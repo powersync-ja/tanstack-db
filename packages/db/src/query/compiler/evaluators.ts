@@ -3,7 +3,13 @@ import {
   UnknownExpressionTypeError,
   UnknownFunctionError,
 } from '../../errors.js'
-import { areValuesEqual, normalizeValue } from '../../utils/comparison.js'
+import {
+  areValuesEqual,
+  compareValues,
+  isUint8Array,
+  isUnorderable,
+  normalizeValue,
+} from '../../utils/comparison.js'
 import type { BasicExpression, Func, PropRef } from '../ir.js'
 import type { NamespacedRow } from '../../types.js'
 
@@ -12,6 +18,24 @@ import type { NamespacedRow } from '../../types.js'
  */
 function isUnknown(value: any): boolean {
   return value === null || value === undefined
+}
+
+function normalizeEqualityOperand(value: unknown): unknown {
+  // Byte comparison needs no Map-key encoding, even for large binary values.
+  return isUint8Array(value) ? value : normalizeValue(value)
+}
+
+/**
+ * Equality that follows PostgreSQL float semantics for `NaN`/invalid Dates:
+ * such values are equal to one another and unequal to anything else. For all
+ * other values it defers to {@link areValuesEqual}. Operands must not be
+ * null/undefined (callers handle UNKNOWN first).
+ */
+function valuesEqual(a: any, b: any): boolean {
+  if (isUnorderable(a) || isUnorderable(b)) {
+    return isUnorderable(a) && isUnorderable(b)
+  }
+  return areValuesEqual(a, b)
 }
 
 function toDateValue(value: any): Date | null {
@@ -227,14 +251,15 @@ function compileFunction(func: Func, isSingleRow: boolean): (data: any) => any {
       const argA = compiledArgs[0]!
       const argB = compiledArgs[1]!
       return (data) => {
-        const a = normalizeValue(argA(data))
-        const b = normalizeValue(argB(data))
+        const a = normalizeEqualityOperand(argA(data))
+        const b = normalizeEqualityOperand(argB(data))
         // In 3-valued logic, any comparison with null/undefined returns UNKNOWN
         if (isUnknown(a) || isUnknown(b)) {
           return null
         }
-        // Use areValuesEqual for proper Uint8Array/Buffer comparison
-        return areValuesEqual(a, b)
+        // NaN/invalid Dates are equal to one another (PostgreSQL semantics);
+        // otherwise use areValuesEqual for proper Uint8Array/Buffer comparison
+        return valuesEqual(a, b)
       }
     }
     case `gt`: {
@@ -247,7 +272,10 @@ function compileFunction(func: Func, isSingleRow: boolean): (data: any) => any {
         if (isUnknown(a) || isUnknown(b)) {
           return null
         }
-        return a > b
+        if (isUnorderable(a) || isUnorderable(b)) {
+          return isUnorderable(a) && !isUnorderable(b)
+        }
+        return compareValues(a, b) > 0
       }
     }
     case `gte`: {
@@ -260,7 +288,10 @@ function compileFunction(func: Func, isSingleRow: boolean): (data: any) => any {
         if (isUnknown(a) || isUnknown(b)) {
           return null
         }
-        return a >= b
+        if (isUnorderable(a) || isUnorderable(b)) {
+          return isUnorderable(a)
+        }
+        return compareValues(a, b) >= 0
       }
     }
     case `lt`: {
@@ -273,7 +304,10 @@ function compileFunction(func: Func, isSingleRow: boolean): (data: any) => any {
         if (isUnknown(a) || isUnknown(b)) {
           return null
         }
-        return a < b
+        if (isUnorderable(a) || isUnorderable(b)) {
+          return isUnorderable(b) && !isUnorderable(a)
+        }
+        return compareValues(a, b) < 0
       }
     }
     case `lte`: {
@@ -286,7 +320,10 @@ function compileFunction(func: Func, isSingleRow: boolean): (data: any) => any {
         if (isUnknown(a) || isUnknown(b)) {
           return null
         }
-        return a <= b
+        if (isUnorderable(a) || isUnorderable(b)) {
+          return isUnorderable(b)
+        }
+        return compareValues(a, b) <= 0
       }
     }
 
@@ -361,7 +398,7 @@ function compileFunction(func: Func, isSingleRow: boolean): (data: any) => any {
       const valueEvaluator = compiledArgs[0]!
       const arrayEvaluator = compiledArgs[1]!
       return (data) => {
-        const value = normalizeValue(valueEvaluator(data))
+        const value = normalizeEqualityOperand(valueEvaluator(data))
         const array = arrayEvaluator(data)
         // In 3-valued logic, if the value is null/undefined, return UNKNOWN
         if (isUnknown(value)) {
@@ -370,7 +407,9 @@ function compileFunction(func: Func, isSingleRow: boolean): (data: any) => any {
         if (!Array.isArray(array)) {
           return false
         }
-        return array.some((item) => normalizeValue(item) === value)
+        return array.some((item) =>
+          valuesEqual(normalizeEqualityOperand(item), value),
+        )
       }
     }
 

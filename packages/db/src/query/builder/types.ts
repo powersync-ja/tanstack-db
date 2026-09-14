@@ -1,4 +1,5 @@
 import type { Collection, CollectionImpl } from '../../collection/index.js'
+import type { CollectionOptionsIdentity } from '../../collection-options.js'
 import type { SingleResult, StringCollationConfig } from '../../types.js'
 import type {
   Aggregate,
@@ -89,7 +90,10 @@ export type ContextSchema = Record<string, unknown>
  * Example: `{ users: usersCollection }`
  */
 export type Source = {
-  [alias: string]: CollectionImpl<any, any> | QueryBuilder<Context>
+  [alias: string]:
+    | CollectionImpl<any, any>
+    | CollectionOptionsIdentity<any, any, any, any, any>
+    | QueryBuilder<any>
 }
 
 /**
@@ -101,7 +105,15 @@ export type Source = {
 export type InferCollectionType<T> =
   T extends CollectionImpl<infer TOutput, infer TKey, any, any, any>
     ? WithVirtualProps<TOutput, TKey>
-    : never
+    : T extends CollectionOptionsIdentity<
+          infer TOutput,
+          infer TKey,
+          any,
+          any,
+          any
+        >
+      ? WithVirtualProps<TOutput, TKey>
+      : never
 
 /**
  * SchemaFromSource - Converts a Source definition into a ContextSchema
@@ -116,9 +128,11 @@ export type InferCollectionType<T> =
 export type SchemaFromSource<T extends Source> = Prettify<{
   [K in keyof T]: T[K] extends CollectionImpl<any, any, any, any, any>
     ? InferCollectionType<T[K]>
-    : T[K] extends QueryBuilder<infer TContext>
-      ? GetResult<TContext>
-      : never
+    : T[K] extends CollectionOptionsIdentity<any, any, any, any, any>
+      ? InferCollectionType<T[K]>
+      : T[K] extends QueryBuilder<infer TContext>
+        ? GetRawResult<TContext>
+        : never
 }>
 
 export type UnionRefsSchema<TSchema extends ContextSchema> = Prettify<{
@@ -154,7 +168,7 @@ export type ContextFromUnionSource<TSource extends Source> =
     : ContextFromSource<TSource>
 
 type ResultFromBranch<TBranch> =
-  TBranch extends QueryBuilder<infer TContext> ? GetResult<TContext> : never
+  TBranch extends QueryBuilder<infer TContext> ? GetRawResult<TContext> : never
 
 type UnionBranchResult<TBranches extends ReadonlyArray<QueryBuilder<any>>> =
   ResultFromBranch<TBranches[number]>
@@ -467,19 +481,65 @@ export type ResultTypeFromSelect<TSelectObject> =
         }>
       >
 
-export type SelectResult<TSelect> =
-  IsPlainObject<TSelect> extends true
-    ? ResultTypeFromSelect<TSelect>
-    : ResultTypeFromSelectValue<TSelect>
-
 // Distribute over caseWhen branch unions so projection branches remain a union
 // of branch result shapes instead of being merged as one object type.
 type ResultTypeFromCaseWhen<T> = T extends unknown
   ? ResultTypeFromSelectValue<T>
   : never
 
-// Extract Ref or subobject with a spread or a Ref
-type ExtractRef<T> = Prettify<ResultTypeFromSelect<WithoutRefBrand<T>>>
+// Extract Ref or subobject with a spread or a Ref.
+type ExtractRef<T> = T extends unknown
+  ? IsTrueRef<T> extends true
+    ? T extends RefLeaf<infer U>
+      ? IsNullableRef<T> extends true
+        ? DeepNullable<U>
+        : U
+      : never
+    : Prettify<ResultTypeFromSelect<WithoutRefBrand<T>>>
+  : never
+
+// A "true" Ref is one that is structurally equivalent to the canonical
+// `Ref<U>` shape the query builder produces for its underlying user type
+// `U` (taking the ref's own nullability into account). When `T` is a true
+// ref, `ExtractRef` can safely return `U` directly; otherwise it must fall
+// through to the recursive projection.
+//
+// Checking only that `T` has "no extra keys" beyond `keyof U` (plus the
+// brand/virtual props) is not sufficient. A spread-derived object can keep
+// exactly the keys of `U` while:
+//   - changing a field's type, e.g. `{ ...u, code: u.slug }`, or
+//   - dropping an optional key, e.g. `const { nickname, ...rest } = u`.
+// Both must be recursively projected, not collapsed back to `U`. We
+// therefore require strict structural equivalence against the canonical ref
+// shape rather than a one-directional key-subset check.
+type IsTrueRef<T> =
+  T extends RefLeaf<infer U>
+    ? RefShapeMatches<T, Ref<U, IsNullableRef<T>>> extends true
+      ? true
+      : false
+    : false
+
+// Strict structural equivalence between two ref shapes. Unlike plain
+// bidirectional assignability, this is sensitive to *key presence* — an
+// object that drops an optional key (e.g. `const { nickname, ...rest } = u`)
+// is not considered equal to one that keeps `nickname?`, even though the two
+// remain mutually assignable. A direct ref (`u.document`, a union member,
+// etc.) is exactly the canonical `Ref` shape and matches here, so it returns
+// `U` via the fast path; any spread-derived object differs (changed field
+// types, dropped keys, or stripped `readonly` modifiers) and instead falls
+// through to the recursive projection, which reconstructs the correct type.
+type RefShapeMatches<A, B> =
+  (<G>() => G extends A ? 1 : 2) extends <G>() => G extends B ? 1 : 2
+    ? true
+    : false
+
+// Propagate nullable-join semantics into the user-data shape.
+type DeepNullable<T> =
+  T extends Record<string, any>
+    ? IsPlainObject<T> extends true
+      ? { [K in keyof T]: DeepNullable<T[K]> }
+      : T | undefined
+    : T | undefined
 
 // Helper type to extract the underlying type from various expression types
 type ExtractExpressionType<T> =
@@ -611,8 +671,11 @@ type ValueOfUnion<T, K extends PropertyKey> = T extends unknown
     ? T[K]
     : never
   : never
-type RefForContextValue<T, Nullable extends boolean = false> =
-  IsPlainObject<T> extends true ? Ref<T, Nullable> : RefLeaf<T, Nullable>
+type RefForContextValue<T, Nullable extends boolean = false> = T extends unknown
+  ? IsPlainObject<T> extends true
+    ? Ref<T, Nullable>
+    : RefLeaf<T, Nullable>
+  : never
 type RefsSchemaForContext<TContext extends Context> =
   IsExactlyUndefined<TContext[`refsSchema`]> extends true
     ? TContext[`schema`]
@@ -770,7 +833,11 @@ type VirtualPropsRef<TKey extends string | number = string | number> = {
  * select(({ user }) => ({ ...user })) // Returns User type, not Ref types
  * ```
  */
-export type Ref<T = any, Nullable extends boolean = false> = {
+export type Ref<T = any, Nullable extends boolean = false> = T extends unknown
+  ? RefBranch<T, Nullable>
+  : never
+
+type RefBranch<T, Nullable extends boolean> = {
   [K in keyof T]: IsNonExactOptional<T[K]> extends true
     ? IsNonExactNullable<T[K]> extends true
       ? // Both optional and nullable
