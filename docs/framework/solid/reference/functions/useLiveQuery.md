@@ -3,15 +3,13 @@ id: useLiveQuery
 title: useLiveQuery
 ---
 
-# Function: useLiveQuery()
-
 ## Call Signature
 
 ```ts
-function useLiveQuery<TContext>(queryFn): Accessor<InferResultType<TContext>> & object;
+function useLiveQuery<TContext>(queryFn): Accessor<InferResultType<TContext>> & object & LiveQueryStatusFlags & object;
 ```
 
-Defined in: [useLiveQuery.ts:102](https://github.com/TanStack/db/blob/main/packages/solid-db/src/useLiveQuery.ts#L102)
+Defined in: [useLiveQuery.ts:123](https://github.com/TanStack/db/blob/main/packages/solid-db/src/useLiveQuery.ts#L123)
 
 Create a live query using a query function
 
@@ -78,7 +76,7 @@ return (
     <Match when={todosQuery.isLoading}>
       <div>Loading...</div>
     </Match>
-    <Match when={todosQuery.isError}>
+    <Match when={todosQuery.isLoadingError}>
       <div>Error: {todosQuery.status}</div>
     </Match>
     <Match when={todosQuery.isReady}>
@@ -108,10 +106,10 @@ return (
 ## Call Signature
 
 ```ts
-function useLiveQuery<TContext>(queryFn): Accessor<InferResultType<TContext>> & object;
+function useLiveQuery<TContext>(queryFn): Accessor<InferConditionalResultType<TContext>> & object & LiveQueryStatusFlags & object;
 ```
 
-Defined in: [useLiveQuery.ts:121](https://github.com/TanStack/db/blob/main/packages/solid-db/src/useLiveQuery.ts#L121)
+Defined in: [useLiveQuery.ts:137](https://github.com/TanStack/db/blob/main/packages/solid-db/src/useLiveQuery.ts#L137)
 
 Create a live query using a query function
 
@@ -178,7 +176,7 @@ return (
     <Match when={todosQuery.isLoading}>
       <div>Loading...</div>
     </Match>
-    <Match when={todosQuery.isError}>
+    <Match when={todosQuery.isLoadingError}>
       <div>Error: {todosQuery.status}</div>
     </Match>
     <Match when={todosQuery.isReady}>
@@ -208,10 +206,10 @@ return (
 ## Call Signature
 
 ```ts
-function useLiveQuery<TContext>(config): Accessor<InferResultType<TContext>> & object;
+function useLiveQuery<TContext>(config): Accessor<InferResultType<TContext>> & object & LiveQueryStatusFlags & object;
 ```
 
-Defined in: [useLiveQuery.ts:182](https://github.com/TanStack/db/blob/main/packages/solid-db/src/useLiveQuery.ts#L182)
+Defined in: [useLiveQuery.ts:193](https://github.com/TanStack/db/blob/main/packages/solid-db/src/useLiveQuery.ts#L193)
 
 Create a live query using configuration object
 
@@ -225,7 +223,7 @@ Create a live query using configuration object
 
 #### config
 
-`Accessor`\<`LiveQueryCollectionConfig`\<`TContext`, `RootQueryResult`\<`TContext`\>\>\>
+`Accessor`\<`LiveQueryHookConfig`\<`TContext`\>\>
 
 Configuration object with query and options
 
@@ -264,7 +262,7 @@ return (
     <Match when={itemsQuery.isLoading}>
       <div>Loading...</div>
     </Match>
-    <Match when={itemsQuery.isError}>
+    <Match when={itemsQuery.isLoadingError}>
       <div>Something went wrong</div>
     </Match>
     <Match when={!itemsQuery.isReady}>
@@ -277,10 +275,10 @@ return (
 ## Call Signature
 
 ```ts
-function useLiveQuery<TResult, TKey, TUtils>(liveQueryCollection): Accessor<TResult[]> & object;
+function useLiveQuery<TResult, TKey, TUtils>(liveQueryCollection): Accessor<TResult[]> & object & LiveQueryStatusFlags & object;
 ```
 
-Defined in: [useLiveQuery.ts:236](https://github.com/TanStack/db/blob/main/packages/solid-db/src/useLiveQuery.ts#L236)
+Defined in: [useLiveQuery.ts:242](https://github.com/TanStack/db/blob/main/packages/solid-db/src/useLiveQuery.ts#L242)
 
 Subscribe to an existing live query collection
 
@@ -339,7 +337,7 @@ return (
    <Match when={sharedQuery.isLoading}>
      <div>Loading...</div>
    </Match>
-   <Match when={sharedQuery.isError}>
+   <Match when={sharedQuery.isLoadingError}>
      <div>Error loading data</div>
    </Match>
  </Switch>
@@ -349,10 +347,10 @@ return (
 ## Call Signature
 
 ```ts
-function useLiveQuery<TResult, TKey, TUtils>(liveQueryCollection): Accessor<TResult | undefined> & object;
+function useLiveQuery<TResult, TKey, TUtils>(liveQueryCollection): Accessor<TResult | undefined> & object & LiveQueryStatusFlags & object;
 ```
 
-Defined in: [useLiveQuery.ts:261](https://github.com/TanStack/db/blob/main/packages/solid-db/src/useLiveQuery.ts#L261)
+Defined in: [useLiveQuery.ts:262](https://github.com/TanStack/db/blob/main/packages/solid-db/src/useLiveQuery.ts#L262)
 
 Create a live query using a query function
 
@@ -425,7 +423,7 @@ return (
     <Match when={todosQuery.isLoading}>
       <div>Loading...</div>
     </Match>
-    <Match when={todosQuery.isError}>
+    <Match when={todosQuery.isLoadingError}>
       <div>Error: {todosQuery.status}</div>
     </Match>
     <Match when={todosQuery.isReady}>

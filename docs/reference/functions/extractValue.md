@@ -3,13 +3,11 @@ id: extractValue
 title: extractValue
 ---
 
-# Function: extractValue()
-
 ```ts
 function extractValue(expr): any;
 ```
 
-Defined in: [packages/db/src/query/expression-helpers.ts:127](https://github.com/TanStack/db/blob/main/packages/db/src/query/expression-helpers.ts#L127)
+Defined in: [packages/db/src/query/expression-helpers.ts:130](https://github.com/TanStack/db/blob/main/packages/db/src/query/expression-helpers.ts#L130)
 
 Extracts the value from a Value expression.
 Returns undefined for non-value expressions.

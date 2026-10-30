@@ -5,7 +5,10 @@ import { afterAll, afterEach, beforeAll } from 'vitest'
 import { BTreeIndex, createCollection } from '@tanstack/db'
 import BetterSqlite3 from 'better-sqlite3'
 import { createNodeSQLitePersistence, persistedCollectionOptions } from '../src'
-import { generateSeedData } from '../../db-collection-e2e/src/fixtures/seed-data'
+import {
+  captureSeedData,
+  generateSeedData,
+} from '../../db-collection-e2e/src/fixtures/seed-data'
 import { runPersistedCollectionConformanceSuite } from '../../db-sqlite-persistence-core/tests/contracts/persisted-collection-conformance-contract'
 import type { Collection } from '@tanstack/db'
 import type {
@@ -41,17 +44,20 @@ function createPersistedCollection<T extends PersistableRow>(
       return
     }
     seedTxSequence++
-    await persistence.adapter.applyCommittedTx(id, {
-      txId: `seed-${id}-${seedTxSequence}`,
-      term: 1,
-      seq: seedTxSequence,
-      rowVersion: seedTxSequence,
-      mutations: rows.map((row) => ({
-        type: `insert` as const,
-        key: row.id,
-        value: row,
-      })),
-    })
+    await persistence.adapter.applyCommittedTx(
+      { kind: `eager`, collectionId: id },
+      {
+        txId: `seed-${id}-${seedTxSequence}`,
+        term: 1,
+        seq: seedTxSequence,
+        rowVersion: seedTxSequence,
+        mutations: rows.map((row) => ({
+          type: `insert` as const,
+          key: row.id,
+          value: row,
+        })),
+      },
+    )
   }
 
   const collection = createCollection(
@@ -72,15 +78,13 @@ function createPersistedCollection<T extends PersistableRow>(
 }
 
 type PersistedTransactionHandle = {
-  isPersisted: {
-    promise: Promise<unknown>
-  }
+  when: (state: 'settled') => Promise<unknown>
 }
 
 async function waitForPersisted(
   transaction: PersistedTransactionHandle,
 ): Promise<void> {
-  await transaction.isPersisted.promise
+  await transaction.when(`settled`)
 }
 
 async function seedCollection<T extends PersistableRow>(
@@ -136,6 +140,11 @@ beforeAll(async () => {
   const suiteId = Date.now().toString(36)
   const database = new BetterSqlite3(dbPath)
   const seedData = generateSeedData()
+  const fixture = captureSeedData(seedData, {
+    registration:
+      'packages/node-db-sqlite-persistence/e2e/node-persisted-collection.e2e.test.ts',
+    provider: 'BetterSqlite3',
+  })
 
   const eagerUsers = createPersistedCollection<User>(
     database,
@@ -183,6 +192,7 @@ beforeAll(async () => {
   await onDemandComments.seedPersisted(seedData.comments)
 
   config = {
+    fixture,
     collections: {
       eager: {
         users: eagerUsers.collection,
@@ -216,6 +226,11 @@ beforeAll(async () => {
         insertRowIntoCollections(
           [eagerPosts.collection, onDemandPosts.collection],
           post,
+        ),
+      deletePost: async (id) =>
+        deleteRowAcrossCollections(
+          [eagerPosts.collection, onDemandPosts.collection],
+          id,
         ),
     },
     setup: async () => {},

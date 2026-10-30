@@ -49,6 +49,8 @@ export interface OfflineTransaction {
   createdAt: Date
   retryCount: number
   nextAttemptAt: number
+  /** Provider work has settled; only durable outbox deletion remains. */
+  outboxPhase?: `deletion-pending` | `rejection-pending`
   lastError?: SerializedError
   metadata?: Record<string, any>
   spanContext?: SerializedSpanContext
@@ -57,6 +59,10 @@ export interface OfflineTransaction {
 
 // Serialized representation for storage
 export interface SerializedOfflineTransaction {
+  /** Absent for the original Date-marker format. */
+  valueEncoding?: 2 | 3 | 4
+  /** Required for opt-in mutation encoding v4. */
+  mutationEncoding?: string
   id: string
   mutationFnName: string
   mutations: Array<SerializedMutation>
@@ -65,6 +71,8 @@ export interface SerializedOfflineTransaction {
   createdAt: string
   retryCount: number
   nextAttemptAt: number
+  /** Absent in older records and while mutationFn may still need to run. */
+  outboxPhase?: `deletion-pending` | `rejection-pending`
   lastError?: SerializedError
   metadata?: Record<string, any>
   spanContext?: SerializedSpanContext
@@ -89,12 +97,31 @@ export interface StorageDiagnostic {
   error?: Error
 }
 
+/** Encodes mutation payloads into JSON-safe values, and restores them on replay. */
+export interface MutationValueCodec {
+  /** Stable format/version identifier, retained in every encoded transaction. */
+  id: string
+  encode: (value: unknown) => string
+  decode: (value: string) => unknown
+}
+
 export interface OfflineConfig {
+  mutationCodec?: MutationValueCodec
   collections: Record<string, Collection<any, any, any, any, any>>
   mutationFns: Record<string, OfflineMutationFn>
   storage?: StorageAdapter
   maxConcurrency?: number
   jitter?: boolean
+  /**
+   * Override retry decisions for errors from all named mutation functions.
+   * Return synchronously; undefined uses the default decision. Put any
+   * function-specific context needed by this shared hook on the Error.
+   * NonRetriableError always stops retry.
+   * A throw or invalid return fails only that outbox row and rejects its
+   * waiters with the hook failure. Queued work runs after terminal cleanup.
+   * The default policy still supplies the delay and configured jitter.
+   */
+  shouldRetry?: (error: Error, retryCount: number) => boolean | undefined
   beforeRetry?: (
     transactions: Array<OfflineTransaction>,
   ) => Array<OfflineTransaction>
@@ -131,6 +158,7 @@ export interface LeaderElection {
 }
 
 export interface TransactionSignaler {
+  readonly isOfflineEnabled: boolean
   resolveTransaction: (transactionId: string, result: any) => void
   rejectTransaction: (transactionId: string, error: Error) => void
   registerRestorationTransaction: (

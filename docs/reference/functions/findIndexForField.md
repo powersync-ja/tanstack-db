@@ -3,20 +3,17 @@ id: findIndexForField
 title: findIndexForField
 ---
 
-# Function: findIndexForField()
-
 ```ts
 function findIndexForField<TKey>(
    collection, 
    fieldPath, 
-   compareOptions?): 
-  | IndexInterface<TKey>
-  | undefined;
+   compareOptions?, 
+   canUse?): IndexReader<TKey> | undefined;
 ```
 
-Defined in: [packages/db/src/utils/index-optimization.ts:37](https://github.com/TanStack/db/blob/main/packages/db/src/utils/index-optimization.ts#L37)
+Defined in: [packages/db/src/utils/index-optimization.ts:59](https://github.com/TanStack/db/blob/main/packages/db/src/utils/index-optimization.ts#L59)
 
-Finds an index that matches a given field path
+Finds the first usable index matching a field path and comparison options.
 
 ## Type Parameters
 
@@ -38,7 +35,10 @@ Finds an index that matches a given field path
 
 `CompareOptions`
 
+### canUse?
+
+(`index`) => `boolean`
+
 ## Returns
 
-  \| [`IndexInterface`](../interfaces/IndexInterface.md)\<`TKey`\>
-  \| `undefined`
+[`IndexReader`](../type-aliases/IndexReader.md)\<`TKey`\> \| `undefined`

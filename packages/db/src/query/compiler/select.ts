@@ -5,15 +5,9 @@ import {
   Value as ValClass,
   isExpressionLike,
 } from '../ir.js'
-import { AggregateNotSupportedError } from '../../errors.js'
+import { UnsafeAliasPathError } from '../../errors.js'
 import { compileExpression, isCaseWhenConditionTrue } from './evaluators.js'
-import { containsAggregate } from './group-by.js'
-import type {
-  Aggregate,
-  BasicExpression,
-  Select,
-  SelectValueExpression,
-} from '../ir.js'
+import type { BasicExpression, Select, SelectValueExpression } from '../ir.js'
 import type {
   KeyedStream,
   NamespacedAndKeyedStream,
@@ -39,6 +33,16 @@ function unwrapVal(input: any): any {
   return input
 }
 
+const UNSAFE_ALIAS_SEGMENTS = new Set([`__proto__`, `prototype`, `constructor`])
+
+function assertSafeAliasSegments(segments: ReadonlyArray<string>): void {
+  for (const seg of segments) {
+    if (UNSAFE_ALIAS_SEGMENTS.has(seg)) {
+      throw new UnsafeAliasPathError(seg)
+    }
+  }
+}
+
 /**
  * Processes a merge operation by merging source values into the target path
  */
@@ -47,6 +51,7 @@ function processMerge(
   namespacedRow: NamespacedRow,
   selectResults: Record<string, any>,
 ): void {
+  assertSafeAliasSegments(op.targetPath)
   const value = op.source(namespacedRow)
   if (value && typeof value === `object`) {
     // Ensure target object exists
@@ -89,6 +94,7 @@ function processNonMergeOp(
 ): void {
   // Support nested alias paths like "meta.author.name"
   const path = op.alias.split(`.`)
+  assertSafeAliasSegments(path)
   if (path.length === 1) {
     selectResults[op.alias] = op.compiled(namespacedRow)
   } else {
@@ -141,6 +147,16 @@ export function processSelect(
   select: Select,
   _allInputs: Record<string, KeyedStream>,
 ): NamespacedAndKeyedStream {
+  if (!isNestedSelectObject(select)) {
+    const compiled = compileSelectValue(select as SelectValueExpression)
+    return pipeline.pipe(
+      map(([key, namespacedRow]) => [
+        key,
+        { ...namespacedRow, $selected: compiled(namespacedRow) },
+      ]),
+    ) as NamespacedAndKeyedStream
+  }
+
   // Build ordered operations to preserve authoring order (spreads and fields)
   const ops: Array<SelectOp> = []
 
@@ -176,10 +192,6 @@ function compileSelectValue(
   }
 
   if (isConditionalSelectValue(value)) {
-    if (containsAggregate(value)) {
-      return () => null
-    }
-
     return compileConditionalSelect(value)
   }
 
@@ -193,13 +205,6 @@ function compileSelectValue(
 
   if (isNestedSelectObject(value)) {
     return compileSelectObject(value)
-  }
-
-  if (
-    isAggregateExpression(value as BasicExpression | Aggregate) ||
-    containsAggregate(value as BasicExpression | Aggregate)
-  ) {
-    return () => null
   }
 
   if (!isExpressionLike(value)) {
@@ -233,33 +238,6 @@ function compileConditionalSelect(
 }
 
 /**
- * Helper function to check if an expression is an aggregate
- */
-function isAggregateExpression(
-  expr: BasicExpression | Aggregate,
-): expr is Aggregate {
-  return expr.type === `agg`
-}
-
-/**
- * Processes a single argument in a function context
- */
-export function processArgument(
-  arg: BasicExpression | Aggregate,
-  namespacedRow: NamespacedRow,
-): any {
-  if (isAggregateExpression(arg)) {
-    throw new AggregateNotSupportedError()
-  }
-
-  // Pre-compile the expression and evaluate immediately
-  const compiledExpression = compileExpression(arg)
-  const value = compiledExpression(namespacedRow)
-
-  return value
-}
-
-/**
  * Helper function to check if an object is a nested select object
  *
  * .select({
@@ -283,6 +261,9 @@ function addFromObject(
   ops: Array<SelectOp>,
 ) {
   for (const [key, value] of Object.entries(obj)) {
+    if (!key.startsWith(`__SPREAD_SENTINEL__`)) {
+      assertSafeAliasSegments(key.split(`.`))
+    }
     if (key.startsWith(`__SPREAD_SENTINEL__`)) {
       const rest = key.slice(`__SPREAD_SENTINEL__`.length)
       const splitIndex = rest.lastIndexOf(`__`)
@@ -295,9 +276,10 @@ function addFromObject(
       if (pathStr.includes(`.`) || isRefExpr) {
         // Merge into the current destination (prefixPath) from the referenced source path
         const targetPath = [...prefixPath]
+        const path = pathStr.split(`.`)
         const expr = isRefExpr
           ? (value as BasicExpression)
-          : (new PropRef(pathStr.split(`.`)) as BasicExpression)
+          : (new PropRef(path, path[0]) as BasicExpression)
         const compiled = compileExpression(expr)
         ops.push({ kind: `merge`, targetPath, source: compiled })
       } else {
@@ -315,15 +297,6 @@ function addFromObject(
 
     const expression = value as any
     if (isConditionalSelectValue(expression)) {
-      if (containsAggregate(expression)) {
-        ops.push({
-          kind: `field`,
-          alias: [...prefixPath, key].join(`.`),
-          compiled: () => null,
-        })
-        continue
-      }
-
       ops.push({
         kind: `field`,
         alias: [...prefixPath, key].join(`.`),
@@ -347,39 +320,28 @@ function addFromObject(
       continue
     }
 
-    if (isAggregateExpression(expression) || containsAggregate(expression)) {
-      // Placeholder for group-by processing later.
-      // Both plain aggregates (count(...)) and expressions wrapping
-      // aggregates (coalesce(count(...), 0)) are deferred to processGroupBy.
+    if (expression === undefined || !isExpressionLike(expression)) {
       ops.push({
         kind: `field`,
         alias: [...prefixPath, key].join(`.`),
-        compiled: () => null,
+        compiled: () => expression,
+      })
+      continue
+    }
+    // If the expression is a Value wrapper, embed the literal to avoid re-compilation mishaps
+    if (expression instanceof ValClass) {
+      const val = expression.value
+      ops.push({
+        kind: `field`,
+        alias: [...prefixPath, key].join(`.`),
+        compiled: () => val,
       })
     } else {
-      if (expression === undefined || !isExpressionLike(expression)) {
-        ops.push({
-          kind: `field`,
-          alias: [...prefixPath, key].join(`.`),
-          compiled: () => expression,
-        })
-        continue
-      }
-      // If the expression is a Value wrapper, embed the literal to avoid re-compilation mishaps
-      if (expression instanceof ValClass) {
-        const val = expression.value
-        ops.push({
-          kind: `field`,
-          alias: [...prefixPath, key].join(`.`),
-          compiled: () => val,
-        })
-      } else {
-        ops.push({
-          kind: `field`,
-          alias: [...prefixPath, key].join(`.`),
-          compiled: compileExpression(expression as BasicExpression),
-        })
-      }
+      ops.push({
+        kind: `field`,
+        alias: [...prefixPath, key].join(`.`),
+        compiled: compileExpression(expression as BasicExpression),
+      })
     }
   }
 }

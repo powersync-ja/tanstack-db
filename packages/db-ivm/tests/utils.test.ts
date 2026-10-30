@@ -1,32 +1,37 @@
 import { describe, expect, it } from 'vitest'
 import { Temporal } from 'temporal-polyfill'
-import { DefaultMap } from '../src/utils.js'
+import { compareKeys, serializeValue } from '../src/utils.js'
 import { hash } from '../src/hashing/index.js'
+import { equalHashValues } from '../src/hashing/hash.js'
 
-describe(`DefaultMap`, () => {
-  it(`should return default value for missing keys`, () => {
-    const map = new DefaultMap(() => 0)
-    expect(map.get(`missing`)).toBe(0)
+describe(`compareKeys`, () => {
+  it(`orders finite numeric keys before NaN`, () => {
+    expect(compareKeys(1, Number.NaN)).toBeLessThan(0)
+    expect(compareKeys(Number.NaN, 1)).toBeGreaterThan(0)
+    expect(compareKeys(Number.NaN, Number.NaN)).toBe(0)
+  })
+})
+
+describe(`serializeValue`, () => {
+  it(`preserves the established JSON form for ordinary keys`, () => {
+    expect(serializeValue(`user1`)).toBe(`"user1"`)
+    expect(serializeValue([1, `completed`])).toBe(`[1,"completed"]`)
   })
 
-  it(`should store and retrieve values`, () => {
-    const map = new DefaultMap(() => 0)
-    map.set(`key`, 42)
-    expect(map.get(`key`)).toBe(42)
+  it(`keeps distinct primitive types and special numbers distinct`, () => {
+    expect(serializeValue(1n)).not.toBe(serializeValue(`1`))
+    expect(serializeValue(Number.NaN)).not.toBe(serializeValue(null))
+    expect(serializeValue(undefined)).not.toBe(serializeValue(null))
+    expect(serializeValue(new Date(0))).not.toBe(
+      serializeValue(`1970-01-01T00:00:00.000Z`),
+    )
+    expect(serializeValue(new Date(Number.NaN))).not.toBe(
+      serializeValue(Number.NaN),
+    )
   })
 
-  it(`should accept initial entries`, () => {
-    const map = new DefaultMap(() => 0, [[`key`, 1]])
-    expect(map.get(`key`)).toBe(1)
-  })
-
-  it(`should update values using the update method`, () => {
-    const map = new DefaultMap(() => 0)
-    map.update(`key`, (value) => value + 1)
-    expect(map.get(`key`)).toBe(1)
-
-    map.update(`key`, (value) => value * 2)
-    expect(map.get(`key`)).toBe(2)
+  it(`canonicalizes plain-object property order`, () => {
+    expect(serializeValue({ a: 1, b: 2 })).toBe(serializeValue({ b: 2, a: 1 }))
   })
 })
 
@@ -77,7 +82,8 @@ describe(`hash`, () => {
 
       // Same numbers should have same hash
       expect(hash(42)).toBe(result1)
-      expect(hash(2.0)).not.toBe(hash(2.5))
+      expect(equalHashValues(2.0, 2.5)).toBe(false)
+      expect(typeof hash(2.5)).toBe(hashType)
       expect(hash(3.14159)).toBe(result4)
     })
 
@@ -87,7 +93,7 @@ describe(`hash`, () => {
 
       expect(typeof result1).toBe(hashType)
       expect(typeof result2).toBe(hashType)
-      expect(result1).not.toBe(result2)
+      expect(equalHashValues(true, false)).toBe(false)
 
       // Same booleans should have same hash
       expect(hash(true)).toBe(result1)
@@ -103,7 +109,7 @@ describe(`hash`, () => {
       expect(typeof result2).toBe(hashType)
       expect(typeof result3).toBe(hashType)
       expect(result1).toBe(result3) // Same bigint should have same hash
-      expect(result1).not.toBe(result2) // Different bigints should have different hash
+      expect(equalHashValues(123n, 456n)).toBe(false)
     })
 
     it(`should hash symbols`, () => {
@@ -122,11 +128,24 @@ describe(`hash`, () => {
       expect(typeof result1).toBe(hashType)
       expect(typeof result2).toBe(hashType)
       expect(typeof result3).toBe(hashType)
-      // Note: Different symbol instances with same description have same hash
-      expect(result1).toBe(result2)
-      expect(result1).not.toBe(result3)
-      expect(result4).toBe(result5)
-      expect(result1).not.toBe(result4)
+      expect(typeof result4).toBe(hashType)
+      expect(typeof result5).toBe(hashType)
+      expect(equalHashValues(sym1, sym2)).toBe(false)
+      expect(equalHashValues(sym1, sym3)).toBe(false)
+      expect(equalHashValues(sym4, sym5)).toBe(false)
+      expect(equalHashValues(sym1, sym4)).toBe(false)
+    })
+
+    it(`should hash registered symbols`, () => {
+      const first = Symbol.for(`tanstack-db-ivm-hash-first`)
+      const same = Symbol.for(`tanstack-db-ivm-hash-first`)
+      const second = Symbol.for(`tanstack-db-ivm-hash-second`)
+
+      expect(hash(first)).toBe(hash(same))
+      expect(typeof hash(second)).toBe(hashType)
+      expect(equalHashValues(first, second)).toBe(false)
+      expect(typeof hash({ [second]: 1 })).toBe(hashType)
+      expect(equalHashValues({ [first]: 1 }, { [second]: 1 })).toBe(false)
     })
   })
 
@@ -143,6 +162,361 @@ describe(`hash`, () => {
       // Note: Different key orders might produce different hashes depending on JSON.stringify behavior
     })
 
+    it(`includes enumerable symbol keys and values`, () => {
+      const key = Symbol(`key`)
+
+      expect(equalHashValues({ [key]: `before` }, { [key]: `after` })).toBe(
+        false,
+      )
+      expect(typeof hash({ [key]: `before` })).toBe(hashType)
+      expect(typeof hash({ [key]: `after` })).toBe(hashType)
+      const first = { [Symbol(`key`)]: `value` }
+      const second = { [Symbol(`key`)]: `value` }
+      expect(equalHashValues(first, second)).toBe(false)
+      expect(typeof hash(first)).toBe(hashType)
+      expect(typeof hash(second)).toBe(hashType)
+    })
+
+    it(`rejects self and mutual cycles through symbol keys`, () => {
+      const key = Symbol(`cycle`)
+      const first: Record<PropertyKey, unknown> = {}
+      const second: Record<PropertyKey, unknown> = {}
+      first[key] = first
+      second[key] = second
+
+      const firstPeer: Record<PropertyKey, unknown> = {}
+      const secondPeer: Record<PropertyKey, unknown> = {}
+      firstPeer[key] = secondPeer
+      secondPeer[key] = firstPeer
+
+      for (const input of [first, second, firstPeer, secondPeer]) {
+        expect(() => hash(input)).toThrow(
+          `Cannot hash cyclic structural values`,
+        )
+        expect(() => hash(input)).toThrow(
+          `Cannot hash cyclic structural values`,
+        )
+      }
+    })
+
+    it.each([`object`, `map`] as const)(
+      `rejects shared cyclic branches through %s with bounded work`,
+      (container) => {
+        const size = 14
+        let reads = 0
+        const nodes: Array<Record<string, unknown> | Map<string, unknown>> =
+          Array.from({ length: size }, (_, value) =>
+            container === `object`
+              ? { value }
+              : new Map<string, unknown>([[`value`, value]]),
+          )
+
+        for (let index = 0; index < size; index++) {
+          const node = nodes[index]!
+          const next = nodes[(index + 1) % size]!
+          for (const key of [`left`, `right`] as const) {
+            const wrapper = Object.defineProperty({}, `next`, {
+              enumerable: true,
+              get: () => {
+                reads++
+                return next
+              },
+            })
+            if (node instanceof Map) node.set(key, wrapper)
+            else node[key] = wrapper
+          }
+        }
+
+        expect(() => hash(nodes[0]!)).toThrow(
+          `Cannot hash cyclic structural values`,
+        )
+        const firstReads = reads
+        const copy = structuredClone(nodes[0]!)
+
+        expect(() => hash(copy)).toThrow(`Cannot hash cyclic structural values`)
+        expect(firstReads).toBeLessThanOrEqual(size * 2)
+      },
+    )
+
+    it(`rejects a shared child that cycles to either ancestor`, () => {
+      const createGraph = (backBranch: `left` | `right`) => {
+        const root: Record<string, unknown> = {}
+        const left: Record<string, unknown> = {}
+        const right: Record<string, unknown> = {}
+        const shared: Record<string, unknown> = {}
+        root.left = left
+        root.right = right
+        left.next = shared
+        right.next = shared
+        shared.back = backBranch === `left` ? left : right
+        return root
+      }
+
+      const left = createGraph(`left`)
+      const equalLeft = createGraph(`left`)
+      const right = createGraph(`right`)
+
+      for (const input of [left, equalLeft, right]) {
+        expect(() => hash(input)).toThrow(
+          `Cannot hash cyclic structural values`,
+        )
+      }
+    })
+
+    it(`rejects cyclic graphs with exponentially many ancestor contexts`, () => {
+      const depth = 11
+      const shared = Array.from(
+        { length: depth + 1 },
+        (_, level) => ({ level }) as Record<string, unknown>,
+      )
+      const left = Array.from({ length: depth }, (_, level) => ({
+        side: `left`,
+        level,
+        next: shared[level + 1],
+      }))
+      const right = Array.from({ length: depth }, (_, level) => ({
+        side: `right`,
+        level,
+        next: shared[level + 1],
+      }))
+      for (let level = 0; level < depth; level++) {
+        shared[level]!.left = left[level]
+        shared[level]!.right = right[level]
+        shared[depth]![`left${level}`] = left[level]
+      }
+
+      expect(() => hash(shared[0])).toThrow(TypeError)
+      expect(() => hash(shared[0])).toThrow(
+        `Cannot hash cyclic structural values`,
+      )
+
+      const ring = Array.from(
+        { length: 600 },
+        (_, value) => ({ value }) as { value: number; next?: unknown },
+      )
+      for (let index = 0; index < ring.length; index++) {
+        ring[index]!.next = ring[(index + 1) % ring.length]
+      }
+      expect(() => hash(structuredClone(ring[0]))).toThrow(
+        `Cannot hash cyclic structural values`,
+      )
+      expect(() => hash(ring[0])).toThrow(
+        `Cannot hash cyclic structural values`,
+      )
+
+      const independent: Record<string, { self?: unknown }> = {}
+      for (let index = 0; index < 600; index++) {
+        const cycle: { self?: unknown } = {}
+        cycle.self = cycle
+        independent[String(index)] = cycle
+      }
+      expect(() => hash(structuredClone(independent))).toThrow(
+        `Cannot hash cyclic structural values`,
+      )
+      expect(() => hash(independent)).toThrow(
+        `Cannot hash cyclic structural values`,
+      )
+
+      const independentDiamonds: Record<string, unknown> = {}
+      for (let index = 0; index < 600; index++) {
+        const diamondCenter: Record<string, unknown> = {}
+        const leftIngress = { next: diamondCenter }
+        const rightIngress = { next: diamondCenter }
+        diamondCenter.back = leftIngress
+        independentDiamonds[`left${index}`] = leftIngress
+        independentDiamonds[`right${index}`] = rightIngress
+      }
+      expect(() => hash(structuredClone(independentDiamonds))).toThrow(
+        `Cannot hash cyclic structural values`,
+      )
+      expect(() => hash(independentDiamonds)).toThrow(
+        `Cannot hash cyclic structural values`,
+      )
+
+      const small: { self?: unknown } = {}
+      small.self = small
+      expect(() => hash(structuredClone(small))).toThrow(
+        `Cannot hash cyclic structural values`,
+      )
+      expect(() => hash(small)).toThrow(`Cannot hash cyclic structural values`)
+    })
+
+    it(`rejects both small and large repeated cyclic traversals`, () => {
+      const createGraph = (size: number) => {
+        const nodes = Array.from(
+          { length: size },
+          (_, value) => ({ value }) as Record<string, unknown>,
+        )
+        for (let index = 0; index < size; index++) {
+          const next = nodes[(index + 1) % size]!
+          nodes[index]!.left = { next }
+          nodes[index]!.right = { next }
+        }
+        return nodes[0]
+      }
+
+      expect(() => hash(createGraph(20))).toThrow(
+        `Cannot hash cyclic structural values`,
+      )
+      expect(() => hash(createGraph(300))).toThrow(
+        `Cannot hash cyclic structural values`,
+      )
+    })
+
+    it(`does not warm structural caches when a hash is rejected`, () => {
+      let reads = 0
+      const sentinel = Object.defineProperty({}, `value`, {
+        enumerable: true,
+        get: () => ++reads,
+      })
+      const shared: Record<string, unknown> = {
+        payload: Array.from({ length: 66_000 }, (_, value) => ({ value })),
+      }
+      const left = { next: shared }
+      const right = { next: shared }
+      shared.back = left
+      const root = { aSentinel: sentinel, left, right }
+
+      expect(() => hash(root)).toThrow(`Cannot hash cyclic structural values`)
+      expect(() => hash(root)).toThrow(`Cannot hash cyclic structural values`)
+      expect(reads).toBe(2)
+    })
+
+    it.each([
+      [`Buffer`, () => Buffer.alloc(129)],
+      [`Uint8Array`, () => new Uint8Array(129)],
+      [`File`, () => new File([`opaque`], `opaque.bin`)],
+    ])(
+      `treats a large %s as an opaque leaf before structural work`,
+      (_name, createLeaf) => {
+        const leaves = Array.from({ length: 700 }, () => createLeaf())
+        for (const leaf of leaves) Object.assign(leaf, { self: leaf })
+        const createChain = () => {
+          const ring = leaves.map((leaf, value) => ({
+            value,
+            leaf,
+            next: undefined as unknown,
+          }))
+          for (let index = 0; index < ring.length; index++) {
+            ring[index]!.next = ring[index + 1]
+          }
+          return ring[0]
+        }
+
+        const first = createChain()
+        const expectedHash = hash(first)
+        expect(hash(first)).toBe(expectedHash)
+        expect(hash(createChain())).toBe(expectedHash)
+
+        let atDepthBoundary: unknown = createLeaf()
+        for (let index = 0; index < 768; index++) {
+          atDepthBoundary = { next: atDepthBoundary }
+        }
+        expect(() => hash(atDepthBoundary)).not.toThrow()
+
+        const adoptionLeaves = Array.from({ length: 20 }, () => createLeaf())
+        const createAdoptionGraph = () => {
+          const nodes = adoptionLeaves.map((leaf, value) => ({
+            value,
+            leaf,
+          })) as Array<Record<string, unknown>>
+          for (let index = 0; index < nodes.length; index++) {
+            const next = nodes[index + 1]
+            nodes[index]!.left = { next }
+            nodes[index]!.right = { next }
+          }
+          return nodes[0]
+        }
+        expect(hash(createAdoptionGraph())).toBe(hash(createAdoptionGraph()))
+      },
+    )
+
+    it(`rejects deep structural recursion before the JavaScript stack overflows`, () => {
+      let reads = 0
+      const sentinel = Object.defineProperty({}, `value`, {
+        enumerable: true,
+        get: () => ++reads,
+      })
+      const ring = Array.from(
+        { length: 800 },
+        (_, value) => ({ value }) as { value: number; next?: unknown },
+      )
+      for (let index = 0; index < ring.length; index++) {
+        ring[index]!.next = ring[(index + 1) % ring.length]
+      }
+      Object.defineProperty(ring[0]!, `aSentinel`, {
+        enumerable: true,
+        value: sentinel,
+      })
+
+      expect(() => hash(ring[0])).toThrow(
+        `Value is too complex to hash safely: structural depth`,
+      )
+      expect(() => hash(ring[0])).toThrow(
+        `Value is too complex to hash safely: structural depth`,
+      )
+      expect(reads).toBe(2)
+
+      const createChain = (size: number) => {
+        const root: { next?: unknown } = {}
+        let tail = root
+        for (let index = 0; index < size; index++) {
+          const next: { next?: unknown } = {}
+          tail.next = next
+          tail = next
+        }
+        return root
+      }
+      const accepted = createChain(600)
+      expect(hash(structuredClone(accepted))).toBe(hash(accepted))
+
+      const root = createChain(800)
+      expect(() => hash(root)).toThrow(
+        `Value is too complex to hash safely: structural depth`,
+      )
+    })
+
+    it(`rejects dense ancestor back-references without warming siblings`, () => {
+      const createGraph = (size: number) => {
+        const nodes: Array<Record<string, unknown>> = []
+        for (let index = 0; index < size; index++) {
+          const node: Record<string, unknown> = { index }
+          if (index > 0) nodes[index - 1]!.next = node
+          for (let ancestor = 0; ancestor < index; ancestor++) {
+            node[`ancestor${ancestor}`] = nodes[ancestor]
+          }
+          nodes.push(node)
+        }
+        return nodes[0]!
+      }
+      const accepted = createGraph(50)
+      expect(() => hash(structuredClone(accepted))).toThrow(
+        `Cannot hash cyclic structural values`,
+      )
+      expect(() => hash(accepted)).toThrow(
+        `Cannot hash cyclic structural values`,
+      )
+
+      let reads = 0
+      const sentinel = Object.defineProperty({}, `value`, {
+        enumerable: true,
+        get: () => ++reads,
+      })
+      const rejected = createGraph(450)
+      Object.defineProperty(rejected, `aSentinel`, {
+        enumerable: true,
+        value: sentinel,
+      })
+
+      expect(() => hash(rejected)).toThrow(
+        `Cannot hash cyclic structural values`,
+      )
+      expect(() => hash(rejected)).toThrow(
+        `Cannot hash cyclic structural values`,
+      )
+      expect(reads).toBe(2)
+    })
+
     it(`should hash arrays`, () => {
       const arr1 = [1, 2, 3]
       const arr2 = [1, 2, 3]
@@ -153,8 +527,9 @@ describe(`hash`, () => {
       const hash3 = hash(arr3)
 
       expect(typeof hash1).toBe(hashType)
+      expect(typeof hash3).toBe(hashType)
       expect(hash1).toBe(hash2) // Same content should have same hash
-      expect(hash1).not.toBe(hash3) // Different content should have different hash
+      expect(equalHashValues(arr1, arr3)).toBe(false)
     })
 
     it(`should hash Date objects`, () => {
@@ -167,8 +542,9 @@ describe(`hash`, () => {
       const hash3 = hash(date3)
 
       expect(typeof hash1).toBe(hashType)
+      expect(typeof hash3).toBe(hashType)
       expect(hash1).toBe(hash2) // Same date should have same hash
-      expect(hash1).not.toBe(hash3) // Different dates should have different hash
+      expect(equalHashValues(date1, date3)).toBe(false)
     })
 
     it(`should hash Temporal objects by value`, () => {
@@ -181,14 +557,17 @@ describe(`hash`, () => {
       const hash3 = hash(date3)
 
       expect(typeof hash1).toBe(hashType)
+      expect(typeof hash3).toBe(hashType)
       expect(hash1).toBe(hash2) // Same Temporal date should have same hash
-      expect(hash1).not.toBe(hash3) // Different Temporal dates should have different hash
+      expect(equalHashValues(date1, date3)).toBe(false)
 
       // Different Temporal types with overlapping string representations should differ
       const plainDate = Temporal.PlainDate.from(`2024-01-15`)
       const plainDateTime = Temporal.PlainDateTime.from(`2024-01-15T00:00:00`)
 
-      expect(hash(plainDate)).not.toBe(hash(plainDateTime))
+      expect(equalHashValues(plainDate, plainDateTime)).toBe(false)
+      expect(typeof hash(plainDate)).toBe(hashType)
+      expect(typeof hash(plainDateTime)).toBe(hashType)
 
       // Other Temporal types should also hash correctly
       const time1 = Temporal.PlainTime.from(`10:30:00`)
@@ -196,29 +575,45 @@ describe(`hash`, () => {
       const time3 = Temporal.PlainTime.from(`14:00:00`)
 
       expect(hash(time1)).toBe(hash(time2))
-      expect(hash(time1)).not.toBe(hash(time3))
+      expect(equalHashValues(time1, time3)).toBe(false)
+      expect(typeof hash(time3)).toBe(hashType)
 
       const instant1 = Temporal.Instant.from(`2024-01-15T00:00:00Z`)
       const instant2 = Temporal.Instant.from(`2024-01-15T00:00:00Z`)
       const instant3 = Temporal.Instant.from(`2024-06-15T00:00:00Z`)
 
       expect(hash(instant1)).toBe(hash(instant2))
-      expect(hash(instant1)).not.toBe(hash(instant3))
+      expect(equalHashValues(instant1, instant3)).toBe(false)
+      expect(typeof hash(instant3)).toBe(hashType)
     })
 
     it(`should hash RegExp objects`, () => {
       const regex1 = /test/g
       const regex2 = /test/g
       const regex3 = /different/i
+      const regex4 = /test/g
+      regex4.lastIndex = 1
 
       const hash1 = hash(regex1)
       const hash2 = hash(regex2)
       const hash3 = hash(regex3)
+      const hash4 = hash(regex4)
 
       expect(typeof hash1).toBe(hashType)
+      expect(typeof hash3).toBe(hashType)
+      expect(typeof hash4).toBe(hashType)
       expect(hash1).toBe(hash2) // Same regex should have same hash
-      // Note: RegExp don't have enumerable properties so they all produce the same hash
-      expect(hash1).toBe(hash3) // All RegExp objects have the same hash
+      expect(equalHashValues(regex1, regex3)).toBe(false)
+      expect(equalHashValues(regex1, regex4)).toBe(false)
+    })
+
+    it(`should distinguish sparse arrays by length`, () => {
+      expect(equalHashValues([], Array(1))).toBe(false)
+      expect(equalHashValues(Array(1), Array(2))).toBe(false)
+      expect(typeof hash([])).toBe(hashType)
+      expect(typeof hash(Array(1))).toBe(hashType)
+      expect(typeof hash(Array(2))).toBe(hashType)
+      expect(hash(Array(2))).toBe(hash(Array(2)))
     })
 
     it(`should hash nested objects`, () => {
@@ -231,8 +626,9 @@ describe(`hash`, () => {
       const hash3 = hash(nested3)
 
       expect(typeof hash1).toBe(hashType)
+      expect(typeof hash3).toBe(hashType)
       expect(hash1).toBe(hash2)
-      expect(hash1).not.toBe(hash3)
+      expect(equalHashValues(nested1, nested3)).toBe(false)
     })
 
     it(`should hash functions`, () => {
@@ -253,8 +649,8 @@ describe(`hash`, () => {
       expect(typeof hash1).toBe(hashType)
       expect(typeof hash2).toBe(hashType)
       expect(typeof hash3).toBe(hashType)
-      expect(hash1).not.toBe(hash2) // Different function should have different hash
-      expect(hash1).not.toBe(hash3) // Different function should have different hash
+      expect(equalHashValues(func1, func2)).toBe(false)
+      expect(equalHashValues(func1, func3)).toBe(false)
       expect(hash1).toBe(hash(func1)) // hashing same function should return same hash
     })
 
@@ -268,8 +664,9 @@ describe(`hash`, () => {
       const hash3 = hash(set3)
 
       expect(typeof hash1).toBe(hashType)
+      expect(typeof hash3).toBe(hashType)
       expect(hash1).toBe(hash2) // Same content should have same hash
-      expect(hash1).not.toBe(hash3) // Different content should have different hash
+      expect(equalHashValues(set1, set3)).toBe(false)
     })
 
     it(`should hash Map objects`, () => {
@@ -292,8 +689,9 @@ describe(`hash`, () => {
       const hash3 = hash(map3)
 
       expect(typeof hash1).toBe(hashType)
+      expect(typeof hash3).toBe(hashType)
       expect(hash1).toBe(hash2) // Same content should have same hash
-      expect(hash1).not.toBe(hash3) // Different content should have different hash
+      expect(equalHashValues(map1, map3)).toBe(false)
     })
 
     it(`should hash Maps and Sets with unsupported types`, () => {
@@ -316,8 +714,9 @@ describe(`hash`, () => {
       const hash3 = hash(mapWithBigInt3)
 
       expect(typeof hash1).toBe(hashType)
+      expect(typeof hash3).toBe(hashType)
       expect(hash1).toBe(hash2) // Same BigInt content should have same hash
-      expect(hash1).not.toBe(hash3) // Different BigInt content should have different hash
+      expect(equalHashValues(mapWithBigInt1, mapWithBigInt3)).toBe(false)
 
       // Set with Symbol values
       const sym1 = Symbol(`test`)
@@ -331,8 +730,9 @@ describe(`hash`, () => {
       const hash6 = hash(setWithSymbols3)
 
       expect(typeof hash4).toBe(hashType)
+      expect(typeof hash6).toBe(hashType)
       expect(hash4).toBe(hash5) // Same Symbol content should have same hash
-      expect(hash4).not.toBe(hash6) // Different Symbol content should have different hash
+      expect(equalHashValues(setWithSymbols1, setWithSymbols3)).toBe(false)
     })
 
     it(`should hash small Buffers and Uint8Arrays by content`, () => {
@@ -346,8 +746,9 @@ describe(`hash`, () => {
       const hash3 = hash(buffer3)
 
       expect(typeof hash1).toBe(hashType)
+      expect(typeof hash3).toBe(hashType)
       expect(hash1).toBe(hash2) // Same content = same hash for small buffers
-      expect(hash1).not.toBe(hash3) // Different Buffer content should have different hash
+      expect(equalHashValues(buffer1, buffer3)).toBe(false)
       expect(hash1).toBe(hash(buffer1)) // Hashing same buffer should return same hash
 
       const uint8Array1 = new Uint8Array([1, 2, 3])
@@ -359,8 +760,9 @@ describe(`hash`, () => {
       const hash6 = hash(uint8Array3)
 
       expect(typeof hash4).toBe(hashType)
+      expect(typeof hash6).toBe(hashType)
       expect(hash4).toBe(hash5) // Same content = same hash for small Uint8Arrays
-      expect(hash4).not.toBe(hash6) // Different uint8Array content should have different hash
+      expect(equalHashValues(uint8Array1, uint8Array3)).toBe(false)
       expect(hash4).toBe(hash(uint8Array1)) // Hashing same uint8Array should return same hash
     })
 
@@ -379,7 +781,8 @@ describe(`hash`, () => {
       const hash2 = hash(largeBuffer2)
 
       expect(typeof hash1).toBe(hashType)
-      expect(hash1).not.toBe(hash2) // Same content but different instances = different hash for large buffers
+      expect(typeof hash2).toBe(hashType)
+      expect(equalHashValues(largeBuffer1, largeBuffer2)).toBe(false)
       expect(hash1).toBe(hash(largeBuffer1)) // Hashing same buffer should return same hash
 
       const largeUint8Array1 = new Uint8Array(300)
@@ -395,7 +798,8 @@ describe(`hash`, () => {
       const hash4 = hash(largeUint8Array2)
 
       expect(typeof hash3).toBe(hashType)
-      expect(hash3).not.toBe(hash4) // Same content but different instances = different hash for large Uint8Arrays
+      expect(typeof hash4).toBe(hashType)
+      expect(equalHashValues(largeUint8Array1, largeUint8Array2)).toBe(false)
       expect(hash3).toBe(hash(largeUint8Array1)) // Hashing same uint8Array should return same hash
 
       // Files are always hashed by reference regardless of size
@@ -408,8 +812,10 @@ describe(`hash`, () => {
       const hash9 = hash(file3)
 
       expect(typeof hash7).toBe(hashType)
-      expect(hash7).not.toBe(hash8) // Same content but different file instances have a different hash because it would be too costly to deeply hash files
-      expect(hash7).not.toBe(hash9) // Different file content should have different hash
+      expect(typeof hash8).toBe(hashType)
+      expect(typeof hash9).toBe(hashType)
+      expect(equalHashValues(file1, file2)).toBe(false)
+      expect(equalHashValues(file1, file3)).toBe(false)
       expect(hash7).toBe(hash(file1)) // Hashing same file should return same hash
     })
   })
@@ -452,7 +858,7 @@ describe(`hash`, () => {
     it(`should handle empty objects and arrays`, () => {
       expect(typeof hash({})).toBe(hashType)
       expect(typeof hash([])).toBe(hashType)
-      expect(hash({})).not.toBe(hash([]))
+      expect(equalHashValues({}, [])).toBe(false)
     })
 
     it(`should handle objects with null and undefined values`, () => {
@@ -478,7 +884,7 @@ describe(`hash`, () => {
 
       expect(typeof hash1).toBe(hashType)
       expect(typeof hash2).toBe(hashType)
-      expect(hash1).not.toBe(hash2)
+      expect(equalHashValues(array, map)).toBe(false)
     })
 
     it(`should handle mixed type arrays`, () => {

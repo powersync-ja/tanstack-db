@@ -3,12 +3,10 @@ id: DeltaType
 title: DeltaType
 ---
 
-# Type Alias: DeltaType
-
 ```ts
 type DeltaType = "enter" | "exit" | "update";
 ```
 
-Defined in: [packages/db/src/query/effect.ts:35](https://github.com/TanStack/db/blob/main/packages/db/src/query/effect.ts#L35)
+Defined in: [packages/db/src/query/effect.ts:55](https://github.com/TanStack/db/blob/main/packages/db/src/query/effect.ts#L55)
 
 Event types for query result deltas

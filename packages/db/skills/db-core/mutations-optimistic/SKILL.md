@@ -6,10 +6,10 @@ description: >
   createPacedMutations with debounceStrategy, throttleStrategy, queueStrategy.
   createTransaction, getActiveTransaction, ambient transaction context.
   Transaction lifecycle (pending/persisting/completed/failed). Mutation merging.
-  onInsert/onUpdate/onDelete handlers. PendingMutation type. Transaction.isPersisted.
+  onInsert/onUpdate/onDelete handlers. PendingMutation type. Transaction.when('settled').
 type: sub-skill
 library: db
-library_version: '0.6.0'
+library_version: '0.6.17'
 sources:
   - 'TanStack/db:docs/guides/mutations.md'
   - 'TanStack/db:packages/db/src/transactions.ts'
@@ -24,7 +24,7 @@ sources:
 > handlers) before you can mutate.
 
 TanStack DB mutations follow a unidirectional loop:
-**optimistic mutation -> handler persists to backend -> sync back -> confirmed state**.
+**optimistic mutation -> handler persists -> handler waits for sync/ack -> confirmed state**.
 Optimistic state is applied in the current tick and dropped when the handler resolves.
 
 ---
@@ -34,17 +34,19 @@ Optimistic state is applied in the current tick and dropped when the handler res
 ### insert
 
 ```ts
+import { safeRandomUUID } from '@tanstack/db'
+
 // Single item
 todoCollection.insert({
-  id: crypto.randomUUID(),
+  id: safeRandomUUID(),
   text: 'Buy groceries',
   completed: false,
 })
 
 // Multiple items
 todoCollection.insert([
-  { id: crypto.randomUUID(), text: 'Buy groceries', completed: false },
-  { id: crypto.randomUUID(), text: 'Walk dog', completed: false },
+  { id: safeRandomUUID(), text: 'Buy groceries', completed: false },
+  { id: safeRandomUUID(), text: 'Walk dog', completed: false },
 ])
 
 // With metadata / non-optimistic
@@ -86,8 +88,15 @@ todoCollection.delete([id1, id2])
 todoCollection.delete(todo.id, { metadata: { reason: 'completed' } })
 ```
 
-All three return a `Transaction` object. Use `tx.isPersisted.promise` to await
-persistence or catch rollback errors.
+All three return a `Transaction` object. Use `tx.when('settled')` to await
+settlement or catch rollback errors. For a non-empty transaction, this normally
+means its `mutationFn` returned; it proves upload, confirmation, or read-back
+only when that function waits for the backend observation before returning.
+
+Do not start or await collection preloads, live-query preloads, or direct
+`loadSubset()` calls inside `mutationFn`. Sync commits queue behind mutation
+persistence, so the preload can wait on the mutation that is waiting on it.
+Use the collection adapter's documented mutation acknowledgement pattern.
 
 ---
 
@@ -118,7 +127,7 @@ const likePost = createOptimisticAction<string>({
 
 // Returns a Transaction
 const tx = likePost(postId)
-await tx.isPersisted.promise
+await tx.when('settled')
 ```
 
 Multi-collection example:
@@ -127,7 +136,7 @@ Multi-collection example:
 const createProject = createOptimisticAction<{ name: string; ownerId: string }>(
   {
     onMutate: ({ name, ownerId }) => {
-      projectCollection.insert({ id: crypto.randomUUID(), name, ownerId })
+      projectCollection.insert({ id: safeRandomUUID(), name, ownerId })
       userCollection.update(ownerId, (d) => {
         d.projectCount += 1
       })
@@ -207,7 +216,9 @@ await tx.commit()
 
 Inside `tx.mutate(() => { ... })`, the transaction is pushed onto an ambient
 stack. Any `collection.insert/update/delete` call joins the ambient transaction
-automatically via `getActiveTransaction()`.
+automatically via `getActiveTransaction()`. That scope is synchronous:
+collection operations after an `await` do not join it. Put async work in
+`mutationFn`, or call `mutate()` again before committing.
 
 For mutations captured by a manual transaction, collection-level
 `onInsert`/`onUpdate`/`onDelete` handlers are not invoked automatically. The
@@ -217,48 +228,50 @@ a good fit for draft-style flows where local state updates immediately but the
 server call waits for Save/Blur; call `tx.rollback()` to discard the optimistic
 changes.
 
-### 4. Mutation handler with refetch (QueryCollection pattern)
+### 4. Mutation handlers with explicit refetch (QueryCollection pattern)
 
 ```ts
 const todoCollection = createCollection(
-  queryCollectionOptions({
+  queryCollectionOptions<{ id: string; text: string; completed: boolean }>({
     queryKey: ['todos'],
+    queryClient,
     queryFn: () => api.todos.getAll(),
     getKey: (t) => t.id,
-    onInsert: async ({ transaction }) => {
+    onInsert: async ({ transaction, collection }) => {
       await Promise.all(
         transaction.mutations.map((m) => api.todos.create(m.modified)),
       )
-      // IMPORTANT: handler must not resolve until server state is synced back
-      // QueryCollection auto-refetches after handler completes
+      await collection.utils.refetch()
     },
-    onUpdate: async ({ transaction }) => {
+    onUpdate: async ({ transaction, collection }) => {
       await Promise.all(
         transaction.mutations.map((m) =>
           api.todos.update(m.original.id, m.changes),
         ),
       )
+      await collection.utils.refetch()
     },
-    onDelete: async ({ transaction }) => {
+    onDelete: async ({ transaction, collection }) => {
       await Promise.all(
         transaction.mutations.map((m) => api.todos.delete(m.original.id)),
       )
+      await collection.utils.refetch()
     },
   }),
 )
 ```
 
-For ElectricCollection, return `{ txid }` instead of refetching:
+For ElectricCollection, wait for each txid in the Electric stream:
 
 ```ts
-onUpdate: async ({ transaction }) => {
+onUpdate: async ({ transaction, collection }) => {
   const txids = await Promise.all(
     transaction.mutations.map(async (m) => {
       const res = await api.todos.update(m.original.id, m.changes)
       return res.txid
     }),
   )
-  return { txid: txids }
+  await Promise.all(txids.map((txid) => collection.utils.awaitTxId(txid)))
 }
 ```
 
@@ -308,7 +321,7 @@ createOptimisticAction({
 // CORRECT
 createOptimisticAction({
   onMutate: (text) => {
-    collection.insert({ id: crypto.randomUUID(), text })
+    collection.insert({ id: safeRandomUUID(), text })
   },
   ...
 })
@@ -338,28 +351,30 @@ re-insert.
 ### HIGH: Inserting item with duplicate key
 
 If an item with the same key already exists (synced or optimistic), throws
-`DuplicateKeyError`. Always generate a unique key (e.g. `crypto.randomUUID()`)
+`DuplicateKeyError`. Always generate a unique key (e.g. `safeRandomUUID()`)
 or check before inserting.
 
-### HIGH: Not awaiting refetch after mutation in query collection handler
+### HIGH: Returning before Query Collection has confirmed data
 
-The optimistic state is held only until the handler resolves. If the handler
-returns before server state has synced back, optimistic state is dropped and
-users see a flash of missing data.
+Query Collection does not refetch after `onInsert`, `onUpdate`, or `onDelete`.
+A server write alone leaves synced rows unchanged. When the handler returns,
+its optimistic state drops, so the previous synced rows reappear.
 
 ```ts
-// WRONG -- optimistic state dropped before new server state arrives
+// WRONG -- the optimistic insert disappears at settlement
 onInsert: async ({ transaction }) => {
   await api.createTodo(transaction.mutations[0].modified)
-  // missing: await collection.utils.refetch()
 }
 
-// CORRECT
-onInsert: async ({ transaction }) => {
+// CORRECT -- explicitly read back the server state
+onInsert: async ({ transaction, collection }) => {
   await api.createTodo(transaction.mutations[0].modified)
   await collection.utils.refetch()
 }
 ```
+
+Alternatively, await a direct-write utility with the confirmed server result.
+Handlers return `Promise<void>`; `{ refetch: false }` is no longer supported.
 
 ---
 
@@ -372,7 +387,7 @@ which can discard user work the user thought was saved. Consider:
 - Showing pending/saving indicators so users know state is unconfirmed
 - Using `{ optimistic: false }` for destructive operations
 - Designing idempotent server endpoints so retries are safe
-- Handling `tx.isPersisted.promise` rejection to surface errors to the user
+- Handling `tx.when('settled')` rejection to surface errors to the user
 
 ---
 

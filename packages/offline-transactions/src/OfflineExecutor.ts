@@ -1,5 +1,9 @@
 // Storage adapters
-import { createOptimisticAction, createTransaction } from '@tanstack/db'
+import {
+  createOptimisticAction,
+  createTransaction,
+  safeRandomUUID,
+} from '@tanstack/db'
 import { IndexedDBAdapter } from './storage/IndexedDBAdapter'
 import { LocalStorageAdapter } from './storage/LocalStorageAdapter'
 
@@ -22,7 +26,7 @@ import { createOfflineAction } from './api/OfflineAction'
 // TanStack DB primitives
 
 // Replay
-import { withNestedSpan, withSpan } from './telemetry/tracer'
+import { NonRetriableError } from './types'
 import type {
   CreateOfflineActionOptions,
   CreateOfflineTransactionOptions,
@@ -36,6 +40,9 @@ import type {
 } from './types'
 import type { Transaction } from '@tanstack/db'
 
+/** How many settled ids an executor remembers to reject late waiters. */
+const SETTLED_TRANSACTIONS_REMEMBERED = 1000
+
 export class OfflineExecutor {
   private config: OfflineConfig
 
@@ -47,6 +54,7 @@ export class OfflineExecutor {
   private leaderElection: LeaderElection | null
   private onlineDetector: OnlineDetector
   private isLeaderState = false
+  private disposed = false
   private unsubscribeOnline: (() => void) | null = null
   private unsubscribeLeadership: (() => void) | null = null
 
@@ -68,6 +76,12 @@ export class OfflineExecutor {
       reject: (error: Error) => void
     }
   > = new Map()
+
+  /**
+   * Ids this executor settled, oldest first. A waiter for one of them has
+   * nothing left to wait for. An unknown id can still arrive from another tab.
+   */
+  private readonly settledTransactions = new Set<string>()
 
   // Track restoration transactions for cleanup when offline transactions complete
   private restorationTransactions: Map<string, Transaction> = new Map()
@@ -96,7 +110,8 @@ export class OfflineExecutor {
       this.initResolve = resolve
       this.initReject = reject
     })
-
+    // Handle constructor-started rejection; waitForInit still observes it.
+    void this.initPromise.catch(() => {})
     this.initialize()
   }
 
@@ -205,14 +220,19 @@ export class OfflineExecutor {
     if (this.leaderElection) {
       this.unsubscribeLeadership = this.leaderElection.onLeadershipChange(
         (isLeader) => {
+          // A custom elector may repeat the initial result while replay is active.
+          if (this.disposed || isLeader === this.isLeaderState) return
           this.isLeaderState = isLeader
+          if (!isLeader) this.executor?.pause()
 
           if (this.config.onLeadershipChange) {
             this.config.onLeadershipChange(isLeader)
           }
 
           if (isLeader) {
-            this.loadAndReplayTransactions()
+            this.loadAndReplayTransactions().catch((error) => {
+              console.warn(`Failed to load and replay transactions:`, error)
+            })
           }
         },
       )
@@ -256,66 +276,70 @@ export class OfflineExecutor {
   }
 
   private async initialize(): Promise<void> {
-    return withSpan(`executor.initialize`, {}, async (span) => {
-      try {
-        // Probe storage and create adapter
-        const { storage, diagnostic } = await this.createStorage()
-
-        // Cast to writable to set readonly properties
-        ;(this as any).storage = storage
-        ;(this as any).storageDiagnostic = diagnostic
-        ;(this as any).mode = diagnostic.mode
-
-        span.setAttribute(`storage.mode`, diagnostic.mode)
-        span.setAttribute(`storage.code`, diagnostic.code)
-
-        if (!storage) {
-          // Online-only mode - notify callback and skip offline setup
-          if (this.config.onStorageFailure) {
-            this.config.onStorageFailure(diagnostic)
-          }
-          span.setAttribute(`result`, `online-only`)
-          this.initResolve()
-          return
-        }
-
-        // Storage available - set up offline components
-        this.outbox = new OutboxManager(storage, this.config.collections)
-        this.executor = new TransactionExecutor(
-          this.scheduler,
-          this.outbox,
-          this.config,
-          this,
-        )
-        this.leaderElection = this.createLeaderElection()
-
-        // Request leadership first
-        const isLeader = await this.leaderElection.requestLeadership()
-        this.isLeaderState = isLeader
-        span.setAttribute(`isLeader`, isLeader)
-
-        // Set up event listeners after leadership is established
-        // This prevents the callback from being called multiple times
-        this.setupEventListeners()
-
-        // Notify initial leadership state
-        if (this.config.onLeadershipChange) {
-          this.config.onLeadershipChange(isLeader)
-        }
-
-        if (isLeader) {
-          await this.loadAndReplayTransactions()
-        }
-        span.setAttribute(`result`, `offline-enabled`)
+    try {
+      // Probe storage and create adapter
+      const { storage, diagnostic } = await this.createStorage()
+      if (this.disposed) {
         this.initResolve()
-      } catch (error) {
-        console.warn(`Failed to initialize offline executor:`, error)
-        span.setAttribute(`result`, `failed`)
-        this.initReject(
-          error instanceof Error ? error : new Error(String(error)),
-        )
+        return
       }
-    })
+
+      // Cast to writable to set readonly properties
+      ;(this as any).storage = storage
+      ;(this as any).storageDiagnostic = diagnostic
+      ;(this as any).mode = diagnostic.mode
+
+      if (!storage) {
+        // Online-only mode - notify callback and skip offline setup
+        if (this.config.onStorageFailure) {
+          this.config.onStorageFailure(diagnostic)
+        }
+        this.initResolve()
+        return
+      }
+
+      // Storage available - set up offline components
+      this.outbox = new OutboxManager(
+        storage,
+        this.config.collections,
+        this.config.mutationCodec,
+      )
+      this.executor = new TransactionExecutor(
+        this.scheduler,
+        this.outbox,
+        this.config,
+        this,
+      )
+      this.leaderElection = this.createLeaderElection()
+
+      // Request leadership first
+      const isLeader = await this.leaderElection.requestLeadership()
+      // Disposal may have run while leadership was pending.
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+      if (this.disposed) {
+        this.leaderElection.releaseLeadership()
+        this.initResolve()
+        return
+      }
+      this.isLeaderState = isLeader
+
+      // Set up event listeners after leadership is established
+      // This prevents the callback from being called multiple times
+      this.setupEventListeners()
+
+      // Notify initial leadership state
+      if (this.config.onLeadershipChange) {
+        this.config.onLeadershipChange(isLeader)
+      }
+
+      if (isLeader) {
+        await this.loadAndReplayTransactions()
+      }
+      this.initResolve()
+    } catch (error) {
+      console.warn(`Failed to initialize offline executor:`, error)
+      this.initReject(error instanceof Error ? error : new Error(String(error)))
+    }
   }
 
   private async loadAndReplayTransactions(): Promise<void> {
@@ -323,22 +347,17 @@ export class OfflineExecutor {
       return
     }
 
-    try {
-      // Load pending transactions and restore optimistic state
-      await this.executor.loadPendingTransactions()
+    // Startup must observe a failed read instead of reporting an empty outbox.
+    await this.executor.loadPendingTransactions()
 
-      // Start execution in the background - don't await to avoid blocking initialization
-      // The transactions will execute and complete asynchronously
-      this.executor.executeAll().catch((error) => {
-        console.warn(`Failed to execute transactions:`, error)
-      })
-    } catch (error) {
-      console.warn(`Failed to load and replay transactions:`, error)
-    }
+    // Replay completion is separate from initialization and durable admission.
+    this.executor.executeAll().catch((error) => {
+      console.warn(`Failed to execute transactions:`, error)
+    })
   }
 
   get isOfflineEnabled(): boolean {
-    return this.mode === `offline` && this.isLeaderState
+    return !this.disposed && this.mode === `offline` && this.isLeaderState
   }
 
   /**
@@ -367,7 +386,7 @@ export class OfflineExecutor {
         mutationFn: (params) =>
           mutationFn({
             ...params,
-            idempotencyKey: options.idempotencyKey || crypto.randomUUID(),
+            idempotencyKey: options.idempotencyKey || safeRandomUUID(),
           }),
         metadata: options.metadata,
       })
@@ -399,7 +418,7 @@ export class OfflineExecutor {
             mutationFn({
               ...vars,
               ...params,
-              idempotencyKey: crypto.randomUUID(),
+              idempotencyKey: safeRandomUUID(),
             }),
           onMutate: options.onMutate,
         })
@@ -423,33 +442,33 @@ export class OfflineExecutor {
     // Wait for initialization to complete
     await this.initPromise
 
-    return withNestedSpan(
-      `executor.persistTransaction`,
-      {
-        'transaction.id': transaction.id,
-        'transaction.mutationFnName': transaction.mutationFnName,
-      },
-      async (span) => {
-        if (!this.isOfflineEnabled || !this.outbox || !this.executor) {
-          span.setAttribute(`result`, `skipped_not_leader`)
-          this.resolveTransaction(transaction.id, undefined)
-          return
-        }
+    if (!this.isOfflineEnabled || !this.outbox || !this.executor) {
+      throw new NonRetriableError(`Offline transaction was not admitted`)
+    }
 
-        try {
-          await this.outbox.add(transaction)
-          await this.executor.execute(transaction)
-          span.setAttribute(`result`, `persisted`)
-        } catch (error) {
-          console.error(
-            `Failed to persist offline transaction ${transaction.id}:`,
-            error,
-          )
-          span.setAttribute(`result`, `failed`)
-          throw error
-        }
-      },
-    )
+    try {
+      this.executor.assertHealthy()
+      await this.outbox.add(transaction)
+      // A shared queue error belongs to its execution, not every caller
+      // that durably admitted a transaction. Per-ID signals settle callers.
+      this.executor.execute(transaction).catch((error) => {
+        console.warn(`Failed to execute transactions:`, error)
+      })
+    } catch (error) {
+      console.error(
+        `Failed to persist offline transaction ${transaction.id}:`,
+        error,
+      )
+      throw error
+    }
+  }
+
+  private rememberSettled(transactionId: string): void {
+    this.settledTransactions.add(transactionId)
+    if (this.settledTransactions.size > SETTLED_TRANSACTIONS_REMEMBERED)
+      this.settledTransactions.delete(
+        this.settledTransactions.values().next().value!,
+      )
   }
 
   // Method for OfflineTransaction to wait for completion
@@ -458,6 +477,10 @@ export class OfflineExecutor {
     if (existing) {
       return existing.promise
     }
+    if (this.settledTransactions.has(transactionId))
+      throw new Error(
+        `Offline transaction ${transactionId} already settled; wait for it before it settles`,
+      )
 
     const deferred: {
       promise: Promise<any>
@@ -476,6 +499,7 @@ export class OfflineExecutor {
 
   // Method for TransactionExecutor to signal completion
   resolveTransaction(transactionId: string, result: any): void {
+    this.rememberSettled(transactionId)
     const deferred = this.pendingTransactionPromises.get(transactionId)
     if (deferred) {
       deferred.resolve(result)
@@ -488,6 +512,7 @@ export class OfflineExecutor {
 
   // Method for TransactionExecutor to signal failure
   rejectTransaction(transactionId: string, error: Error): void {
+    this.rememberSettled(transactionId)
     const deferred = this.pendingTransactionPromises.get(transactionId)
     if (deferred) {
       deferred.reject(error)
@@ -525,26 +550,13 @@ export class OfflineExecutor {
       return
     }
 
-    // Mark as completed so recomputeOptimisticState removes it from consideration.
-    // The actual data will come from the sync.
-    restorationTx.setState(`completed`)
+    // A sibling rollback can settle this snapshot before its durable work.
+    if (restorationTx.state !== `pending`) return
 
-    // Remove from each collection's transaction map and recompute
-    const touchedCollections = new Set<string>()
-    for (const mutation of restorationTx.mutations) {
-      // Defensive check for corrupted deserialized data
-      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-      if (!mutation.collection) {
-        continue
-      }
-      const collectionId = mutation.collection.id
-      if (touchedCollections.has(collectionId)) {
-        continue
-      }
-      touchedCollections.add(collectionId)
-      mutation.collection._state.transactions.delete(restorationTx.id)
-      mutation.collection._state.recomputeOptimisticState(false)
-    }
+    // Mark as completed: every Collection that tracked it recomputes and
+    // releases it. The actual data will come from the sync.
+    restorationTx.completeWithoutCommit()
+    restorationTx.touchCollection()
   }
 
   async removeFromOutbox(id: string): Promise<void> {
@@ -592,6 +604,8 @@ export class OfflineExecutor {
   }
 
   dispose(): void {
+    this.disposed = true
+    this.executor?.pause()
     for (const collection of Object.values(this.config.collections)) {
       collection.deferDataRefresh = null
     }

@@ -35,6 +35,27 @@ export {
   type Prettify,
 } from './builder/index.js'
 
+// Pooled live queries for framework hooks
+export {
+  pooledLiveQueries,
+  type PooledLiveQueries,
+} from './pooled-live-query.js'
+
+// Grouping without aggregates
+export { groupKeys, type GroupKeys } from './builder/group-keys.js'
+export type { OperatorCallback } from './builder/types.js'
+
+// Operator code for query IR built by hand: `IR.Aggregate` takes the grouping
+// compiler, and `IR.IncludesSubquery` the include runtime.
+export {
+  grouping as groupingCompiler,
+  type Grouping,
+} from './compiler/grouping.js'
+export {
+  includesRuntime,
+  type IncludesRuntime,
+} from './live/includes-runtime.js'
+
 // Expression functions exports
 export {
   // Operators
@@ -59,16 +80,17 @@ export {
   coalesce,
   caseWhen,
   add,
+  subtract,
+  multiply,
+  divide,
   // Aggregates
   count,
   avg,
   sum,
   min,
   max,
-  // Includes helpers
-  toArray,
-  materialize,
 } from './builder/functions.js'
+export { include, materialize, toArray } from './builder/include-functions.js'
 
 // Ref proxy utilities
 export type { Ref } from './builder/types.js'
@@ -90,18 +112,21 @@ export {
 // One-shot query execution
 export { queryOnce, type QueryOnceConfig } from './query-once.js'
 
-export { type LiveQueryCollectionConfig } from './live/types.js'
-export { type LiveQueryCollectionUtils } from './live/collection-config-builder.js'
-
-// Predicate utilities for predicate push-down
 export {
-  isWhereSubset,
-  unionWherePredicates,
-  minusWherePredicates,
-  isOrderBySubset,
-  isLimitSubset,
-  isOffsetLimitSubset,
-  isPredicateSubset,
-} from './predicate-utils.js'
+  type LiveQueryCollectionConfig,
+  type LiveQueryHookConfig,
+} from './live/types.js'
+export { type LiveQueryCollectionUtils } from './live/collection-config-builder.js'
+export {
+  UnhashableQueryIRError,
+  canonicalizeQueryIR,
+  getLoadSubsetDemandKey,
+  getQueryIdentity,
+  getStableQueryBuilderHash,
+  getStableQueryIRHash,
+  getStableValueHash,
+  type DemandKey,
+  type QueryIdentity,
+} from './ir-stable-identity.js'
 
 export { DeduplicatedLoadSubset } from './subset-dedupe.js'

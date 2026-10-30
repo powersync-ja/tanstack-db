@@ -583,7 +583,7 @@ describe(`Collection with schema validation`, () => {
         .array(z.string())
         .transform((val) => val.map((tag) => tag.toLowerCase())),
       metadata: z
-        .record(z.string())
+        .record(z.string(), z.string())
         .transform((val) => ({ ...val, processed: true })),
     })
 
@@ -655,9 +655,9 @@ describe(`Collection with schema validation`, () => {
         .transform((val) => val.map((tag) => tag.toLowerCase())),
       metadata: z
         .union([
-          z.record(z.string()),
+          z.record(z.string(), z.string()),
           z
-            .record(z.string())
+            .record(z.string(), z.string())
             .transform((val) => ({ ...val, processed: true })),
         ])
         .transform((val) => ({ ...val, processed: true })),
@@ -668,7 +668,7 @@ describe(`Collection with schema validation`, () => {
       schema: userSchema,
       startSync: true,
       sync: {
-        sync: ({ begin, write, commit }) => {
+        sync: ({ begin, write, commit, markReady }) => {
           begin()
           // Insert initial data
           write({
@@ -685,6 +685,7 @@ describe(`Collection with schema validation`, () => {
             },
           })
           commit()
+          markReady()
         },
       },
     })
@@ -833,7 +834,7 @@ describe(`Collection with schema validation`, () => {
       schema: updateSchema,
       startSync: true,
       sync: {
-        sync: ({ begin, write, commit }) => {
+        sync: ({ begin, write, commit, markReady }) => {
           begin()
           // Add the transformed insert data
           write({
@@ -841,6 +842,7 @@ describe(`Collection with schema validation`, () => {
             value: insertMutation.modified as any,
           })
           commit()
+          markReady()
         },
       },
     })

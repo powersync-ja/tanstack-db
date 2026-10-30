@@ -1,19 +1,20 @@
 ---
 name: react-db
 description: >
-  React bindings for TanStack DB. useLiveQuery hook with dependency arrays
-  (8 overloads: query function, config object, pre-created collection,
-  disabled state via returning undefined/null). useLiveSuspenseQuery for
+  React bindings for TanStack DB. Prefer useLiveQuery({ query }) with
+  derived structured query identity. Provide queryKey only for opaque
+  functional query variants or very hot render paths. Dependency arrays are
+  legacy and warn before 1.0 removal. useLiveSuspenseQuery for
   React Suspense with Error Boundaries (data always defined).
   useLiveInfiniteQuery for cursor-based pagination (pageSize, fetchNextPage,
   hasNextPage, isFetchingNextPage). usePacedMutations for debounced React
   state updates. Return shape: data, state, collection, status, isLoading,
-  isReady, isError. Import from @tanstack/react-db (re-exports all of
-  @tanstack/db).
+  isReady, isLoadingError, isCrashed, isSyncError, health. Import from
+  @tanstack/react-db (re-exports all of @tanstack/db).
 type: framework
 library: db
 framework: react
-library_version: '0.6.0'
+library_version: '0.6.17'
 requires:
   - db-core
 sources:
@@ -30,15 +31,16 @@ This skill builds on db-core. Read it first for collection setup, query builder,
 ## Setup
 
 ```tsx
-import { useLiveQuery, eq, not } from '@tanstack/react-db'
+import { eq, not, useLiveQuery } from '@tanstack/react-db'
 
 function TodoList() {
-  const { data: todos, isLoading } = useLiveQuery((q) =>
-    q
-      .from({ todo: todoCollection })
-      .where(({ todo }) => not(todo.completed))
-      .orderBy(({ todo }) => todo.created_at, 'asc'),
-  )
+  const { data: todos, isLoading } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ todo: todoCollection })
+        .where(({ todo }) => not(todo.completed))
+        .orderBy(({ todo }) => todo.created_at, 'asc'),
+  })
 
   if (isLoading) return <div>Loading...</div>
 
@@ -59,7 +61,7 @@ function TodoList() {
 ### useLiveQuery
 
 ```tsx
-// Query function with dependency array
+// Preferred config object with derived query identity
 const {
   data,
   state,
@@ -67,38 +69,43 @@ const {
   status,
   isLoading,
   isReady,
-  isError,
+  isLoadingError, // the first load failed: nothing to show
+  isCrashed, // status 'crashed': local storage broke
   isIdle,
   isCleanedUp,
-} = useLiveQuery(
-  (q) =>
+  isSyncError, // data is shown, but a sync problem is in health
+  health, // health tree: one node for the query and one per source
+} = useLiveQuery({
+  query: (q) =>
     q
       .from({ todo: todoCollection })
       .where(({ todo }) => eq(todo.userId, userId)),
-  [userId],
-)
+})
 
-// Config object
+// Static query
 const { data } = useLiveQuery({
   query: (q) => q.from({ todo: todoCollection }),
   gcTime: 60000,
 })
 
 // Pre-created collection (from route loader)
-const { data } = useLiveQuery(preloadedCollection)
+const { data } = useLiveQuery(preloadedTodos)
 
-// Conditional query — return undefined/null to disable
-const { data, status } = useLiveQuery(
-  (q) => {
+// Conditional query — derived identity handles enabled/disabled transitions
+const { data, status } = useLiveQuery({
+  query: (q) => {
     if (!userId) return undefined
     return q
       .from({ todo: todoCollection })
       .where(({ todo }) => eq(todo.userId, userId))
   },
-  [userId],
-)
+})
 // When disabled: status='disabled', data=undefined
 ```
+
+`isLoadingError` means the first load failed and there is nothing to show; offer `collection.reload()`. `isCrashed` means local storage broke; only `cleanup({ dependents: true })` and a fresh start recover. After the query is ready, sync problems never change `status`: read `isSyncError` or the `health` tree to show stale-data warnings. `isError` and node `phase` were removed.
+
+Many queries of one shape, such as one per list row, can share one partition. Pass `pool: pooledLiveQueries` (from `@tanstack/db`) in the config form: `useLiveQuery({ query, pool: pooledLiveQueries })`. Pooling applies to queries that filter one eager source with `eq(field, literal)`. It is off by default, and Suspense and `DbClient` queries never pool.
 
 ### useLiveSuspenseQuery
 
@@ -106,9 +113,9 @@ const { data, status } = useLiveQuery(
 // data is ALWAYS defined — never undefined
 // Must wrap in <Suspense> and <ErrorBoundary>
 function TodoList() {
-  const { data: todos } = useLiveSuspenseQuery((q) =>
-    q.from({ todo: todoCollection }),
-  )
+  const { data: todos } = useLiveSuspenseQuery({
+    query: (q) => q.from({ todo: todoCollection }),
+  })
 
   return (
     <ul>
@@ -119,14 +126,13 @@ function TodoList() {
   )
 }
 
-// With deps — re-suspends when deps change
-const { data } = useLiveSuspenseQuery(
-  (q) =>
+// Structured captured values are part of the derived identity and re-suspend when changed
+const { data } = useLiveSuspenseQuery({
+  query: (q) =>
     q
       .from({ todo: todoCollection })
       .where(({ todo }) => eq(todo.category, category)),
-  [category],
-)
+})
 ```
 
 ### useLiveInfiniteQuery
@@ -137,9 +143,11 @@ const { data, fetchNextPage, hasNextPage, isFetchingNextPage } =
     (q) =>
       q
         .from({ posts: postsCollection })
+        .where(({ posts }) => eq(posts.category, category))
         .orderBy(({ posts }) => posts.createdAt, 'desc'),
-    { pageSize: 20 },
-    [category],
+    {
+      pageSize: 20,
+    },
   )
 
 // data is the flat array of all loaded pages
@@ -170,20 +178,23 @@ const mutate = usePacedMutations({
 
 ## Includes (Hierarchical Data)
 
-When a query uses includes (subqueries in `select`), each child field is a live `Collection` by default. Subscribe to it with `useLiveQuery` in a subcomponent:
+When a query uses `include()` for a subquery in `select`, each child field is a live `Collection`. Subscribe to it with `useLiveQuery` in a subcomponent:
 
 ```tsx
 function ProjectList() {
-  const { data: projects } = useLiveQuery((q) =>
-    q.from({ p: projectsCollection }).select(({ p }) => ({
-      id: p.id,
-      name: p.name,
-      issues: q
-        .from({ i: issuesCollection })
-        .where(({ i }) => eq(i.projectId, p.id))
-        .select(({ i }) => ({ id: i.id, title: i.title })),
-    })),
-  )
+  const { data: projects } = useLiveQuery({
+    query: (q) =>
+      q.from({ p: projectsCollection }).select(({ p }) => ({
+        id: p.id,
+        name: p.name,
+        issues: include(
+          q
+            .from({ i: issuesCollection })
+            .where(({ i }) => eq(i.projectId, p.id))
+            .select(({ i }) => ({ id: i.id, title: i.title })),
+        ),
+      })),
+  })
 
   return (
     <ul>
@@ -217,19 +228,20 @@ With `toArray()`, child results are plain arrays and the parent re-renders on ch
 ```tsx
 import { toArray, eq } from '@tanstack/react-db'
 
-const { data: projects } = useLiveQuery((q) =>
-  q.from({ p: projectsCollection }).select(({ p }) => ({
-    id: p.id,
-    name: p.name,
-    issues: toArray(
-      q
-        .from({ i: issuesCollection })
-        .where(({ i }) => eq(i.projectId, p.id))
-        .select(({ i }) => ({ id: i.id, title: i.title })),
-    ),
-  })),
-)
-// project.issues is string[] — no subcomponent needed
+const { data: projects } = useLiveQuery({
+  query: (q) =>
+    q.from({ p: projectsCollection }).select(({ p }) => ({
+      id: p.id,
+      name: p.name,
+      issues: toArray(
+        q
+          .from({ i: issuesCollection })
+          .where(({ i }) => eq(i.projectId, p.id))
+          .select(({ i }) => ({ id: i.id, title: i.title })),
+      ),
+    })),
+})
+// project.issues is Array<{ id: string; title: string }> — no subcomponent needed
 ```
 
 See db-core/live-queries/SKILL.md for full includes rules (correlation conditions, nested includes, aggregates).
@@ -238,7 +250,8 @@ See db-core/live-queries/SKILL.md for full includes rules (correlation condition
 
 Live query results include computed, read-only virtual properties on every row:
 
-- `$synced`: `true` when the row is confirmed by sync; `false` when it is still optimistic.
+- `$hasPendingWrites`: `true` while a pending local optimistic write affects
+  the row; `false` otherwise. It does not prove backend confirmation.
 - `$origin`: `"local"` if the last confirmed change came from this client, otherwise `"remote"`.
 - `$key`: the row key for the result.
 - `$collectionId`: the source collection ID.
@@ -246,37 +259,53 @@ Live query results include computed, read-only virtual properties on every row:
 These props are added automatically and can be used in `where`, `select`, and `orderBy` clauses. Do not persist them back to storage.
 
 ```tsx
-const { data } = useLiveQuery(
-  (q) =>
+const { data } = useLiveQuery({
+  query: (q) =>
     q
       .from({ todo: todoCollection })
-      .where(({ todo }) => eq(todo.$synced, false)),
-  [],
-)
-// Shows only optimistic (unconfirmed) todos
+      .where(({ todo }) => eq(todo.$hasPendingWrites, true)),
+})
+// Shows rows with pending local optimistic writes
 ```
 
 ## React-Specific Patterns
 
-### Dependency arrays
+### Query identity
 
 ```tsx
-// Include ALL external reactive values
-const { data } = useLiveQuery(
-  (q) =>
+// Structured captured values are included in the derived identity
+const { data } = useLiveQuery({
+  query: (q) =>
     q
       .from({ todo: todoCollection })
       .where(({ todo }) =>
         and(eq(todo.userId, userId), eq(todo.status, filter)),
       ),
-  [userId, filter],
-)
+})
 
-// Empty array = static query, never re-runs
-const { data } = useLiveQuery((q) => q.from({ todo: todoCollection }), [])
-
-// No array = re-runs on every render (usually wrong)
+// Static query
+const { data } = useLiveQuery({
+  query: (q) => q.from({ todo: todoCollection }),
+})
 ```
+
+Use `queryKey` only when DB cannot derive identity from structured IR, such as
+`.fn.where`, `.fn.select`, `.fn.having`, or as a deliberate performance escape
+hatch on a hot render path:
+
+```tsx
+const { data } = useLiveQuery({
+  queryKey: [todoCollection.id, 'search', search],
+  query: (q) =>
+    q.from({ todo: todoCollection }).fn.where(({ todo }) => {
+      return fuzzyMatch(todo.title, search)
+    }),
+})
+```
+
+Unhashable IR without `queryKey` throws `UnhashableQueryIRError`, even with a
+dependency array. Slow or repeated derived identity work warns once and points
+to the same `queryKey` escape hatch.
 
 ### Suspense + Error Boundary
 
@@ -295,36 +324,92 @@ const { data } = useLiveQuery((q) => q.from({ todo: todoCollection }), [])
 await todoCollection.preload()
 
 // In component — data available immediately:
-const { data } = useLiveQuery((q) => q.from({ todo: todoCollection }))
+const { data } = useLiveQuery({
+  query: (q) => q.from({ todo: todoCollection }),
+})
 ```
 
 See meta-framework/SKILL.md for full preloading patterns.
 
 ## Common Mistakes
 
-### CRITICAL Missing external values in dependency array
+### CRITICAL Using === instead of eq() in .where()
+
+Wrong — throws `InvalidWhereExpressionError` at runtime:
+
+```tsx
+const { data } = useLiveQuery({
+  query: (q) =>
+    q
+      .from({ todo: todoCollection })
+      .where(({ todo }) => todo.completed === true),
+})
+```
+
+Correct — use expression functions from `@tanstack/react-db`:
+
+```tsx
+import { useLiveQuery, eq } from '@tanstack/react-db'
+
+const { data } = useLiveQuery({
+  query: (q) =>
+    q
+      .from({ todo: todoCollection })
+      .where(({ todo }) => eq(todo.completed, true)),
+})
+```
+
+JavaScript `===`, `!==`, `<`, and `>` evaluate immediately and return a boolean. Use expression functions such as `eq`, `gt`, `gte`, `lt`, `lte`, `and`, `or`, and `not` for structured `.where()` predicates. See db-core/live-queries/SKILL.md for the full operator reference.
+
+### CRITICAL Assigning useLiveQuery result directly instead of destructuring
+
+Wrong — crashes with "map is not a function":
+
+```tsx
+const todos = useLiveQuery({
+  query: (q) => q.from({ todo: todoCollection }),
+})
+return todos.map((t) => <li>{t.text}</li>) // TypeError: todos.map is not a function
+```
+
+Correct — destructure `{ data }`:
+
+```tsx
+const { data: todos } = useLiveQuery({
+  query: (q) => q.from({ todo: todoCollection }),
+})
+return todos.map((t) => <li key={t.id}>{t.text}</li>)
+```
+
+`useLiveQuery` returns an object with `data`, `isLoading`, `status`, and other fields. For queries that can be disabled, use `{ data: todos = [] }` to handle `data` being `undefined`.
+
+### CRITICAL Using opaque query logic without queryKey
 
 Wrong:
 
 ```tsx
-const { data } = useLiveQuery((q) =>
-  q.from({ todo: todoCollection }).where(({ todo }) => eq(todo.userId, userId)),
-)
+const { data } = useLiveQuery({
+  query: (q) =>
+    q.from({ todo: todoCollection }).fn.where(({ todo }) => {
+      return fuzzyMatch(todo.title, search)
+    }),
+})
 ```
 
 Correct:
 
 ```tsx
-const { data } = useLiveQuery(
-  (q) =>
-    q
-      .from({ todo: todoCollection })
-      .where(({ todo }) => eq(todo.userId, userId)),
-  [userId],
-)
+const { data } = useLiveQuery({
+  queryKey: [todoCollection.id, 'search', search],
+  query: (q) =>
+    q.from({ todo: todoCollection }).fn.where(({ todo }) => {
+      return fuzzyMatch(todo.title, search)
+    }),
+})
 ```
 
-When the query uses external state not in the deps array, the query won't re-run when that value changes, showing stale results.
+Structured expressions are hashable by default. Functional query variants are
+opaque runtime code, so they need an explicit key to say when identity changes.
 
 Source: docs/framework/react/overview.md
 
@@ -354,7 +439,12 @@ Source: docs/guides/live-queries.md
 
 ### HIGH "Not a Collection" error from duplicate @tanstack/db
 
-If `useLiveQuery` throws `InvalidSourceError: The value provided for alias "todo" is not a Collection`, it usually means two copies of `@tanstack/db` are installed. The collection was created by one copy, but `useLiveQuery` checks `instanceof` against the other.
+If a query-builder alias throws
+`InvalidSourceError: The value provided for alias "todo" is not a Collection`,
+it can mean two copies of `@tanstack/db` are installed. Direct
+`useLiveQuery(preCreatedCollection)` detection is structural and works across
+package copies or realms, but `q.from({ todo: collection })` still validates
+the source with the core collection class.
 
 In dev mode, TanStack DB also throws `DuplicateDbInstanceError` if two instances are detected.
 
@@ -372,7 +462,7 @@ If multiple versions appear, fix with one of:
 {
   "pnpm": {
     "overrides": {
-      "@tanstack/db": "^0.6.0"
+      "@tanstack/db": "^0.6.17"
     }
   }
 }

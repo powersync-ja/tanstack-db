@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   InvalidPersistedCollectionConfigError,
   PersistenceUnavailableError,
@@ -34,8 +34,10 @@ class FakeWorker {
 
   private initialized = false
   public terminated = false
+  public readonly url: string
 
-  constructor(..._args: Array<unknown>) {
+  constructor(url: URL | string) {
+    this.url = String(url)
     FakeWorker.instances.push(this)
   }
 
@@ -146,6 +148,9 @@ const originalWorker = (globalThis as typeof globalThis & { Worker?: unknown })
 const originalNavigator = globalThis.navigator
 
 function installWorkerTestEnvironment(behavior: FakeWorkerBehavior = {}): void {
+  const page = new EventTarget()
+  vi.stubGlobal(`addEventListener`, page.addEventListener.bind(page))
+  vi.stubGlobal(`removeEventListener`, page.removeEventListener.bind(page))
   FakeWorker.instances = []
   FakeWorker.behavior = behavior
   Object.defineProperty(globalThis, `Worker`, {
@@ -162,6 +167,7 @@ function installWorkerTestEnvironment(behavior: FakeWorkerBehavior = {}): void {
     configurable: true,
     writable: true,
   })
+  vi.stubGlobal(`location`, { href: `https://example.test/` })
 }
 
 function restoreWorkerTestEnvironment(): void {
@@ -179,9 +185,79 @@ function restoreWorkerTestEnvironment(): void {
 
 afterEach(() => {
   restoreWorkerTestEnvironment()
+  vi.unstubAllGlobals()
 })
 
 describe(`openBrowserWASQLiteOPFSDatabase`, () => {
+  it(`reports unavailable when the page location is missing`, async () => {
+    installWorkerTestEnvironment()
+    vi.stubGlobal(`location`, undefined)
+
+    await expect(
+      openBrowserWASQLiteOPFSDatabase({ databaseName: `phase-7.sqlite` }),
+    ).rejects.toBeInstanceOf(PersistenceUnavailableError)
+    expect(FakeWorker.instances).toHaveLength(0)
+  })
+
+  // The Worker constructor resolves a relative URL against the document base,
+  // which an about:srcdoc frame inherits from its parent. Its own location
+  // cannot resolve a path, such as the ones Vite serves source assets from.
+  it(`resolves asset URLs against the document base in an about:srcdoc frame`, async () => {
+    installWorkerTestEnvironment()
+    vi.stubGlobal(`location`, { href: `about:srcdoc` })
+    vi.stubGlobal(`document`, {
+      baseURI: `https://example.test/app/`,
+      querySelector: () => null,
+    })
+
+    const database = await openBrowserWASQLiteOPFSDatabase({
+      databaseName: `phase-7.sqlite`,
+    })
+    await database.close?.()
+
+    expect(FakeWorker.instances).toHaveLength(1)
+    expect(new URL(FakeWorker.instances[0]!.url).origin).toBe(
+      `https://example.test`,
+    )
+  })
+
+  // An abort during option evaluation rejects the open's failure signal before
+  // a worker exists. If the Worker constructor then throws, nothing awaits that
+  // signal; it must not surface as an unhandled rejection.
+  it(`leaves no unhandled rejection when an aborted open cannot start its worker`, async () => {
+    installWorkerTestEnvironment()
+    vi.stubGlobal(
+      `Worker`,
+      class {
+        constructor() {
+          throw new DOMException(`cross-origin worker`, `SecurityError`)
+        }
+      },
+    )
+    const unhandled: Array<unknown> = []
+    const onUnhandled = (reason: unknown) => unhandled.push(reason)
+    process.on(`unhandledRejection`, onUnhandled)
+    const controller = new AbortController()
+
+    try {
+      await expect(
+        openBrowserWASQLiteOPFSDatabase({
+          databaseName: `phase-7.sqlite`,
+          timeoutMs: 0,
+          signal: controller.signal,
+          get vfsName() {
+            controller.abort()
+            return `opfs`
+          },
+        }),
+      ).rejects.toBeInstanceOf(PersistenceUnavailableError)
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off(`unhandledRejection`, onUnhandled)
+    }
+  })
+
   it(`initializes via worker and supports execute + close`, async () => {
     installWorkerTestEnvironment({
       executeRows: [{ id: `1`, title: `from worker` }],

@@ -1,8 +1,11 @@
 import {
   InvalidPersistedCollectionConfigError,
   PersistenceUnavailableError,
+  SQLiteConnectionClosedError,
 } from '@tanstack/db-sqlite-persistence-core'
-import OPFSWorkerConstructor from './opfs-worker?worker'
+import wasmUrl from '@journeyapps/wa-sqlite/dist/wa-sqlite.wasm?url&no-inline'
+import workerUrl from './opfs-worker?worker&url'
+import { packageVersion } from './package-version'
 import type { BrowserWASQLiteDatabase } from './wa-sqlite-driver'
 import type {
   BrowserOPFSWorkerErrorCode,
@@ -11,7 +14,11 @@ import type {
 } from './opfs-worker-protocol'
 
 const DEFAULT_VFS_NAME = `opfs`
+const DEFAULT_OPEN_TIMEOUT_MS = 30_000
+const MAX_OPEN_TIMEOUT_MS = 2_147_483_647
 type BrowserOPFSFeatureGlobal = {
+  document?: Document
+  location?: { href?: string }
   navigator?: {
     storage?: {
       getDirectory?: () => Promise<unknown>
@@ -23,6 +30,10 @@ type BrowserOPFSFeatureGlobal = {
 export type OpenBrowserWASQLiteOPFSDatabaseOptions = {
   databaseName: string
   vfsName?: string
+  /** Defaults to 30 seconds. Set to 0 to wait without a deadline. */
+  timeoutMs?: number
+  /** Cancels only the database open, not an established connection. */
+  signal?: AbortSignal
 }
 
 type BrowserOPFSWorkerLike = Pick<
@@ -32,7 +43,7 @@ type BrowserOPFSWorkerLike = Pick<
 
 type PendingWorkerRequest = {
   resolve: (value: unknown) => void
-  reject: (error: Error) => void
+  reject: (reason: unknown) => void
 }
 
 type BrowserOPFSWorkerRequestWithoutId =
@@ -58,6 +69,7 @@ function hasOPFSBrowserPrerequisites(globalObject: unknown): boolean {
   const WorkerConstructor = candidate.Worker
 
   return (
+    typeof candidate.location?.href === `string` &&
     typeof getDirectory === `function` &&
     typeof WorkerConstructor === `function`
   )
@@ -86,7 +98,7 @@ function createWorkerRequestIdFactory(): () => string {
   }
 }
 
-function createOPFSWorkerInstance(): BrowserOPFSWorkerLike {
+function createOPFSWorkerInstance(workerFileUrl: URL): BrowserOPFSWorkerLike {
   const WorkerConstructor = (
     globalThis as typeof globalThis & { Worker?: typeof Worker }
   ).Worker
@@ -96,7 +108,123 @@ function createOPFSWorkerInstance(): BrowserOPFSWorkerLike {
     )
   }
 
-  return new (OPFSWorkerConstructor as unknown as new () => BrowserOPFSWorkerLike)()
+  try {
+    // The package build ships the worker as a classic script, which browsers
+    // without module workers can start. Vite serves the source as a module.
+    return new WorkerConstructor(workerFileUrl, {
+      type:
+        typeof __BROWSER_SQLITE_PACKAGE_BUILD__ === `undefined`
+          ? `module`
+          : `classic`,
+    })
+  } catch (error) {
+    // For example, a worker URL on another origin throws a SecurityError.
+    throw new PersistenceUnavailableError(
+      `Failed to start the OPFS worker: ${String(error)}`,
+    )
+  }
+}
+
+function getOpenAbortError(signal: AbortSignal): Error {
+  const reason: unknown = signal.reason
+  return reason instanceof Error
+    ? reason
+    : new DOMException(
+        `Opening browser OPFS database was aborted`,
+        `AbortError`,
+      )
+}
+
+// Bundlers inline `process.env.NODE_ENV`; the probe keeps an unbundled page,
+// which has no `process`, from throwing.
+/* @__NO_SIDE_EFFECTS__ */
+function devBuild(): boolean {
+  try {
+    return process.env.NODE_ENV !== `production`
+  } catch {
+    return false
+  }
+}
+
+type OPFSAssetUrls = {
+  wasmFileUrl: URL
+  workerFileUrl: URL
+}
+
+/**
+ * Returns a pending lookup only for the built package under a Vite dev server.
+ * Bundlers otherwise resolve the static asset URLs.
+ */
+function resolveViteAssetUrls({
+  wasmFileUrl,
+  workerFileUrl,
+}: OPFSAssetUrls): Promise<OPFSAssetUrls> | undefined {
+  const viteClient = (
+    globalThis as BrowserOPFSFeatureGlobal
+  ).document?.querySelector<HTMLScriptElement>(`script[src*="/@vite/client"]`)
+  // Vite resolves both URLs when it serves this source. Only the package build
+  // defines this flag: Vite's dependency optimizer moves the built module
+  // without moving its assets.
+  if (
+    typeof __BROWSER_SQLITE_PACKAGE_BUILD__ === `undefined` ||
+    !viteClient?.src
+  ) {
+    return undefined
+  }
+
+  // The build emits dist/wa-sqlite.wasm and dist/assets/opfs-worker.js, at different
+  // depths from the code. In place, as when the package is excluded from
+  // pre-bundling, both URLs share dist/. A moved module resolves them to
+  // different directories and needs the lookup, which can fail when the app
+  // root cannot resolve the package name.
+  if (new URL(`../`, workerFileUrl).href === new URL(`./`, wasmFileUrl).href) {
+    return undefined
+  }
+
+  // Ask Vite to resolve the package exports instead of guessing install paths.
+  const packageUrl = new URL(
+    `@id/@tanstack/browser-db-sqlite-persistence/`,
+    new URL(`../`, viteClient.src),
+  )
+  return Promise.all([
+    import(
+      /* @vite-ignore */ /* webpackIgnore: true */ new URL(
+        `wa-sqlite.wasm?url&no-inline`,
+        packageUrl,
+      ).href
+    ) as Promise<{ default: string }>,
+    import(
+      /* @vite-ignore */ /* webpackIgnore: true */ new URL(
+        `opfs-worker.js?url`,
+        packageUrl,
+      ).href
+    ) as Promise<{ default: string }>,
+  ]).then(
+    // Vite returns paths on its own server; some page URLs, such as
+    // about:srcdoc, cannot resolve a path.
+    ([wasmAsset, workerAsset]) => ({
+      wasmFileUrl: new URL(wasmAsset.default, packageUrl),
+      workerFileUrl: new URL(workerAsset.default, packageUrl),
+    }),
+    (error: unknown) => {
+      throw new PersistenceUnavailableError(
+        `Vite could not resolve the browser OPFS assets: ${String(error)}`,
+      )
+    },
+  )
+}
+
+async function closeWorkerConnection(
+  closeRequest: Promise<void>,
+  disposeWorker: (reason: unknown) => void,
+): Promise<void> {
+  try {
+    await closeRequest
+  } finally {
+    disposeWorker(
+      new DOMException(`The SQLite connection is closed`, `AbortError`),
+    )
+  }
 }
 
 /**
@@ -113,6 +241,22 @@ export async function openBrowserWASQLiteOPFSDatabase(
     )
   }
 
+  const timeoutMs = options.timeoutMs ?? DEFAULT_OPEN_TIMEOUT_MS
+  if (
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs < 0 ||
+    timeoutMs > MAX_OPEN_TIMEOUT_MS
+  ) {
+    throw new InvalidPersistedCollectionConfigError(
+      `Browser wa-sqlite timeoutMs must be an integer between 0 and ${MAX_OPEN_TIMEOUT_MS}`,
+    )
+  }
+
+  const signal = options.signal
+  if (signal?.aborted) {
+    throw getOpenAbortError(signal)
+  }
+
   if (!hasOPFSBrowserPrerequisites(globalThis)) {
     throw new PersistenceUnavailableError(
       `Browser OPFS prerequisites are not available in this runtime`,
@@ -120,27 +264,86 @@ export async function openBrowserWASQLiteOPFSDatabase(
   }
 
   const vfsName = options.vfsName ?? DEFAULT_VFS_NAME
-  const worker = createOPFSWorkerInstance()
+  let openTimeout: ReturnType<typeof setTimeout> | undefined
+  let failOpen!: (reason: unknown) => void
+  // The deadline and abort signal cover asset resolution and initialization.
+  const openFailure = new Promise<never>((_resolve, reject) => {
+    failOpen = reject
+  })
+  // A failure before any step awaits this signal, such as an abort followed by
+  // a throwing Worker constructor, must not become an unhandled rejection.
+  openFailure.catch(() => {})
+  const onAbort = (): void => {
+    if (signal) failOpen(getOpenAbortError(signal))
+  }
+  signal?.addEventListener(`abort`, onAbort, { once: true })
+  if (signal?.aborted) onAbort()
+  if (timeoutMs > 0) {
+    openTimeout = setTimeout(() => {
+      failOpen(
+        new DOMException(
+          `Opening browser OPFS database timed out after ${timeoutMs} ms`,
+          `TimeoutError`,
+        ),
+      )
+    }, timeoutMs)
+  }
+
+  try {
+    // Resolve like the Worker constructor does: against the document base,
+    // which an about:srcdoc frame inherits. A worker has only its location.
+    const pageUrl =
+      (globalThis as BrowserOPFSFeatureGlobal).document?.baseURI ??
+      globalThis.location.href
+    const bundledUrls = {
+      wasmFileUrl: new URL(wasmUrl, pageUrl),
+      workerFileUrl: new URL(workerUrl, pageUrl),
+    }
+    // Bundlers inline the NODE_ENV comparison, so a production build drops the
+    // dev-server lookup.
+    const viteUrls =
+      devBuild() && process.env.NODE_ENV !== `production`
+        ? resolveViteAssetUrls(bundledUrls)
+        : undefined
+    return await openOPFSWorkerDatabase(
+      viteUrls ? await Promise.race([viteUrls, openFailure]) : bundledUrls,
+      databaseName,
+      vfsName,
+      openFailure,
+    )
+  } finally {
+    if (openTimeout !== undefined) clearTimeout(openTimeout)
+    signal?.removeEventListener(`abort`, onAbort)
+  }
+}
+
+async function openOPFSWorkerDatabase(
+  { wasmFileUrl, workerFileUrl }: OPFSAssetUrls,
+  databaseName: string,
+  vfsName: string,
+  openFailure: Promise<never>,
+): Promise<BrowserWASQLiteDatabase> {
+  const worker = createOPFSWorkerInstance(workerFileUrl)
   const nextRequestId = createWorkerRequestIdFactory()
   const pendingRequests = new Map<string, PendingWorkerRequest>()
   let disposed = false
+  let closing: Promise<void> | undefined
 
-  const disposeWorker = (): void => {
+  // Every accepted request settles: disposal rejects whatever is still pending.
+  const disposeWorker = (reason: unknown): void => {
     if (disposed) {
       return
     }
+    for (const pendingRequest of pendingRequests.values()) {
+      pendingRequest.reject(reason)
+    }
+    pendingRequests.clear()
     disposed = true
+    globalThis.removeEventListener(`pagehide`, onPageHide)
     worker.removeEventListener(`message`, onMessage)
     worker.removeEventListener(`error`, onError)
     worker.removeEventListener(`messageerror`, onMessageError)
     worker.terminate()
-  }
-
-  const rejectAllPendingRequests = (error: Error): void => {
-    for (const pendingRequest of pendingRequests.values()) {
-      pendingRequest.reject(error)
-    }
-    pendingRequests.clear()
   }
 
   const onMessage = (event: Event): void => {
@@ -162,31 +365,41 @@ export async function openBrowserWASQLiteOPFSDatabase(
   }
 
   const onError = (): void => {
-    rejectAllPendingRequests(
+    disposeWorker(
       new PersistenceUnavailableError(`OPFS worker terminated unexpectedly`),
     )
-    disposeWorker()
   }
 
   const onMessageError = (): void => {
-    rejectAllPendingRequests(
+    disposeWorker(
       new PersistenceUnavailableError(
         `OPFS worker message serialization failed`,
       ),
     )
-    disposeWorker()
+  }
+
+  const onPageHide = (): void => {
+    // A document entering the back/forward cache can be frozen before an
+    // asynchronous close completes, including while initialization is pending.
+    disposeWorker(
+      new DOMException(
+        `The page is closing its SQLite connection`,
+        `AbortError`,
+      ),
+    )
   }
 
   worker.addEventListener(`message`, onMessage)
   worker.addEventListener(`error`, onError)
   worker.addEventListener(`messageerror`, onMessageError)
+  globalThis.addEventListener(`pagehide`, onPageHide)
 
   const sendWorkerRequest = <T>(
     request: BrowserOPFSWorkerRequestWithoutId,
   ): Promise<T> => {
-    if (disposed) {
+    if (disposed || closing) {
       return Promise.reject(
-        new InvalidPersistedCollectionConfigError(
+        new SQLiteConnectionClosedError(
           `Browser OPFS worker connection is closed`,
         ),
       )
@@ -218,13 +431,18 @@ export async function openBrowserWASQLiteOPFSDatabase(
   }
 
   try {
-    await sendWorkerRequest<void>({
-      type: `init`,
-      databaseName,
-      vfsName,
-    })
+    await Promise.race([
+      sendWorkerRequest<void>({
+        type: `init`,
+        databaseName,
+        vfsName,
+        wasmUrl: wasmFileUrl.href,
+        packageVersion,
+      }),
+      openFailure,
+    ])
   } catch (error) {
-    disposeWorker()
+    disposeWorker(error)
     throw error
   }
 
@@ -238,21 +456,17 @@ export async function openBrowserWASQLiteOPFSDatabase(
         sql,
         params,
       }),
-    close: async () => {
-      let closeError: unknown
-      try {
-        await sendWorkerRequest<void>({
-          type: `close`,
-        })
-      } catch (error) {
-        closeError = error
-      } finally {
-        disposeWorker()
+    close: () => {
+      if (disposed) {
+        return Promise.resolve()
       }
-
-      if (closeError) {
-        throw closeError
-      }
+      // Concurrent callers share one close request and its outcome. Admission
+      // ends here; work still pending when close settles is aborted.
+      closing ??= closeWorkerConnection(
+        sendWorkerRequest<void>({ type: `close` }),
+        disposeWorker,
+      )
+      return closing
     },
   }
 }

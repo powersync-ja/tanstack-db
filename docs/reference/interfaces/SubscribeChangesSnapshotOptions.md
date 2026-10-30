@@ -3,9 +3,7 @@ id: SubscribeChangesSnapshotOptions
 title: SubscribeChangesSnapshotOptions
 ---
 
-# Interface: SubscribeChangesSnapshotOptions\<T, TKey\>
-
-Defined in: [packages/db/src/types.ts:869](https://github.com/TanStack/db/blob/main/packages/db/src/types.ts#L869)
+Defined in: [packages/db/src/types.ts:1280](https://github.com/TanStack/db/blob/main/packages/db/src/types.ts#L1280)
 
 ## Extends
 
@@ -23,13 +21,35 @@ Defined in: [packages/db/src/types.ts:869](https://github.com/TanStack/db/blob/m
 
 ## Properties
 
+### deferAcquisition?
+
+```ts
+optional deferAcquisition: boolean;
+```
+
+Defined in: [packages/db/src/types.ts:1238](https://github.com/TanStack/db/blob/main/packages/db/src/types.ts#L1238)
+
+**`Internal`**
+
+Whether this subscription defers provider work. It keeps the Collection
+alive and reads its local rows, but starts no idle source sync run and no
+acquisition attempt until `subscription.resumeDeferredAcquisition()`. A
+live-query Collection defers its source subscriptions until it has a
+subscriber or a preload in its current sync run.
+
+#### Inherited from
+
+[`SubscribeChangesOptions`](SubscribeChangesOptions.md).[`deferAcquisition`](SubscribeChangesOptions.md#deferacquisition)
+
+***
+
 ### limit?
 
 ```ts
 optional limit: number;
 ```
 
-Defined in: [packages/db/src/types.ts:874](https://github.com/TanStack/db/blob/main/packages/db/src/types.ts#L874)
+Defined in: [packages/db/src/types.ts:1285](https://github.com/TanStack/db/blob/main/packages/db/src/types.ts#L1285)
 
 **`Internal`**
 
@@ -41,13 +61,43 @@ Optional limit to include in loadSubset for query-specific cache keys.
 
 ***
 
+### onLoadSubsetError()?
+
+```ts
+optional onLoadSubsetError: (event) => void;
+```
+
+Defined in: [packages/db/src/types.ts:1268](https://github.com/TanStack/db/blob/main/packages/db/src/types.ts#L1268)
+
+**`Internal`**
+
+Receives subset-load failures scoped to this subscription.
+
+#### Parameters
+
+##### event
+
+[`SubscriptionLoadSubsetErrorEvent`](SubscriptionLoadSubsetErrorEvent.md)
+
+#### Returns
+
+`void`
+
+#### Inherited from
+
+```ts
+Omit.onLoadSubsetError
+```
+
+***
+
 ### onLoadSubsetResult()?
 
 ```ts
 optional onLoadSubsetResult: (result) => void;
 ```
 
-Defined in: [packages/db/src/types.ts:866](https://github.com/TanStack/db/blob/main/packages/db/src/types.ts#L866)
+Defined in: [packages/db/src/types.ts:1266](https://github.com/TanStack/db/blob/main/packages/db/src/types.ts#L1266)
 
 **`Internal`**
 
@@ -58,7 +108,7 @@ Allows the caller to directly track the loading promise for isReady status.
 
 ##### result
 
-`true` | `Promise`\<`void`\>
+[`LoadSubsetRequestResult`](../type-aliases/LoadSubsetRequestResult.md)
 
 #### Returns
 
@@ -78,7 +128,7 @@ Omit.onLoadSubsetResult
 optional onStatusChange: (event) => void;
 ```
 
-Defined in: [packages/db/src/types.ts:850](https://github.com/TanStack/db/blob/main/packages/db/src/types.ts#L850)
+Defined in: [packages/db/src/types.ts:1250](https://github.com/TanStack/db/blob/main/packages/db/src/types.ts#L1250)
 
 **`Internal`**
 
@@ -109,7 +159,7 @@ Omit.onStatusChange
 optional orderBy: OrderBy;
 ```
 
-Defined in: [packages/db/src/types.ts:873](https://github.com/TanStack/db/blob/main/packages/db/src/types.ts#L873)
+Defined in: [packages/db/src/types.ts:1284](https://github.com/TanStack/db/blob/main/packages/db/src/types.ts#L1284)
 
 **`Internal`**
 
@@ -121,13 +171,102 @@ Optional orderBy to include in loadSubset for query-specific cache keys.
 
 ***
 
+### owner?
+
+```ts
+optional owner: CollectionDependent;
+```
+
+Defined in: [packages/db/src/types.ts:1244](https://github.com/TanStack/db/blob/main/packages/db/src/types.ts#L1244)
+
+**`Internal`**
+
+The live query or Effect this subscription reads for, so
+`collection.subscribers` can name it.
+
+#### Inherited from
+
+[`SubscribeChangesOptions`](SubscribeChangesOptions.md).[`owner`](SubscribeChangesOptions.md#owner)
+
+***
+
+### truncateReplayPublication?
+
+```ts
+optional truncateReplayPublication: object;
+```
+
+Defined in: [packages/db/src/types.ts:1270](https://github.com/TanStack/db/blob/main/packages/db/src/types.ts#L1270)
+
+**`Internal`**
+
+Lets a live-query graph retain its last publication during replay.
+
+#### fail()?
+
+```ts
+readonly optional fail: (error) => void;
+```
+
+The replay could not load every active demand again.
+
+##### Parameters
+
+###### error
+
+`Error`
+
+##### Returns
+
+`void`
+
+#### holdsDemand()?
+
+```ts
+readonly optional holdsDemand: () => boolean;
+```
+
+The live query still holds logical demand.
+
+##### Returns
+
+`boolean`
+
+#### start()
+
+```ts
+readonly start: () => void;
+```
+
+##### Returns
+
+`void`
+
+#### succeed()
+
+```ts
+readonly succeed: () => void;
+```
+
+##### Returns
+
+`void`
+
+#### Inherited from
+
+```ts
+Omit.truncateReplayPublication
+```
+
+***
+
 ### where()?
 
 ```ts
 optional where: (row) => any;
 ```
 
-Defined in: [packages/db/src/types.ts:842](https://github.com/TanStack/db/blob/main/packages/db/src/types.ts#L842)
+Defined in: [packages/db/src/types.ts:1227](https://github.com/TanStack/db/blob/main/packages/db/src/types.ts#L1227)
 
 Callback function for filtering changes using a row proxy.
 The callback receives a proxy object that records property access,
@@ -137,7 +276,7 @@ allowing you to use query builder functions like `eq`, `gt`, etc.
 
 ##### row
 
-`SingleRowRefProxy`\<[`WithVirtualProps`](../type-aliases/WithVirtualProps.md)\<`T`, `TKey`\>\>
+`SingleRowRefProxy`\<[`WithVirtualProps`](../type-aliases/WithVirtualProps.md)\<`T`, `TKey`\>, `TKey`, `true`\>
 
 #### Returns
 
@@ -167,7 +306,7 @@ Omit.where
 optional whereExpression: BasicExpression<boolean>;
 ```
 
-Defined in: [packages/db/src/types.ts:844](https://github.com/TanStack/db/blob/main/packages/db/src/types.ts#L844)
+Defined in: [packages/db/src/types.ts:1229](https://github.com/TanStack/db/blob/main/packages/db/src/types.ts#L1229)
 
 Pre-compiled expression for filtering changes
 

@@ -54,30 +54,36 @@ export function runRuntimePersistenceContractSuite(
           const adapter = factory.createAdapter(driver)
           const collectionId = `todos`
 
-          await adapter.applyCommittedTx(collectionId, {
-            txId: `tx-1`,
-            term: 1,
-            seq: 1,
-            rowVersion: 1,
-            mutations: [
-              {
-                type: `insert`,
-                key: `1`,
-                value: {
-                  id: `1`,
-                  title: `First`,
-                  score: 10,
+          await adapter.applyCommittedTx(
+            { kind: `eager`, collectionId: collectionId },
+            {
+              txId: `tx-1`,
+              term: 1,
+              seq: 1,
+              rowVersion: 1,
+              mutations: [
+                {
+                  type: `insert`,
+                  key: `1`,
+                  value: {
+                    id: `1`,
+                    title: `First`,
+                    score: 10,
+                  },
                 },
-              },
-            ],
-          })
+              ],
+            },
+          )
 
-          const loadedRows = await adapter.loadSubset(collectionId, {
-            where: new IR.Func(`eq`, [
-              new IR.PropRef([`id`]),
-              new IR.Value(`1`),
-            ]),
-          })
+          const loadedRows = await adapter.loadSubset(
+            { kind: `eager`, collectionId: collectionId },
+            {
+              where: new IR.Func(`eq`, [
+                new IR.PropRef([`id`]),
+                new IR.Value(`1`),
+              ]),
+            },
+          )
           expect(loadedRows).toEqual([
             {
               key: `1`,
@@ -114,10 +120,13 @@ export function runRuntimePersistenceContractSuite(
             title: `Persisted from collection`,
             score: 42,
           })
-          await insertTx.isPersisted.promise
+          await insertTx.when(`settled`)
 
           const readerAdapter = factory.createAdapter(readerDriver)
-          const loadedRows = await readerAdapter.loadSubset(`todos`, {})
+          const loadedRows = await readerAdapter.loadSubset(
+            { kind: `eager`, collectionId: `todos` },
+            {},
+          )
           expect(loadedRows).toHaveLength(1)
           expect(loadedRows[0]?.key).toBe(`persisted`)
           expect(loadedRows[0]?.value.title).toBe(`Persisted from collection`)

@@ -2,6 +2,198 @@
 
 This guide provides principles and patterns for AI agents contributing to the TanStack DB codebase. These guidelines are derived from PR review patterns and reflect the quality standards expected in this project.
 
+## Think like a scientist
+
+Treat the code as an implementation of laws about observable behavior. Before
+changing a subsystem, articulate the law, its authority, and the conditions
+under which it applies. Think hard about whether it is the right law and whether
+we fully enforce it. Existing behavior is evidence about the implementation;
+it is not, by itself, authority for the promise.
+
+Use oracles as instruments: a small independent model enacts a law, legal
+histories exercise it, and public observations test production against it.
+Seek cases that distinguish plausible explanations. A mismatch can expose a
+production bug, a wrong model or law, missing information at the production
+boundary, or an unsuitable observation checkpoint. A green oracle can still
+miss a violation when its histories, path, observation checkpoint, or
+comparison are insufficient.
+Correctly implemented behavior can also fail the user's need. Use the
+[repair-location table](docs/contributing/instruments/adversarial-review.md#locate-the-repair)
+after diagnosing which account failed, before changing expectations.
+
+Challenge the laws themselves when the task warrants it: their suitability,
+interactions, and underlying concepts can need revision. Keep proposed design
+changes distinct from defects under the accepted contract. Preserve useful
+implementation freedom and state what the evidence does and does not establish.
+
+Before creating or editing an oracle, load
+[oracle-authoring](.agents/skills/oracle-authoring/SKILL.md). This applies to
+an edit of an oracle or of the production driver, history grammar, or
+comparison that it uses. It also applies when the edit fixes a bug or a review
+finding.
+Before reviewing an oracle, load
+[oracle-review](.agents/skills/oracle-review/SKILL.md). Both use the
+oracle guide below and a small [instrument library](docs/contributing/instruments/index.md)
+that is also available for other design work. Select instruments as needed;
+routine work does not require a full instrument sequence.
+
+## How oracle work is scored
+
+Every behavior change in an area that an oracle owns has two possible paths.
+The maintainer runs hostile auditors on every pull request. The auditors look
+for the shortcuts listed below and report each one. Pick the path with this in
+mind: a shortcut does not finish the task sooner. It moves the work into
+review, where it costs more.
+
+### The oracle-first path
+
+1. State the law and its authority.
+2. Extend the oracle so that generated histories reach the state where the law
+   matters. Declare that state with
+   [`createOracleReach`](packages/db/tests/oracle-reach.ts), and show that the
+   generated histories reach it.
+3. Run the oracle against the unchanged production code. It fails: this is the
+   RED result, and it proves that the oracle sees the defect.
+4. Change production. The oracle gives immediate feedback on each attempt,
+   including attempts that break a neighboring law.
+5. Show that a hostile mutant, such as the original defect, fails the oracle.
+
+On this path, you know the fix is correct before you push it. Reviewers find
+little that is new, so the total work and token spend stay low. Later agents
+inherit a clean model of the subsystem that they can extend in place.
+
+### The shortcut path
+
+Change production first, then adjust the oracle until it passes: relax a
+comparison, add an exclusion, change a model rule to match the new output, or
+add one pinned example. The tests pass, but nothing shows that the oracle can
+see the defect class. Auditors find the gap. Each finding costs a fix, a new
+witness, and another review round, and the next fix often breaks a
+neighboring law that the oracle still cannot see.
+
+In one recorded case, a production-first rewrite of reload handling needed four
+more review rounds and about ten follow-up commits. Each round found a defect
+in the previous round's fix. A grammar-first pass then found the last defect on
+its first run, and the fix that followed made the rule smaller. The result is
+usually the same code, after much more work, rework, and maintainer
+frustration.
+
+### Extra credit
+
+Work earns extra credit for:
+
+- an oracle improvement that has proof: a declared reach, a RED result on the
+  parent commit, a GREEN result, and a hostile mutant that fails.
+- a model that stays independent of production and short, with each rule tied
+  to its authority.
+- a production change that is clean and light in shipped bytes, especially one
+  that removes states, branches, or recovery paths.
+
+### Penalties
+
+Auditors penalize these shortcuts heavily, and a pull request that contains one
+is not ready:
+
+- **Production first:** a production change in an oracle-owned area without a
+  RED result from the extended oracle on the code before the change.
+- **Model hacking:** a model rule changed to match production output without a
+  stated authority (a contract document and section, or a maintainer
+  decision). Production output is evidence. It is not authority.
+- **Unreachable claims:** a closure claim for a state that generated histories
+  do not reach, or a reach that nobody measured.
+- **Quiet exclusions:** a skipped, narrowed, or relaxed comparison without an
+  entry in the [coverage map](docs/contributing/oracle-coverage.md) that names
+  the owner and the maintainer decision.
+- **Pinned-only coverage:** a named example where the law needs a generator
+  dimension.
+- **Unit tests inside oracles:** ordinary examples or concrete type assertions
+  placed in an oracle file. A fixed regression must replay the shared model,
+  production driver, and comparison without its own expected answer.
+- **"Pre-existing" as a dismissal:** a reachable counterexample that an agent
+  labels as older than the change, but does not fix, record in the coverage
+  map with its trace, or bring to the maintainer for a decision.
+- **No mutant:** a closure claim without a hostile mutant that fails the
+  oracle.
+
+### The evidence block
+
+Every pull request or commit that changes behavior in an oracle-owned area
+includes this block:
+
+- **Law:** the law and its authority.
+- **Reach:** the declared state and how many generated histories reached it.
+- **RED:** the command and the failure on the parent commit.
+- **GREEN:** the command and the result after the change.
+- **Mutant:** the hostile mutant and how the oracle rejected it.
+- **Limits:** the states, paths, and observations that the evidence does not
+  cover.
+
+### Lint feedback while you work
+
+The `oracle/` lint rules in `scripts/eslint-plugin-oracle/` report the
+shortcuts that a syntactic check can see. The repository's agent hooks
+(`.claude/`, `.codex/`, `.gemini/`, and `.github/hooks/`) return the reports
+after each edit and at the end of each turn. A hook sees only the edits that
+the harness's own edit tools make. After an edit through a shell command, or
+in a harness without these hooks, run `pnpm lint:changed` before you finish.
+
+The end-of-turn hook and `pnpm lint:changed` also report every oracle run
+budget that the branch lowered or removed, and CI prints it as a warning. A
+budget is removed when its key is in no oracle file, or in a module that an
+oracle file imports, any more. A lowered or removed budget can be deliberate.
+Restore it, or explain the reason in the pull request.
+
+Fix a report. Do not turn the rule off. The hooks, `pnpm lint:changed`, the
+pre-commit hook, and CI ignore `eslint-disable` comments for these rules. A
+true exception needs a maintainer to change the rule in a reviewed pull
+request.
+
+## Required reading: live-query materialization
+
+Before reading, analyzing, or modifying correlated live-query materialization
+code under `packages/db/src/query/live/`, read
+`packages/db/src/query/live/ARCHITECTURE.md` in full. Read it before changing
+the related includes oracle tests as well.
+
+Treat that document's component boundaries and normative laws as constraints.
+If a change intentionally revises an architectural contract, update the
+architecture document in the same pull request.
+
+## Required reading: executable subsystem models
+
+Read `docs/contributing/glossary.md` before naming or renaming a subsystem
+state, action, boundary, or observation. Production code, executable models,
+tests, and design documents must use the same term for the same concept. A
+model may stay structurally independent, but it must declare any abstraction
+that combines, splits, or does not correspond to production concepts.
+
+Some oracle files are also the shortest documentation for their subsystem.
+Before changing a covered contract or its machinery, use
+`docs/contributing/oracle-coverage.md` to find the primary executable owner and
+read its stated limits. Do not infer authority from a filename alone.
+
+Read these stable entry points before the narrower owner:
+
+- For correlated live-query materialization, read the architecture document
+  required above.
+- For Collection mutation admission, subscription ownership, replay,
+  publication, or disposal, read
+  `packages/db/tests/collection-subscription-lifecycle-grammar-oracle.ts`.
+- For optimistic snapshots and settlement, read
+  `packages/db/tests/optimistic-history-oracle.ts`.
+- For opaque cursor pagination, read
+  `packages/query-db-collection/tests/cursor-pagination/model-oracle.ts`.
+- For TrailBase lifecycle work, read
+  `packages/trailbase-db-collection/tests/ORACLE.md`.
+- For cross-framework behavior, read the shared contract under
+  `packages/db/tests/conformance/` and the receiving framework's driver. One
+  framework's scheduling cut does not prove another's.
+
+The opening prose states the contract. The small model states the expected
+behavior. The production driver and comparison check whether the implementation
+refines the model for the exercised histories and observations. If a change
+revises one of these contracts, update all three in the same pull request. Do not update only the assertions to match new production output.
+
 ## Table of Contents
 
 1. [Type Safety](#type-safety)
@@ -15,6 +207,7 @@ This guide provides principles and patterns for AI agents contributing to the Ta
 9. [Modern JavaScript Patterns](#modern-javascript-patterns)
 10. [Edge Cases and Corner Cases](#edge-cases-and-corner-cases)
 11. [Git and PR Hygiene](#git-and-pr-hygiene)
+12. [Code Weight and Fail-Fast Design](#code-weight-and-fail-fast-design)
 
 ## Type Safety
 
@@ -230,6 +423,18 @@ When merging predicates or combining queries, ensure the semantics are correct:
 
 **Key Principle:** Think carefully about what operations like intersection, union, and subset mean for your specific use case. Consider edge cases with limits, ordering, and predicates.
 
+### Reject Multiple Copies of `@tanstack/db`
+
+TanStack DB does not support interoperability between multiple copies of
+`@tanstack/db` in one runtime.
+Each copy has its own transaction stack and IR classes. Do not add cross-copy
+expression support or shape-based fallbacks to make the copies interoperate.
+Keep the existing duplicate-instance check, which throws
+`DuplicateDbInstanceError` for duplicate development browser loads. Do not
+replace its error with a warning. SSR and test runners may evaluate the
+package twice without exchanging values; do not reject those independent
+loads or add per-value tracking solely to detect unsupported cross-copy use.
+
 ## Abstraction Design
 
 ### Avoid Leaky Abstractions
@@ -349,9 +554,45 @@ const dependentBuilders = [] // Accurately describes dependents
 
 ## Testing Requirements
 
+### Required reading: oracle tests
+
+Before designing, changing, or reviewing an oracle or generated-history test,
+read [Oracle Testing Rubric](docs/contributing/oracle-rubric.md).
+Use the [coverage map](docs/contributing/oracle-coverage.md) to find an existing
+owner and its limits before adding another model. The guide explains testing
+methods; it does not authorize new product behavior or retire existing laws.
+
+### Write Oracle Tests as Literate Programs
+
+Write every oracle and generated-history test as a literate program.
+Combine explanatory prose with executable code so the file teaches the
+subsystem contract. Follow
+[ORC-003](docs/contributing/oracle-rubric.md#orc-003-distinguishable-oracle-responsibilities)
+and the guide's
+[literate-oracle guidance](docs/contributing/oracle-rubric.md#write-the-oracle-as-executable-subsystem-documentation).
+
+Start with the promised law and its limits before introducing test mechanics.
+Explain the central law beside the independent model. Describe the legal
+history grammar, production path, public observations, and comparison checkpoint
+beside the relevant code. Keep the contract, model, history grammar, production
+driver, and refinement check distinguishable. Place their explanations close
+enough for a reviewer to compare them directly.
+
+Use the project glossary's terms and clear, direct prose. Explain why each
+observation follows from the model. Update the prose when the executable law
+changes. Code, headings, or a separate review report alone do not satisfy this
+requirement.
+
+Keep the prose proportional to the law. A compact oracle can use one opening
+comment and short explanations beside its code. A focused regression may remain
+short, but it does not waive this requirement for an oracle or replace
+applicable oracle coverage.
+
 ### Always Add Tests for Bugs
 
-**Key Principle:** If you're fixing a bug, add a unit test that reproduces the bug before fixing it. This ensures:
+**Key Principle:** Reproduce a bug in a test before fixing it, then follow the
+[applicable oracle coverage requirements](#require-applicable-oracle-coverage).
+The evidence must show:
 
 - The bug is actually fixed
 - The bug doesn't regress in the future
@@ -361,12 +602,156 @@ const dependentBuilders = [] // Accurately describes dependents
 
 ```typescript
 // Found a bug with fetchSnapshot resolving after up-to-date message
-// Should add a test:
+// First isolate the failure in a focused regression:
 test('ignores snapshot that resolves after up-to-date message', async () => {
   // Reproduce the corner case
   // Verify it's handled correctly
 })
+
+// Then extend the applicable primary oracle so the law is exercised across
+// nearby legal histories.
 ```
+
+### Treat Every Review Bug as a Test Gap
+
+When a reviewer agent confirms a bug, it must also ask why the existing tests
+did not catch it. The finding should name the missing test law, state
+transition, generator dimension, adapter boundary, or assertion. If a test or
+oracle should already have caught the bug, identify the false-green model,
+classifier, fixture, or assertion that let it pass. Use that analysis to suggest
+the smallest test or oracle improvement that would catch the same class of bug,
+not only the reported example.
+
+### Close the Declared Bug Class
+
+A passing reproduction fixes one trace; it does not establish that the bug
+class is closed. Before claiming closure, name the violated product law and
+bound the claim by legal histories, production paths, and public observations
+at specific checkpoints.
+
+Extend the primary oracle so it reaches the reported trace and nearby legal
+histories that distinguish the repair from plausible wrong designs. Use a
+separate oracle owner when another boundary needs a different model. Show that
+the check fails on the original implementation or a hostile mutant at the
+intended checkpoint, then passes with the fix.
+
+At closeout, state what the evidence covers. Record remaining in-scope
+histories or paths in the oracle coverage map with an owner and needed witness.
+A reachable in-scope counterexample keeps the class open. Passing random runs
+is not a universal proof. A bug-fix pull request is not ready while a known
+in-scope part of the declared bug class remains open.
+
+Every bug-fix pull request must show how it evaluated and closed the declared
+bug class. State the violated law and its authority. Name the legal histories,
+production paths, and public observation checkpoints that the oracle exercises.
+Include the original or hostile-mutant RED result and the repaired GREEN result.
+State any remaining limits. A passing reproduction for one trace does not
+satisfy this requirement.
+
+### Keep Oracles Independent
+
+An oracle is useful only when its expected result comes from a source independent
+of the implementation under test. Do not translate production branches, state
+machines, classifiers, or helper functions into a second implementation and call
+that an oracle. Both copies can encode the same wrong assumption.
+
+- Derive expected behavior from public contracts, documented prior behavior,
+  mathematical laws, or a separately specified reference model.
+- Keep the reference model structurally different from production. Do not import
+  the production helper or reuse its classifications to compute expected results.
+- Preserve existing contract tests unless a product or design decision explicitly
+  changes the contract. Rewriting a passing expectation to match new production
+  behavior is a design review, not routine test maintenance.
+- When production work suggests an oracle change, compare the old and new
+  semantics with counterexamples before editing the oracle.
+- Use hostile mutants to prove the oracle rejects plausible wrong designs,
+  including the mistake production currently makes. A green oracle without a
+  demonstrated kill is weak evidence.
+- Use process grammar to explore lifecycle paths, and design grammar to challenge
+  the oracle's reference semantics. More generated traces cannot repair a wrong
+  reference model.
+
+### Require Applicable Oracle Coverage
+
+An oracle that checks general laws across generated states and histories is a
+stronger form of coverage than a unit test for one specific example. Every
+production change that adds, removes, or changes observable behavior must
+extend the primary oracle when that oracle can express the governing law. Add
+the missing model rule, generator dimension, state transition, or observable
+assertion; adding more pinned examples alone does not generalize the oracle. Do
+not submit only an isolated unit test for behavior owned by an applicable
+oracle. An internal refactor does not require new oracle coverage when existing
+applicable oracles already exercise the unchanged contract.
+
+Applicability follows the contract ownership recorded in
+`docs/contributing/oracle-coverage.md`, not the limits of the owner's current
+histories, production paths, or observations. A missing history, path, or
+observation is a coverage gap in the primary owner. Add a separate oracle owner
+only when the boundary requires a different independent judgment. Add a
+receiving witness when a claim crosses an adapter, framework, provider, or other
+integration boundary.
+
+For a bug fix, use a focused regression to isolate and shrink the failure, then
+keep it as a replay example for the broader oracle. Verify that the expanded
+oracle fails without the fix and passes with it. Keep valuable unit tests as
+supplemental coverage, but do not treat them as a substitute for applicable
+oracle coverage. If no existing oracle applies, create one when the behavior
+admits a practical independent model. For a change that is not a bug fix, a
+focused test alone is acceptable only when an oracle is not practical for the
+behavior. The pull request must identify the relevant coverage-map entry and
+explain why extending its owner, creating a new independent oracle, or adding a
+receiving witness is not practical. Bug fixes cannot use this focused-test-only
+exception. They must provide evidence that closes the entire declared bug class.
+
+### Keep Unit Tests Out of Oracles
+
+Oracle files contain reusable laws, independent models, input or history
+grammars, shared comparisons, and their execution. Do not put ordinary unit
+tests or concrete type assertions in an oracle file. A filename, coverage-map
+entry, contract comment, or table of fixtures does not turn examples into an
+oracle.
+
+Keep a fixed regression as input to the same model, production driver, and
+comparison that the generated campaign uses. It must not carry a separate
+expected answer or its own assertions. Checker calibration may supply a wrong
+observation to that same comparison. Put supplemental unit tests in ordinary
+test files; they do not discharge an oracle-owned coverage obligation.
+
+For compile-time contracts, generate legal TypeScript inputs and check their
+public types against a reusable independent type law. A list of
+`expectTypeOf` calls or `@ts-expect-error` examples is not an oracle. Negative
+checks derived by the shared law from generated inputs are permitted.
+
+### Name Oracle Files for Discovery
+
+Include `oracle` in filenames that own an independent reference computation,
+state model, differential or metamorphic comparison, or reusable law checker.
+Modules that define the model, checker, or its history grammar also qualify.
+Identify the actual mechanism before renaming a file. A coverage-map entry,
+contract comment, or collection of fixed assertions is not sufficient evidence.
+
+An oracle file holds only oracle tests. It declares its check, model, and history
+grammar with `declareOracle` from `packages/db/tests/oracle-declaration.ts`. A
+type-level oracle names its model types in `typeModel`. Each
+part is optional. Every test in the file must use a declared part, directly
+or through a driver, or run a generated property that states its law inline.
+A test that compares production with a hand-written value is a unit test:
+put it in an ordinary test file. The `oracle/no-unit-test` lint rule reports
+a test that does neither.
+
+Ordinary example tests, type assertions, fixtures, registration wrappers, and
+runner utilities keep their ordinary names. A module that only drives production
+or records observations is not an oracle definition. Report oracle owners and
+definitions separately from supporting files; a file count is not an oracle count.
+Preserve runner suffixes and update imports, commands, replay selectors, and
+current documentation whenever an oracle file moves.
+
+### Name Tests After Behavior
+
+Test names should state the behavior they prove. Do not put issue or pull
+request numbers in test names; those references become stale and make the test
+suite harder to read. When an external report contains essential context that
+the test cannot express, link it in a nearby comment instead.
 
 ### Test Corner Cases
 
@@ -642,6 +1027,74 @@ return allDone
 ### Remove Outdated Comments
 
 **Key Principle:** When refactoring code, update or remove comments that reference old function names or outdated logic.
+
+## Code Weight and Fail-Fast Design
+
+Treat production code as a continuing cost. Bug fixes and features should aim
+for a net-negative production diff. Pay for new behavior by
+refactoring the existing code it touches: merge duplicated logic and parallel
+structures, delete indirection, and remove branches that the change makes
+redundant. Refactoring existing code is the expected way to fix a bug or add a
+feature. Do not graft new code onto a design and leave the old code in place.
+
+Measure production code weight in shipped bytes, not lines. Run
+`pnpm size:compare` (add `--files` for a per-file breakdown). It builds the
+changed packages with the same minified build that the Compressed size CI
+check uses, bundles each one as an app's production build would, and
+compares gzip and brotli bytes with the merge-base on `origin/main`.
+Development-only code, such as full error messages, does not count.
+A package bundle keeps every export, so `size:compare` also reports
+scenarios in `scripts/size-scenarios/`, each tree-shaken as an app ships it.
+`app` is the typical app: a query collection, a filtered live query, and the
+React adapter. Its weight reaches nearly every user, so weigh it most. Each
+other scenario adds one feature to `app`, and its feature-cost column shows
+what that feature adds. Comments, names, and formatting cost nothing in that measure, so
+keep useful comments and clear names. Never delete a comment, shorten a name,
+or reformat code to improve a code-weight number. Reduce states, branches,
+helpers, and recovery paths.
+
+When a change still grows production bytes after that work, state why. Name
+the refactors you tried and the evidence that ruled them out.
+
+Tests and contract documentation can grow to prove the behavior. Report their
+weight separately from production code.
+
+Use the test-first and bug-class guidance above to reproduce the failure and
+identify the violated contract. Strengthen or simplify existing control flow
+before adding state or recovery machinery.
+
+### Separate Valid Edge Cases from Contract Contradictions
+
+A rare but valid operation is not an invariant violation. The implementation
+must support it.
+
+An impossible internal state or a contradictory collaborator signal is an
+invariant violation. Throw or reject immediately at the boundary. Check the
+invariant before the code releases established state or publishes success.
+
+Do not convert an invariant violation into false readiness, partial success,
+or a silent fallback. In library code, "crash" means a synchronous throw or a
+rejected promise. It does not require process termination.
+
+### Recovery Must Earn Its Code Weight
+
+Add retries, generations, queues, fallback states, or rollback paths only when
+all these conditions are true:
+
+- The condition can occur during valid operation.
+- The public contract defines recovery behavior.
+- Recovery protects user-visible behavior.
+- A test or oracle proves the recovery law.
+
+If a condition requires a programming error or contract breach, detect it and
+fail loudly. Do not build a second lifecycle to recover from it.
+
+Prefer a small change to the current abstraction over a replacement state
+machine. A new state machine requires an explicit architectural reason and an
+oracle law that the existing design cannot express.
+
+For reviewer-proposed defensive machinery based only on contradictory mocks,
+add an invariant witness that fails before mutation instead.
 
 ## General Principles
 

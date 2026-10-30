@@ -7,7 +7,10 @@ import {
   createBrowserWASQLitePersistence,
   persistedCollectionOptions,
 } from '../src'
-import { generateSeedData } from '../../db-collection-e2e/src/fixtures/seed-data'
+import {
+  captureSeedData,
+  generateSeedData,
+} from '../../db-collection-e2e/src/fixtures/seed-data'
 import { runPersistedCollectionConformanceSuite } from '../../db-sqlite-persistence-core/tests/contracts/persisted-collection-conformance-contract'
 import { createWASQLiteTestDatabase } from '../tests/helpers/wa-sqlite-test-db'
 import type { Collection } from '@tanstack/db'
@@ -45,17 +48,20 @@ function createPersistedCollection<T extends PersistableRow>(
       return
     }
     seedTxSequence++
-    await persistence.adapter.applyCommittedTx(id, {
-      txId: `seed-${id}-${seedTxSequence}`,
-      term: 1,
-      seq: seedTxSequence,
-      rowVersion: seedTxSequence,
-      mutations: rows.map((row) => ({
-        type: `insert` as const,
-        key: row.id,
-        value: row,
-      })),
-    })
+    await persistence.adapter.applyCommittedTx(
+      { kind: `eager`, collectionId: id },
+      {
+        txId: `seed-${id}-${seedTxSequence}`,
+        term: 1,
+        seq: seedTxSequence,
+        rowVersion: seedTxSequence,
+        mutations: rows.map((row) => ({
+          type: `insert` as const,
+          key: row.id,
+          value: row,
+        })),
+      },
+    )
   }
 
   const collection = createCollection(
@@ -76,15 +82,13 @@ function createPersistedCollection<T extends PersistableRow>(
 }
 
 type PersistedTransactionHandle = {
-  isPersisted: {
-    promise: Promise<unknown>
-  }
+  when: (state: 'settled') => Promise<unknown>
 }
 
 async function waitForPersisted(
   transaction: PersistedTransactionHandle,
 ): Promise<void> {
-  await transaction.isPersisted.promise
+  await transaction.when(`settled`)
 }
 
 async function seedCollection<T extends PersistableRow>(
@@ -142,6 +146,11 @@ beforeAll(async () => {
     filename: dbPath,
   })
   const seedData = generateSeedData()
+  const fixture = captureSeedData(seedData, {
+    registration:
+      'packages/browser-db-sqlite-persistence/e2e/browser-single-tab-persisted-collection.e2e.test.ts',
+    provider: 'WASQLite test database fixture',
+  })
 
   const eagerUsers = createPersistedCollection<User>(
     database,
@@ -189,6 +198,7 @@ beforeAll(async () => {
   await onDemandComments.seedPersisted(seedData.comments)
 
   config = {
+    fixture,
     collections: {
       eager: {
         users: eagerUsers.collection,
@@ -222,6 +232,11 @@ beforeAll(async () => {
         insertRowIntoCollections(
           [eagerPosts.collection, onDemandPosts.collection],
           post,
+        ),
+      deletePost: async (id) =>
+        deleteRowAcrossCollections(
+          [eagerPosts.collection, onDemandPosts.collection],
+          id,
         ),
     },
     setup: async () => {},

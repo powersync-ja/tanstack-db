@@ -1,0 +1,486 @@
+/**
+ * Angular driver for the shared live-query conformance suite.
+ *
+ * `injectLiveQuery` needs an injection context, so each mount runs inside a
+ * child `EnvironmentInjector` created off TestBed's; `unmount` calls
+ * `injector.destroy()`, firing the `DestroyRef` cleanup. Result signals are read
+ * after settling. Controllable inputs use Angular's reactive `{ params, query }`
+ * form driven by a signal.
+ *
+ * All registered laws must pass; the driver has no whole-test waivers.
+ */
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import {
+  Component,
+  DestroyRef,
+  EnvironmentInjector,
+  ErrorHandler,
+  createEnvironmentInjector,
+  effect,
+  inject,
+  input,
+  runInInjectionContext,
+  signal,
+} from '@angular/core'
+import { TestBed } from '@angular/core/testing'
+import {
+  coalesce,
+  count,
+  createCollection,
+  createLiveQueryCollection,
+  createOptimisticAction,
+  eq,
+  groupKeys,
+  gt,
+  sum,
+} from '@tanstack/db'
+import {
+  mockSyncCollectionOptions,
+  mockSyncCollectionOptionsNoInitialState,
+} from '../../db/tests/utils'
+import { injectLiveQuery } from '../src/index'
+import { runSuite } from '../../db/tests/conformance/suite'
+import { createPublicationLog } from '../../db/tests/conformance/publication-log'
+import { makeLaggingSource } from '../../db/tests/conformance/lagging-source'
+import { makeSyncSource } from '../../db/tests/conformance/sync-source'
+import { makeErrorSource as makeSharedErrorSource } from '../../db/tests/conformance/error-source'
+import { expectResultSurface } from '../../db/tests/conformance/result-laws'
+import { withScopeSetup } from '../../db/tests/conformance/scope-setup'
+import type { PooledLiveQueries } from '@tanstack/db'
+import type {
+  ConformanceResult,
+  ControllableHandle,
+  DeferredSourceHandle,
+  LiveQueryDriver,
+  LiveQueryHandle,
+  QueryBuild,
+  SourceHandle,
+} from '../../db/tests/conformance/contract'
+
+let sourceSeq = 0
+
+function writer<T extends { id: string }>(collection: any) {
+  return (type: `insert` | `update` | `delete`, value: T) => {
+    collection.utils.begin()
+    collection.utils.write({ type, value })
+    collection.utils.commit()
+  }
+}
+
+function makeSource<T extends { id: string }>(
+  initialData: ReadonlyArray<T>,
+  collectionId?: string,
+): SourceHandle<T> {
+  const collection = createCollection(
+    mockSyncCollectionOptions<T>({
+      id: collectionId ?? `conformance-angular-${sourceSeq++}`,
+      getKey: (r) => r.id,
+      initialData: [...initialData],
+    }),
+  )
+  const write = writer<T>(collection)
+  return {
+    collection,
+    insert: (row) => write(`insert`, row),
+    update: (row) => write(`update`, row),
+    remove: (row) => write(`delete`, row),
+  }
+}
+
+function makeDeferredSource<
+  T extends { id: string },
+>(): DeferredSourceHandle<T> {
+  const collection = createCollection(
+    mockSyncCollectionOptionsNoInitialState<T>({
+      id: `conformance-angular-${sourceSeq++}`,
+      getKey: (r) => r.id,
+    }),
+  )
+  collection.startSyncImmediate()
+  const write = writer<T>(collection)
+  return {
+    collection,
+    insert: (row) => write(`insert`, row),
+    update: (row) => write(`update`, row),
+    remove: (row) => write(`delete`, row),
+    emit: (rows) => {
+      collection.utils.begin()
+      rows.forEach((value) => collection.utils.write({ type: `insert`, value }))
+      collection.utils.commit()
+    },
+    markReady: () => collection.utils.markReady(),
+  }
+}
+
+function makePrecreated(
+  build: QueryBuild,
+  opts?: { startSync?: boolean; gcTime?: number },
+) {
+  const collection = createLiveQueryCollection({
+    query: build as any,
+    startSync: opts?.startSync ?? true,
+    gcTime: opts?.gcTime,
+  })
+  return { collection }
+}
+
+function makeErrorSource(kind: `fail` | `crash`) {
+  return makeSharedErrorSource(
+    createCollection,
+    `conformance-angular-err-${sourceSeq++}`,
+    kind,
+  )
+}
+
+async function settle() {
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 50))
+}
+
+// Angular reports an error that a binding's root effect throws, such as a
+// rejected query input, to the application ErrorHandler. The driver records
+// them, and a handle rethrows the first one reported since it mounted on its
+// next read or flush: that is the rejection the contract observes. Mounts that
+// fail run one at a time, so this attributes each error to its mount. Every
+// recorded error must be claimed by a read before its test ends, so an error
+// that no scenario expects still fails its test.
+const reported: Array<{ error: unknown; claimed: boolean }> = []
+const reportedSince = new WeakMap<object, number>()
+
+beforeEach(() => {
+  reported.length = 0
+  TestBed.resetTestingModule()
+  TestBed.configureTestingModule({
+    rethrowApplicationErrors: false,
+    providers: [
+      {
+        provide: ErrorHandler,
+        useValue: {
+          handleError: (error: unknown) =>
+            reported.push({ error, claimed: false }),
+        },
+      },
+    ],
+  })
+})
+
+afterEach(() => {
+  expect(
+    reported.filter(({ claimed }) => !claimed).map(({ error }) => error),
+    `errors reported to ErrorHandler that no read observed`,
+  ).toEqual([])
+})
+
+function rethrowReported(result: any): void {
+  const entry = reported.slice(reportedSince.get(result) ?? 0)[0]
+  if (entry) {
+    entry.claimed = true
+    throw entry.error
+  }
+}
+
+function makeHandle(result: any, destroy: () => void): LiveQueryHandle {
+  return {
+    collection: () => result.collection(),
+    current(): ConformanceResult {
+      rethrowReported(result)
+      return expectResultSurface({
+        data: result.data(),
+        state: result.state(),
+        status: result.status(),
+        isReady: result.isReady(),
+        isLoadingError: result.isLoadingError(),
+        isCrashed: result.isCrashed(),
+        isSyncError: result.isSyncError(),
+        // angular-db exposes no `isEnabled`; derive it from status (status-derived).
+        isEnabled: result.status() !== `disabled`,
+        health: result.health(),
+      })
+    },
+    async flush() {
+      await settle()
+      rethrowReported(result)
+    },
+    async apply(fn: () => void) {
+      fn()
+      await settle()
+      rethrowReported(result)
+    },
+    unmount() {
+      destroy()
+    },
+  }
+}
+
+function inCtx(fn: () => any): { result: any; destroy: () => void } {
+  const parent = TestBed.inject(EnvironmentInjector)
+  const since = reported.length
+  const injector = createEnvironmentInjector([], parent)
+  let result: any
+  withScopeSetup(
+    () =>
+      runInInjectionContext(injector, () => {
+        result = fn()
+      }),
+    () => injector.destroy(),
+  )
+  if (result && typeof result === `object`) reportedSince.set(result, since)
+  return { result, destroy: () => injector.destroy() }
+}
+
+function mount(build: QueryBuild) {
+  const { result, destroy } = inCtx(() => injectLiveQuery(build as any))
+  return makeHandle(result, destroy)
+}
+
+function mountCollection(collection: any) {
+  const { result, destroy } = inCtx(() => injectLiveQuery(collection))
+  return makeHandle(result, destroy)
+}
+
+function mountConfig(
+  build: QueryBuild,
+  opts?: { gcTime?: number; pool?: PooledLiveQueries },
+) {
+  const { result, destroy } = inCtx(() =>
+    injectLiveQuery({ query: build, ...opts }),
+  )
+  return makeHandle(result, destroy)
+}
+
+function mountDisabled() {
+  const { result, destroy } = inCtx(() => injectLiveQuery(() => null))
+  return makeHandle(result, destroy)
+}
+
+function mountControllable<P>(
+  build: (q: any, param: P) => any,
+  initial: P,
+  opts?: { pool?: PooledLiveQueries },
+): ControllableHandle<P> {
+  const param = signal<P>(initial)
+  const published = createPublicationLog()
+  const { result, destroy } = inCtx(() => {
+    const query = injectLiveQuery({
+      params: () => ({ value: param() }),
+      query: ({ params, q }: any) => build(q, params.value),
+      pool: opts?.pool,
+    })
+    // Angular renders the value each effect run reads.
+    effect(() => {
+      published.record(query.data(), query.state())
+    })
+    return query
+  })
+  const handle = makeHandle(result, destroy)
+  return {
+    ...handle,
+    publications: published.values,
+    statePublications: published.stateValues,
+    async setParam(next: P) {
+      param.set(next)
+      // The first paint after the change: the framework has flushed its
+      // reactive work, but no later task has run.
+      TestBed.tick()
+      published.record(result.data(), result.state())
+      await settle()
+    },
+  }
+}
+
+const angularDriver: LiveQueryDriver = {
+  name: `angular`,
+  // Reactive reads decide when the query compiles again.
+  comparesQueryIdentity: false,
+  disabledRepresentation: `empty-reactive`,
+  ops: { eq, gt, count, sum, coalesce, groupKeys, createOptimisticAction },
+  makeSource,
+  makeDeferredSource,
+  makeLaggingSource: <T extends { id: string }>() =>
+    makeLaggingSource<T>(
+      createCollection,
+      `conformance-angular-lagging-${sourceSeq++}`,
+    ),
+  makeSyncSource: <T extends { id: string }>(data: ReadonlyArray<T>) =>
+    makeSyncSource<T>(
+      createCollection,
+      `conformance-angular-health-${sourceSeq++}`,
+      data,
+    ),
+  makePrecreated,
+  makeErrorSource,
+  mount,
+  mountControllable,
+  mountCollection,
+  mountConfig,
+  mountDisabled,
+  knownGaps: [],
+  features: { serverSnapshot: false, suspense: false, pooledEqFilters: true },
+}
+
+describe(`owned native scope setup`, () => {
+  it(`keeps a successful scope alive until explicit disposal`, () => {
+    let calls = 0
+    const handle = inCtx(() => {
+      inject(DestroyRef).onDestroy(() => {
+        calls++
+      })
+      return 7
+    })
+    expect(calls).toBe(0)
+    handle.destroy()
+    expect(calls).toBe(1)
+  })
+
+  it.each([false, true])(
+    `disposes failed setup and retains errors, cleanupFails=%s`,
+    (cleanupFails) => {
+      const primary = new Error(`scope setup failure`)
+      const secondary = new Error(`scope cleanup failure`)
+      let calls = 0
+      let caught: unknown
+      try {
+        inCtx(() => {
+          inject(DestroyRef).onDestroy(() => {
+            calls++
+            if (cleanupFails) throw secondary
+          })
+          throw primary
+        })
+      } catch (error) {
+        caught = error
+      }
+      expect(calls).toBe(1)
+      if (cleanupFails) {
+        expect(caught).toBeInstanceOf(AggregateError)
+        expect((caught as AggregateError).errors).toEqual([primary, secondary])
+        expect((caught as AggregateError).cause).toBe(primary)
+      } else expect(caught).toBe(primary)
+    },
+  )
+})
+
+runSuite(angularDriver)
+
+it(`reports a disabled query as ready before effects run`, () => {
+  const mounted = inCtx(() => injectLiveQuery(() => null))
+  try {
+    expect(mounted.result.status()).toBe(`disabled`)
+    expect(mounted.result.isReady()).toBe(true)
+  } finally {
+    mounted.destroy()
+  }
+})
+
+/**
+ * Angular component boundary: required inputs are assigned after field
+ * initialization. A reactive live-query option may read an input when Angular
+ * first runs effects, but construction must not read it before `setInput`.
+ * The model is a full filter of two fixed source rows at each input value.
+ * This checks rendered public data after change detection, not every possible
+ * framework scheduling cut or the shared query model's other laws.
+ */
+it(`waits for required inputs before evaluating a reactive live query`, async () => {
+  const source = createCollection(
+    mockSyncCollectionOptions<{ id: string; age: number }>({
+      id: `angular-required-input-query`,
+      getKey: (row) => row.id,
+      initialData: [
+        { id: `a`, age: 20 },
+        { id: `b`, age: 40 },
+      ],
+    }),
+  )
+
+  @Component({
+    inputs: [{ name: `minAge`, required: true }],
+    template: `{{ live.data().length }}`,
+  })
+  class RequiredInputQuery {
+    minAge = input.required<number>()
+    live = injectLiveQuery({
+      params: () => ({ minAge: this.minAge() }),
+      query: ({ params, q }) =>
+        q
+          .from({ person: source })
+          .where(({ person }) => gt(person.age, params.minAge))
+          .select(({ person }) => ({ id: person.id, age: person.age })),
+    })
+  }
+
+  // This suite uses Angular's JIT test environment, which does not infer the
+  // signal-input flag from `input.required()`. Supply the same input metadata
+  // that Angular's AOT compiler emits; TestBed still constructs the component,
+  // assigns the input, runs its effects, and renders the public result.
+  const definition = (
+    RequiredInputQuery as unknown as {
+      ɵcmp: { inputs: { minAge: [string, number, null] } }
+    }
+  ).ɵcmp
+  definition.inputs.minAge = [`minAge`, 1, null]
+
+  const fixture = TestBed.createComponent(RequiredInputQuery)
+  try {
+    fixture.componentRef.setInput(`minAge`, 30)
+    fixture.detectChanges()
+    await settle()
+    fixture.detectChanges()
+    expect(fixture.nativeElement.textContent.trim()).toBe(`1`)
+    expect(fixture.componentInstance.live.data().map((row) => row.id)).toEqual([
+      `b`,
+    ])
+
+    fixture.componentRef.setInput(`minAge`, 10)
+    fixture.detectChanges()
+    await settle()
+    fixture.detectChanges()
+    expect(fixture.nativeElement.textContent.trim()).toBe(`2`)
+    expect(fixture.componentInstance.live.data().map((row) => row.id)).toEqual([
+      `a`,
+      `b`,
+    ])
+  } finally {
+    fixture.destroy()
+  }
+})
+
+it(`preserves raw result types through the actual driver reader`, () => {
+  const raw: Record<string, unknown> = {
+    data: [{ id: `a`, value: undefined }],
+    state: new Map(),
+    status: `disabled`,
+    isReady: false,
+    isLoadingError: false,
+    isCrashed: false,
+    isSyncError: false,
+    isEnabled: false,
+    health: undefined,
+  }
+  const result = Object.fromEntries(
+    Object.keys(raw).map((key) => [key, () => raw[key]]),
+  )
+  const handle = makeHandle(result, () => {})
+  try {
+    const healthy = handle.current()
+    expect(healthy.data).toBe(raw.data)
+    expect(healthy.state).toBe(raw.state)
+    expect(healthy.isReady).toBe(false)
+    expect(healthy.isLoadingError).toBe(false)
+    expect(healthy.isEnabled).toBe(false)
+    for (const key of [`status`, `isReady`, `isLoadingError`]) {
+      const original = raw[key]
+      delete raw[key]
+      expect(() => handle.current()).toThrowError(new RegExp(`raw ${key}`))
+      for (const invalid of key === `status`
+        ? [undefined, 0]
+        : [undefined, 0, ``]) {
+        raw[key] = invalid
+        expect(() => handle.current()).toThrowError(new RegExp(`raw ${key}`))
+      }
+      raw[key] = original
+      expect(handle.current()[key as keyof ConformanceResult]).toBe(original)
+    }
+  } finally {
+    handle.unmount()
+  }
+})

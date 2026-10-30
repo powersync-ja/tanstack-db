@@ -3,9 +3,7 @@ id: TransactionError
 title: TransactionError
 ---
 
-# Class: TransactionError
-
-Defined in: [packages/db/src/errors.ts:286](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L286)
+Defined in: [packages/db/src/errors.ts:415](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L415)
 
 ## Extends
 
@@ -13,15 +11,23 @@ Defined in: [packages/db/src/errors.ts:286](https://github.com/TanStack/db/blob/
 
 ## Extended by
 
+- [`PacedTransactionManualCommitError`](PacedTransactionManualCommitError.md)
+- [`QueueCapacityExceededError`](QueueCapacityExceededError.md)
+- [`QueueDisposedError`](QueueDisposedError.md)
+- [`ThrottleCallDroppedError`](ThrottleCallDroppedError.md)
+- [`DebounceCallDroppedError`](DebounceCallDroppedError.md)
 - [`MissingMutationFunctionError`](MissingMutationFunctionError.md)
 - [`OnMutateMustBeSynchronousError`](OnMutateMustBeSynchronousError.md)
 - [`TransactionNotPendingMutateError`](TransactionNotPendingMutateError.md)
 - [`TransactionAlreadyCompletedRollbackError`](TransactionAlreadyCompletedRollbackError.md)
+- [`DuplicateTransactionIdError`](DuplicateTransactionIdError.md)
 - [`TransactionNotPendingCommitError`](TransactionNotPendingCommitError.md)
 - [`NoPendingSyncTransactionWriteError`](NoPendingSyncTransactionWriteError.md)
 - [`SyncTransactionAlreadyCommittedWriteError`](SyncTransactionAlreadyCommittedWriteError.md)
+- [`SyncRowReusedWithoutPreviousValueError`](SyncRowReusedWithoutPreviousValueError.md)
 - [`NoPendingSyncTransactionCommitError`](NoPendingSyncTransactionCommitError.md)
 - [`SyncTransactionAlreadyCommittedError`](SyncTransactionAlreadyCommittedError.md)
+- [`SyncQueueInvariantError`](SyncQueueInvariantError.md)
 
 ## Constructors
 
@@ -31,7 +37,7 @@ Defined in: [packages/db/src/errors.ts:286](https://github.com/TanStack/db/blob/
 new TransactionError(message): TransactionError;
 ```
 
-Defined in: [packages/db/src/errors.ts:287](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L287)
+Defined in: [packages/db/src/errors.ts:416](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L416)
 
 #### Parameters
 

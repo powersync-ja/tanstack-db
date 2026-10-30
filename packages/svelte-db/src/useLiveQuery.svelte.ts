@@ -2,21 +2,50 @@
 import { untrack } from 'svelte'
 // eslint-disable-next-line import/no-duplicates -- See https://github.com/un-ts/eslint-plugin-import-x/issues/308
 import { SvelteMap } from 'svelte/reactivity'
-import { BaseQueryBuilder, createLiveQueryCollection } from '@tanstack/db'
+import {
+  UnhashableQueryIRError,
+  createLiveQueryObserver,
+  createLiveQuerySourceIdClaims,
+  getLiveQueryHash,
+  getPublicCollection,
+  getStableValueHash,
+  identifyLiveQuery,
+  isCollection,
+  isSingleResultCollection,
+  prepareLiveQueryValue,
+  rejectLiveQueryInput,
+  releaseDeferredOnReclaim,
+  resolveLiveQueryValue,
+  resumeDeferredLiveQueryCollections,
+} from '@tanstack/db'
+import { useDbContext } from './db-context.js'
 import type {
   ChangeMessage,
   Collection,
-  CollectionConfigSingleRowOption,
   CollectionStatus,
   Context,
+  DbClient,
+  DeferredLiveQueryCollections,
   GetResult,
+  HealthNode,
   InferResultType,
   InitialQueryBuilder,
-  LiveQueryCollectionConfig,
+  LiveQueryHookConfig,
+  LiveQueryKey,
+  LiveQueryObserver,
+  LiveQueryStatusFlags,
   NonSingleResult,
   QueryBuilder,
   SingleResult,
 } from '@tanstack/db'
+
+const DEFAULT_GC_TIME_MS = 1
+
+/** Copy a snapshot's ordered rows; a single-result query's `data` is one row. */
+function snapshotRows(data: unknown): Array<any> {
+  if (Array.isArray(data)) return [...data]
+  return data === undefined ? [] : [data]
+}
 
 /**
  * Return type for useLiveQuery hook
@@ -27,19 +56,32 @@ import type {
  * @property isLoading - True while initial query data is loading
  * @property isReady - True when query has received first data and is ready
  * @property isIdle - True when query hasn't started yet
- * @property isError - True when query encountered an error
+ * @property isLoadingError - True when the first load failed
+ * @property isCrashed - True when local storage or an invariant broke
+ * @property isSyncError - True when data is shown and `health` has a problem
  * @property isCleanedUp - True when query has been cleaned up
  */
-export interface UseLiveQueryReturn<T extends object, TData = Array<T>> {
+export interface UseLiveQueryReturn<
+  T extends object,
+  TData = Array<T>,
+> extends LiveQueryStatusFlags {
   state: Map<string | number, T>
   data: TData
   collection: Collection<T, string | number, {}>
   status: CollectionStatus
-  isLoading: boolean
-  isReady: boolean
-  isIdle: boolean
-  isError: boolean
-  isCleanedUp: boolean
+}
+
+type InferConditionalResultType<TContext extends Context> =
+  TContext extends SingleResult
+    ? InferResultType<TContext> | []
+    : InferResultType<TContext>
+
+export type ConditionalUseLiveQueryReturn<
+  T extends object,
+  TData = Array<T>,
+> = Omit<UseLiveQueryReturn<T, TData>, `collection` | `status`> & {
+  collection: Collection<T, string | number, {}> | null
+  status: CollectionStatus | `disabled`
 }
 
 export interface UseLiveQueryReturnWithCollection<
@@ -47,19 +89,20 @@ export interface UseLiveQueryReturnWithCollection<
   TKey extends string | number,
   TUtils extends Record<string, any>,
   TData = Array<T>,
-> {
+> extends LiveQueryStatusFlags {
   state: Map<TKey, T>
   data: TData
   collection: Collection<T, TKey, TUtils>
   status: CollectionStatus
-  isLoading: boolean
-  isReady: boolean
-  isIdle: boolean
-  isError: boolean
-  isCleanedUp: boolean
 }
 
 type MaybeGetter<T> = T | (() => T)
+
+export type UseLiveQueryConfig<TContext extends Context> =
+  LiveQueryHookConfig<TContext> & {
+    queryKey?: MaybeGetter<LiveQueryKey>
+    client?: DbClient
+  }
 
 function toValue<T>(value: MaybeGetter<T>): T {
   if (typeof value === `function`) {
@@ -120,8 +163,8 @@ function toValue<T>(value: MaybeGetter<T>): T {
  * const query = useLiveQuery((q) =>
  *   q.from({ todos: todosCollection })
  * )
- * const { data, isLoading, isError } = $derived(query)
- * // Now data, isLoading, and isError maintain reactivity
+ * const { data, isLoading, isLoadingError } = $derived(query)
+ * // Now data, isLoading, and isLoadingError maintain reactivity
  *
  * @example
  * // Join pattern
@@ -146,7 +189,7 @@ function toValue<T>(value: MaybeGetter<T>): T {
  * // In template:
  * // {#if todosQuery.isLoading}
  * //   <div>Loading...</div>
- * // {:else if todosQuery.isError}
+ * // {:else if todosQuery.isLoadingError}
  * //   <div>Error: {todosQuery.status}</div>
  * // {:else}
  * //   <ul>
@@ -168,9 +211,9 @@ export function useLiveQuery<TContext extends Context>(
     q: InitialQueryBuilder,
   ) => QueryBuilder<TContext> | undefined | null,
   deps?: Array<() => unknown>,
-): UseLiveQueryReturn<
+): ConditionalUseLiveQueryReturn<
   GetResult<TContext>,
-  InferResultType<TContext> | undefined
+  InferConditionalResultType<TContext>
 >
 
 /**
@@ -202,7 +245,7 @@ export function useLiveQuery<TContext extends Context>(
  * // In template:
  * // {#if itemsQuery.isLoading}
  * //   <div>Loading...</div>
- * // {:else if itemsQuery.isError}
+ * // {:else if itemsQuery.isLoadingError}
  * //   <div>Something went wrong</div>
  * // {:else if !itemsQuery.isReady}
  * //   <div>Preparing...</div>
@@ -212,7 +255,7 @@ export function useLiveQuery<TContext extends Context>(
  */
 // Overload 2: Accept config object
 export function useLiveQuery<TContext extends Context>(
-  config: LiveQueryCollectionConfig<TContext>,
+  config: UseLiveQueryConfig<TContext>,
   deps?: Array<() => unknown>,
 ): UseLiveQueryReturn<GetResult<TContext>, InferResultType<TContext>>
 
@@ -251,7 +294,7 @@ export function useLiveQuery<TContext extends Context>(
  * // In template:
  * // {#if queryResult.isLoading}
  * //   <div>Loading...</div>
- * // {:else if queryResult.isError}
+ * // {:else if queryResult.isLoadingError}
  * //   <div>Error loading data</div>
  * // {:else}
  * //   {#each queryResult.data as item (item.id)}
@@ -286,7 +329,13 @@ export function useLiveQuery(
   configOrQueryOrCollection: any,
   deps: Array<() => unknown> = [],
 ): UseLiveQueryReturn<any> | UseLiveQueryReturnWithCollection<any, any, any> {
-  const collection = $derived.by(() => {
+  const context = useDbContext()
+  const contextDbClient = context?.client
+  // Source Collection IDs this hook's client-backed queries read, kept until
+  // it unmounts.
+  const sourceIdClaims = createLiveQuerySourceIdClaims()
+
+  const resolved = $derived.by(() => {
     // First check if the original parameter might be a getter
     // by seeing if toValue returns something different than the original
     let unwrappedParam = configOrQueryOrCollection
@@ -301,14 +350,13 @@ export function useLiveQuery(
     }
 
     // Check if it's already a collection by checking for specific collection methods
-    const isCollection =
-      unwrappedParam &&
-      typeof unwrappedParam === `object` &&
-      typeof unwrappedParam.subscribeChanges === `function` &&
-      typeof unwrappedParam.startSyncImmediate === `function` &&
-      typeof unwrappedParam.id === `string`
+    const inputIsCollection = isCollection(unwrappedParam)
+    const dbClient = inputIsCollection
+      ? contextDbClient
+      : ((unwrappedParam as { client?: DbClient } | null)?.client ??
+        contextDbClient)
 
-    if (isCollection) {
+    if (inputIsCollection) {
       // Warn when passing a collection directly with on-demand sync mode
       // In on-demand mode, data is only loaded when queries with predicates request it
       // Passing the collection directly doesn't provide any predicates, so no data loads
@@ -328,185 +376,254 @@ export function useLiveQuery(
       if (unwrappedParam.status === `idle`) {
         unwrappedParam.startSyncImmediate()
       }
-      return unwrappedParam
+      return {
+        collection: unwrappedParam,
+        client: dbClient,
+        queryHash: getStableValueHash(
+          [`collection`, unwrappedParam.id],
+          `queryKey`,
+        ),
+        resumeDeferredCollections: () => {},
+      }
     }
 
     // Reference deps to make computed reactive to them
-    deps.forEach((dep) => toValue(dep))
+    const dependencyValues = deps.map((dep) => toValue(dep))
+    const deferredCollections: DeferredLiveQueryCollections = new Set()
+    // The compile boundary: a query rejected anywhere after preparation
+    // releases the sync starts it deferred, so a later reader can start them.
+    try {
+      const preparedValue = prepareLiveQueryValue(
+        unwrappedParam,
+        dbClient,
+        deferredCollections,
+      )
+      const configuredQueryKey = (
+        unwrappedParam as { queryKey?: MaybeGetter<LiveQueryKey> } | null
+      )?.queryKey
+      const queryKey = configuredQueryKey
+        ? toValue(configuredQueryKey)
+        : undefined
 
-    // Ensure we always start sync for Svelte helpers
-    if (typeof unwrappedParam === `function`) {
-      // Check if query function returns null/undefined (disabled query)
-      const queryBuilder = new BaseQueryBuilder() as InitialQueryBuilder
-      const result = unwrappedParam(queryBuilder)
+      // A DbClient matches preloaded and hydrated queries by identity hash, so
+      // a client-backed query without queryKey needs a stable IR identity and
+      // keeps each source Collection ID's object while the hook is mounted.
+      const derivedHash =
+        dbClient && !queryKey?.length
+          ? identifyLiveQuery(
+              preparedValue,
+              {
+                claims: sourceIdClaims,
+                client: dbClient,
+                bindingName: `useLiveQuery`,
+              },
+              getLiveQueryHash,
+            )
+          : undefined
 
-      if (result === undefined || result === null) {
-        // Disabled query - return null
-        return null
+      let queryHash: string | undefined
+      try {
+        queryHash =
+          deps.length > 0 && !queryKey?.length
+            ? getStableValueHash(
+                [
+                  `deps`,
+                  dependencyValues,
+                  derivedHash ?? getLiveQueryHash(preparedValue),
+                ],
+                `queryKey`,
+              )
+            : (derivedHash ?? getLiveQueryHash(preparedValue, queryKey))
+      } catch (error) {
+        // A dependency value or a client-free query that cannot be hashed
+        // leaves hydration without a key; it does not reject the query. An
+        // empty key counts as none; a nonempty one must hash.
+        if (!(error instanceof UnhashableQueryIRError)) throw error
+        if (queryKey?.length) throw error
       }
 
-      return createLiveQueryCollection({
-        query: unwrappedParam,
-        startSync: true,
-      })
-    } else {
-      return createLiveQueryCollection({
-        ...unwrappedParam,
-        startSync: true,
-      })
+      let collection: Collection<any, any, any> | null
+      if (preparedValue === undefined || preparedValue === null) {
+        collection = null
+      } else if (isCollection(preparedValue)) {
+        collection = preparedValue
+      } else {
+        // Hydration keys the live-query Collection by identity, so it never
+        // pools, even when the config passes a pool.
+        collection = resolveLiveQueryValue(preparedValue, {
+          gcTime: DEFAULT_GC_TIME_MS,
+          pool: dbClient ? false : undefined,
+        })
+      }
+
+      // A setup that never subscribes releases its deferred sync starts when
+      // garbage collection reclaims the live query it built. A Collection
+      // the input supplied is not this setup's to reclaim.
+      const cancelReclaimRelease =
+        collection && !isCollection(preparedValue)
+          ? releaseDeferredOnReclaim(collection, deferredCollections)
+          : undefined
+      return {
+        collection,
+        client: dbClient,
+        queryHash,
+        // The subscribing effect releases the starts, so it drops the
+        // reclaim release.
+        resumeDeferredCollections: () => {
+          cancelReclaimRelease?.()
+          resumeDeferredLiveQueryCollections(deferredCollections)
+        },
+      }
+    } catch (error) {
+      return rejectLiveQueryInput(deferredCollections, error)
     }
   })
 
+  let currentResolved = untrack(() => resolved)
+  let currentObserver = createLiveQueryObserver(currentResolved.collection, {
+    client: currentResolved.client,
+    queryHash: currentResolved.queryHash,
+    onPreload: currentResolved.resumeDeferredCollections,
+  })
+  const initialSnapshot =
+    typeof window === `undefined` || context?.hydrating
+      ? currentObserver.getServerSnapshot()
+      : currentObserver.getSnapshot()
+
   // Reactive state that gets updated granularly through change events
-  const state = new SvelteMap<string | number, any>()
+  const state = new SvelteMap<string | number, any>(initialSnapshot.state ?? [])
 
   // Reactive data array that maintains sorted order
-  let internalData = $state<Array<any>>([])
+  let internalData = $state<Array<any>>(snapshotRows(initialSnapshot.data))
 
   // Track collection status reactively
-  let status = $state(collection ? collection.status : (`disabled` as const))
+  let status = $state(initialSnapshot.status)
+  let health = $state.raw<HealthNode | undefined>(initialSnapshot.health)
+  let isSyncError = $state(initialSnapshot.isSyncError)
 
-  // Helper to sync data array from collection in correct order
-  const syncDataFromCollection = (
-    currentCollection: Collection<any, any, any>,
+  const syncFromObserver = (
+    observer: LiveQueryObserver<any, any>,
+    changes?: Array<ChangeMessage<any>>,
   ) => {
+    const snapshot = observer.getSnapshot()
+    status = snapshot.status as CollectionStatus
+    health = snapshot.health
+    isSyncError = snapshot.isSyncError
     untrack(() => {
-      internalData = []
-      internalData.push(...Array.from(currentCollection.values()))
+      if (changes && changes.length > 0) {
+        for (const change of changes) {
+          switch (change.type) {
+            case `insert`:
+            case `update`:
+              state.set(change.key, change.value)
+              break
+            case `delete`:
+              state.delete(change.key)
+              break
+          }
+        }
+      } else {
+        state.clear()
+        for (const [key, value] of snapshot.state ?? []) {
+          state.set(key, value)
+        }
+      }
+      internalData = snapshotRows(snapshot.data)
     })
   }
 
-  // Track current unsubscribe function
-  let currentUnsubscribe: (() => void) | null = null
-
   // Watch for collection changes and subscribe to updates
   $effect(() => {
-    const currentCollection = collection
+    const nextResolved = resolved
 
-    // Handle null collection (disabled query)
-    if (!currentCollection) {
-      status = `disabled` as const
-      untrack(() => {
-        state.clear()
-        internalData = []
+    if (nextResolved !== currentResolved) {
+      currentObserver.dispose()
+      currentResolved = nextResolved
+      currentObserver = createLiveQueryObserver(nextResolved.collection, {
+        client: nextResolved.client,
+        queryHash: nextResolved.queryHash,
+        onPreload: nextResolved.resumeDeferredCollections,
       })
-      if (currentUnsubscribe) {
-        currentUnsubscribe()
-        currentUnsubscribe = null
-      }
-      return
+      syncFromObserver(currentObserver)
     }
 
-    // Update status state whenever the effect runs
-    status = currentCollection.status
+    const observer = currentObserver
 
-    // Clean up previous subscription
-    if (currentUnsubscribe) {
-      currentUnsubscribe()
-    }
-
-    // Initialize state with current collection data
-    untrack(() => {
-      state.clear()
-      for (const [key, value] of currentCollection.entries()) {
-        state.set(key, value)
-      }
-    })
-
-    // Initialize data array in correct order
-    syncDataFromCollection(currentCollection)
-
-    // Listen for the first ready event to catch status transitions
-    // that might not trigger change events (fixes async status transition bug)
-    currentCollection.onFirstReady(() => {
-      // Update status directly - Svelte's reactivity system handles the update automatically
-      // Note: We cannot use flushSync here as it's disallowed inside effects in async mode
-      status = currentCollection.status
-    })
-
-    // Subscribe to collection changes with granular updates
-    const subscription = currentCollection.subscribeChanges(
-      (changes: Array<ChangeMessage<any>>) => {
-        // Apply each change individually to the reactive state
-        untrack(() => {
-          for (const change of changes) {
-            switch (change.type) {
-              case `insert`:
-              case `update`:
-                state.set(change.key, change.value)
-                break
-              case `delete`:
-                state.delete(change.key)
-                break
-            }
-          }
-        })
-
-        // Update the data array to maintain sorted order
-        syncDataFromCollection(currentCollection)
-        // Update status state on every change
-        status = currentCollection.status
-      },
-      {
-        includeInitialState: true,
+    const unsubscribe = observer.subscribe(
+      (changes: Array<ChangeMessage<any>> | undefined) => {
+        syncFromObserver(observer, changes)
       },
     )
-
-    currentUnsubscribe = subscription.unsubscribe.bind(subscription)
-
-    // Preload collection data if not already started
-    if (currentCollection.status === `idle`) {
-      currentCollection.preload().catch(console.error)
+    try {
+      currentResolved.resumeDeferredCollections()
+      syncFromObserver(observer)
+    } catch (error) {
+      unsubscribe()
+      observer.dispose()
+      throw error
     }
 
     // Cleanup when effect is invalidated
     return () => {
-      if (currentUnsubscribe) {
-        currentUnsubscribe()
-        currentUnsubscribe = null
-      }
+      unsubscribe()
+      if (observer === currentObserver) observer.dispose()
     }
   })
 
+  // Every read goes through the compiled query, so a query the hook rejected
+  // throws on each read instead of serving the previous query's state.
+  const readResolved = () => resolved
+
   return {
     get state() {
+      readResolved()
       return state
     },
     get data() {
-      const currentCollection = collection
-      if (currentCollection) {
-        const config =
-          currentCollection.config as CollectionConfigSingleRowOption<
-            any,
-            any,
-            any
-          >
-        if (config.singleResult) {
-          return internalData[0]
-        }
+      const currentCollection = resolved.collection
+      if (currentCollection && isSingleResultCollection(currentCollection)) {
+        return internalData[0]
       }
       return internalData
     },
     get collection() {
-      return collection
+      return getPublicCollection(resolved.collection)
     },
     get status() {
-      return status
+      readResolved()
+      return status as CollectionStatus
     },
     get isLoading() {
+      readResolved()
       return status === `loading`
     },
     get isReady() {
+      readResolved()
       return status === `ready` || status === `disabled`
     },
     get isIdle() {
+      readResolved()
       return status === `idle`
     },
-    get isError() {
+    get isLoadingError() {
+      readResolved()
       return status === `error`
     },
+    get isCrashed() {
+      readResolved()
+      return status === `crashed`
+    },
     get isCleanedUp() {
+      readResolved()
       return status === `cleaned-up`
+    },
+    get isSyncError() {
+      readResolved()
+      return isSyncError
+    },
+    get health() {
+      readResolved()
+      return health
     },
   }
 }

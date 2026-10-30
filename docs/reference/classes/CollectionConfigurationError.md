@@ -3,9 +3,7 @@ id: CollectionConfigurationError
 title: CollectionConfigurationError
 ---
 
-# Class: CollectionConfigurationError
-
-Defined in: [packages/db/src/errors.ts:71](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L71)
+Defined in: [packages/db/src/errors.ts:75](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L75)
 
 ## Extends
 
@@ -13,6 +11,7 @@ Defined in: [packages/db/src/errors.ts:71](https://github.com/TanStack/db/blob/m
 
 ## Extended by
 
+- [`InvalidSyncPersistenceCapabilityError`](InvalidSyncPersistenceCapabilityError.md)
 - [`CollectionRequiresConfigError`](CollectionRequiresConfigError.md)
 - [`CollectionRequiresSyncConfigError`](CollectionRequiresSyncConfigError.md)
 - [`InvalidSchemaError`](InvalidSchemaError.md)
@@ -26,7 +25,7 @@ Defined in: [packages/db/src/errors.ts:71](https://github.com/TanStack/db/blob/m
 new CollectionConfigurationError(message): CollectionConfigurationError;
 ```
 
-Defined in: [packages/db/src/errors.ts:72](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L72)
+Defined in: [packages/db/src/errors.ts:76](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L76)
 
 #### Parameters
 

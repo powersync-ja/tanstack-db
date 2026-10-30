@@ -3,9 +3,7 @@ id: QueueStrategy
 title: QueueStrategy
 ---
 
-# Interface: QueueStrategy
-
-Defined in: [packages/db/src/strategies/types.ts:66](https://github.com/TanStack/db/blob/main/packages/db/src/strategies/types.ts#L66)
+Defined in: [packages/db/src/strategies/types.ts:73](https://github.com/TanStack/db/blob/main/packages/db/src/strategies/types.ts#L73)
 
 Queue strategy that processes all executions in order
 FIFO: { addItemsTo: 'back', getItemsFrom: 'front' }
@@ -39,7 +37,7 @@ Type discriminator for strategy identification
 cleanup: () => void;
 ```
 
-Defined in: [packages/db/src/strategies/types.ts:23](https://github.com/TanStack/db/blob/main/packages/db/src/strategies/types.ts#L23)
+Defined in: [packages/db/src/strategies/types.ts:30](https://github.com/TanStack/db/blob/main/packages/db/src/strategies/types.ts#L30)
 
 Clean up any resources held by the strategy
 Should be called when the strategy is no longer needed
@@ -57,12 +55,12 @@ Should be called when the strategy is no longer needed
 ### execute()
 
 ```ts
-execute: <T>(fn) => void | Promise<void>;
+execute: <T>(fn, onAdmit?, onCommit?) => boolean | void | Promise<void>;
 ```
 
-Defined in: [packages/db/src/strategies/types.ts:15](https://github.com/TanStack/db/blob/main/packages/db/src/strategies/types.ts#L15)
+Defined in: [packages/db/src/strategies/types.ts:76](https://github.com/TanStack/db/blob/main/packages/db/src/strategies/types.ts#L76)
 
-Execute a function according to the strategy's timing rules
+Explicit false rejects the transaction; void preserves custom strategies.
 
 #### Type Parameters
 
@@ -76,15 +74,19 @@ Execute a function according to the strategy's timing rules
 
 () => [`Transaction`](Transaction.md)\<`T`\>
 
-The function to execute
+##### onAdmit?
+
+() => `void` \| [`Transaction`](Transaction.md)\<`T`\>
+
+##### onCommit?
+
+() => `Promise`\<`unknown`\> \| `undefined`
 
 #### Returns
 
-`void` \| `Promise`\<`void`\>
+`boolean` \| `void` \| `Promise`\<`void`\>
 
-The result of the function execution (if applicable)
-
-#### Inherited from
+#### Overrides
 
 [`BaseStrategy`](BaseStrategy.md).[`execute`](BaseStrategy.md#execute)
 
@@ -96,4 +98,4 @@ The result of the function execution (if applicable)
 optional options: QueueStrategyOptions;
 ```
 
-Defined in: [packages/db/src/strategies/types.ts:67](https://github.com/TanStack/db/blob/main/packages/db/src/strategies/types.ts#L67)
+Defined in: [packages/db/src/strategies/types.ts:74](https://github.com/TanStack/db/blob/main/packages/db/src/strategies/types.ts#L74)

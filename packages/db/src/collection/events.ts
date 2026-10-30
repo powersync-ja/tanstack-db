@@ -45,10 +45,30 @@ export interface CollectionLoadingSubsetChangeEvent {
 }
 
 /**
+ * Event emitted when the Collection's health tree may have changed: its own
+ * status or problems, or for a live query, those of a Collection it depends
+ * on. Read `collection.health` for the current tree.
+ */
+export interface CollectionHealthChangeEvent {
+  type: `health:change`
+  collection: Collection<any, any, any, any, any>
+}
+
+/**
  * Event emitted when the collection is truncated (all data cleared)
  */
 export interface CollectionTruncateEvent {
   type: `truncate`
+  collection: Collection<any, any, any, any, any>
+}
+
+/**
+ * Event emitted when the sync adapter reports that rows it serves for loaded
+ * subsets may have shifted between served pages. Ordered live queries then
+ * re-establish their windows with a bounded repair.
+ */
+export interface CollectionLoadedSubsetsInvalidatedEvent {
+  type: `loadedSubsets:invalidated`
   collection: Collection<any, any, any, any, any>
 }
 
@@ -64,6 +84,7 @@ export type CollectionIndexSerializableValue =
 
 export interface CollectionIndexResolverMetadata {
   kind: `constructor` | `async`
+  /** Stable for built-in indexes; diagnostic and build-dependent for custom constructors. */
   name?: string
 }
 
@@ -100,21 +121,14 @@ export type AllCollectionEvents = {
   'status:change': CollectionStatusChangeEvent
   'subscribers:change': CollectionSubscribersChangeEvent
   'loadingSubset:change': CollectionLoadingSubsetChangeEvent
+  'health:change': CollectionHealthChangeEvent
   truncate: CollectionTruncateEvent
+  'loadedSubsets:invalidated': CollectionLoadedSubsetsInvalidatedEvent
   'index:added': CollectionIndexAddedEvent
   'index:removed': CollectionIndexRemovedEvent
 } & {
   [K in CollectionStatus as `status:${K}`]: CollectionStatusEvent<K>
 }
-
-export type CollectionEvent =
-  | AllCollectionEvents[keyof AllCollectionEvents]
-  | CollectionStatusChangeEvent
-  | CollectionSubscribersChangeEvent
-  | CollectionLoadingSubsetChangeEvent
-  | CollectionTruncateEvent
-  | CollectionIndexAddedEvent
-  | CollectionIndexRemovedEvent
 
 export type CollectionEventHandler<T extends keyof AllCollectionEvents> = (
   event: AllCollectionEvents[T],
@@ -145,22 +159,39 @@ export class CollectionEventsManager extends EventEmitter<AllCollectionEvents> {
   emitStatusChange<T extends CollectionStatus>(
     status: T,
     previousStatus: CollectionStatus,
+    isCurrent: () => boolean,
   ) {
-    this.emit(`status:change`, {
-      type: `status:change`,
-      collection: this.collection,
-      previousStatus,
-      status,
-    })
+    this.emitInnerWhile(
+      `status:change`,
+      {
+        type: `status:change`,
+        collection: this.collection,
+        previousStatus,
+        status,
+      },
+      isCurrent,
+    )
+    if (!isCurrent()) return
 
     // Emit specific status event using type assertion
     const eventKey: `status:${T}` = `status:${status}`
-    this.emit(eventKey, {
-      type: eventKey,
+    this.emitInnerWhile(
+      eventKey,
+      {
+        type: eventKey,
+        collection: this.collection,
+        previousStatus,
+        status,
+      } as AllCollectionEvents[`status:${T}`],
+      isCurrent,
+    )
+  }
+
+  emitHealthChange() {
+    this.emit(`health:change`, {
+      type: `health:change`,
       collection: this.collection,
-      previousStatus,
-      status,
-    } as AllCollectionEvents[`status:${T}`])
+    })
   }
 
   emitSubscribersChange(

@@ -1,5 +1,3 @@
-import { describe, expect, it } from 'vitest'
-import { render, renderHook, waitFor } from '@solidjs/testing-library'
 import {
   Query,
   count,
@@ -8,7 +6,11 @@ import {
   createOptimisticAction,
   eq,
   gt,
+  include,
+  toArray,
 } from '@tanstack/db'
+import { describe, expect, it, vi } from 'vitest'
+import { render, renderHook, waitFor } from '@solidjs/testing-library'
 import {
   For,
   Suspense,
@@ -19,6 +21,7 @@ import {
 import { useLiveQuery } from '../src/useLiveQuery'
 import { mockSyncCollectionOptions } from '../../db/tests/utils'
 import type { Accessor } from 'solid-js'
+import type { Collection } from '@tanstack/db'
 
 type Person = {
   id: string
@@ -85,6 +88,99 @@ const initialIssues: Array<Issue> = [
 ]
 
 describe(`Query Collections`, () => {
+  it(`clears data immediately when switching to an already-ready empty collection`, async () => {
+    return createRoot(async (dispose) => {
+      const populated = createCollection(
+        mockSyncCollectionOptions<Person>({
+          id: `solid-populated-switch`,
+          getKey: (person) => person.id,
+          initialData: initialPersons,
+        }),
+      )
+      const empty = createCollection(
+        mockSyncCollectionOptions<Person>({
+          id: `solid-empty-switch`,
+          getKey: (person) => person.id,
+          initialData: [],
+        }),
+      )
+      populated.startSyncImmediate()
+      empty.startSyncImmediate()
+
+      const [current, setCurrent] = createSignal(populated)
+      const result = useLiveQuery(current)
+      await waitFor(() => expect(result()).toHaveLength(3))
+
+      setCurrent(empty)
+
+      expect(result()).toHaveLength(0)
+      expect(result.state.size).toBe(0)
+      dispose()
+    })
+  })
+
+  it(`remounts overlapping row keys when switching collection identity`, async () => {
+    type SwitchItem = { id: string; label: string }
+    const first = createCollection(
+      mockSyncCollectionOptions<SwitchItem>({
+        id: `solid-overlapping-switch-first`,
+        getKey: (item) => item.id,
+        initialData: [{ id: `shared`, label: `First` }],
+      }),
+    )
+    const second = createCollection(
+      mockSyncCollectionOptions<SwitchItem>({
+        id: `solid-overlapping-switch-second`,
+        getKey: (item) => item.id,
+        initialData: [{ id: `shared`, label: `Second` }],
+      }),
+    )
+    first.startSyncImmediate()
+    second.startSyncImmediate()
+
+    const [current, setCurrent] = createSignal<typeof first | typeof second>(
+      first,
+    )
+    let mount = 0
+    const rendered = render(() => {
+      const result = useLiveQuery(current)
+      return (
+        <ol data-testid="overlapping-switch-list">
+          <For each={result()}>
+            {(item) => {
+              const token = `mount-${++mount}`
+              return (
+                <li data-token={token} data-row-key={item.id}>
+                  {item.label}
+                </li>
+              )
+            }}
+          </For>
+        </ol>
+      )
+    })
+    const row = () =>
+      rendered.getByTestId(`overlapping-switch-list`).children[0] as
+        HTMLLIElement | undefined
+
+    try {
+      await waitFor(() => expect(row()?.textContent).toBe(`First`))
+      const firstNode = row()
+      const firstToken = firstNode?.dataset.token
+
+      setCurrent(second)
+
+      await waitFor(() => expect(row()?.textContent).toBe(`Second`))
+      expect(row()).not.toBe(firstNode)
+      expect(row()?.dataset.token).not.toBe(firstToken)
+      expect(mount).toBe(2)
+    } finally {
+      rendered.unmount()
+      await first.cleanup()
+      await second.cleanup()
+    }
+  })
+
   it(`should work with basic collection and select`, async () => {
     const collection = createCollection(
       mockSyncCollectionOptions<Person>({
@@ -304,19 +400,19 @@ describe(`Query Collections`, () => {
 
     // Verify that we have the expected joined results
 
-    expect(result.state.get(`[1,1]`)).toMatchObject({
+    expect(result.state.get(`["1","1"]`)).toMatchObject({
       id: `1`,
       name: `John Doe`,
       title: `Issue 1`,
     })
 
-    expect(result.state.get(`[2,2]`)).toMatchObject({
+    expect(result.state.get(`["2","2"]`)).toMatchObject({
       id: `2`,
       name: `Jane Doe`,
       title: `Issue 2`,
     })
 
-    expect(result.state.get(`[3,1]`)).toMatchObject({
+    expect(result.state.get(`["3","1"]`)).toMatchObject({
       id: `3`,
       name: `John Doe`,
       title: `Issue 3`,
@@ -338,7 +434,7 @@ describe(`Query Collections`, () => {
     await waitFor(() => {
       expect(result.state.size).toBe(4)
     })
-    expect(result.state.get(`[4,2]`)).toMatchObject({
+    expect(result.state.get(`["4","2"]`)).toMatchObject({
       id: `4`,
       name: `Jane Doe`,
       title: `Issue 4`,
@@ -359,7 +455,7 @@ describe(`Query Collections`, () => {
 
     await waitFor(() => {
       // The updated title should be reflected in the joined results
-      expect(result.state.get(`[2,2]`)).toMatchObject({
+      expect(result.state.get(`["2","2"]`)).toMatchObject({
         id: `2`,
         name: `Jane Doe`,
         title: `Updated Issue 2`,
@@ -381,7 +477,7 @@ describe(`Query Collections`, () => {
 
     await waitFor(() => {
       // After deletion, issue 3 should no longer have a joined result
-      expect(result.state.get(`[3,1]`)).toBeUndefined()
+      expect(result.state.get(`["3","1"]`)).toBeUndefined()
       expect(result.state.size).toBe(3)
     })
   })
@@ -518,6 +614,125 @@ describe(`Query Collections`, () => {
 
       // Should now be empty
       expect(rendered.result.state.size).toBe(0)
+
+      dispose()
+    })
+  })
+
+  it(`should drop stale keys from state synchronously when parameters narrow`, async () => {
+    // Narrowing recompiles into a *new* collection with fewer keys. The
+    // observer re-seeds via `includeInitialState`, which only inserts current
+    // rows and never deletes the previous collection's keys. `state` must be
+    // cleared synchronously so the dropped keys don't linger in the window
+    // before the async resource reconciles (this reads `state` with no settle;
+    // `data`, rebuilt wholesale, stays correct either way).
+    return createRoot(async (dispose) => {
+      const collection = createCollection(
+        mockSyncCollectionOptions<Person>({
+          id: `stale-keys-on-narrow-test`,
+          getKey: (person: Person) => person.id,
+          initialData: initialPersons,
+        }),
+      )
+
+      const [minAge, setMinAge] = createSignal(10)
+      const rendered = renderHook(
+        (props: { minAge: Accessor<number> }) => {
+          return useLiveQuery((q) =>
+            q
+              .from({ collection })
+              .where(({ collection: c }) => gt(c.age, props.minAge()))
+              .select(({ collection: c }) => ({ id: c.id })),
+          )
+        },
+        { initialProps: [{ minAge }] },
+      )
+
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      expect(rendered.result.state.size).toBe(3) // all three ages > 10
+
+      // Narrow to only John Smith (age 35); ids 1 and 2 must not linger.
+      setMinAge(32)
+
+      expect(rendered.result.state.size).toBe(1)
+      expect(rendered.result.state.has(`1`)).toBe(false)
+      expect(rendered.result.state.has(`2`)).toBe(false)
+
+      dispose()
+    })
+  })
+
+  it(`does not resurrect state from a superseded collection's async continuation`, async () => {
+    // The resource fetcher awaits toArrayWhenReady(); if the collection is
+    // switched while that await is pending, the old continuation must not
+    // write its (now stale) rows/status over the new collection's.
+    return createRoot(async (dispose) => {
+      let beginA: (() => void) | undefined
+      let writeA: ((msg: any) => void) | undefined
+      let commitA: (() => void) | undefined
+      let markReadyA: (() => void) | undefined
+
+      const slowCollection = createCollection<Person>({
+        id: `superseded-async-slow`,
+        getKey: (person: Person) => person.id,
+        startSync: false,
+        sync: {
+          sync: ({ begin, write, commit, markReady }) => {
+            beginA = begin
+            writeA = write
+            commitA = commit
+            markReadyA = markReady
+            // Stays loading until markReady is called manually.
+          },
+        },
+      })
+      const fastCollection = createCollection(
+        mockSyncCollectionOptions<Person>({
+          id: `superseded-async-fast`,
+          getKey: (person: Person) => person.id,
+          initialData: [initialPersons[0]!],
+        }),
+      )
+
+      const [useSlow, setUseSlow] = createSignal(true)
+      const rendered = renderHook(() => {
+        return useLiveQuery((q) =>
+          q
+            .from({ persons: useSlow() ? slowCollection : fastCollection })
+            .select(({ persons }) => ({ id: persons.id, name: persons.name })),
+        )
+      })
+
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(rendered.result.isLoading).toBe(true)
+
+      // Switch collections while the slow fetch is still awaiting readiness.
+      setUseSlow(false)
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(rendered.result.state.has(`1`)).toBe(true)
+
+      // The superseded collection now becomes ready with different rows; its
+      // continuation resolves but must not clobber the current state.
+      beginA!()
+      writeA!({
+        type: `insert`,
+        value: {
+          id: `stale`,
+          name: `Stale Row`,
+          age: 99,
+          email: `stale@example.com`,
+          isActive: false,
+          team: `none`,
+        },
+      })
+      commitA!()
+      markReadyA!()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+
+      expect(rendered.result.state.has(`stale`)).toBe(false)
+      expect(rendered.result.state.has(`1`)).toBe(true)
+      expect(rendered.result().map((p: any) => p.id)).toEqual([`1`])
+      expect(rendered.result.status).toBe(`ready`)
 
       dispose()
     })
@@ -665,8 +880,8 @@ describe(`Query Collections`, () => {
       createComputed(() => {
         renderStates.push({
           stateSize: queryResult.state.size,
-          hasTempKey: queryResult.state.has(`[temp-key,1]`),
-          hasPermKey: queryResult.state.has(`[4,1]`),
+          hasTempKey: queryResult.state.has(`["temp-key","1"]`),
+          hasPermKey: queryResult.state.has(`["4","1"]`),
           timestamp: Date.now(),
         })
       })
@@ -740,19 +955,19 @@ describe(`Query Collections`, () => {
       // Verify optimistic state is immediately reflected
       expect(result.state.size).toBe(4)
     })
-    expect(result.state.get(`[temp-key,1]`)).toMatchObject({
+    expect(result.state.get(`["temp-key","1"]`)).toMatchObject({
       id: `temp-key`,
       name: `John Doe`,
       title: `New Issue`,
     })
-    expect(result.state.get(`[4,1]`)).toBeUndefined()
+    expect(result.state.get(`["4","1"]`)).toBeUndefined()
 
     // Wait for the transaction to be committed
-    await transaction.isPersisted.promise
+    await transaction.when(`settled`)
 
     await waitFor(() => {
       // Wait for the permanent key to appear
-      expect(result.state.get(`[4,1]`)).toBeDefined()
+      expect(result.state.get(`["4","1"]`)).toBeDefined()
     })
 
     // Check if we had any render where the temp key was removed but the permanent key wasn't added yet
@@ -765,8 +980,8 @@ describe(`Query Collections`, () => {
 
     // Verify the temporary key is replaced by the permanent one
     expect(result.state.size).toBe(4)
-    expect(result.state.get(`[temp-key,1]`)).toBeUndefined()
-    expect(result.state.get(`[4,1]`)).toMatchObject({
+    expect(result.state.get(`["temp-key","1"]`)).toBeUndefined()
+    expect(result.state.get(`["4","1"]`)).toMatchObject({
       id: `4`,
       name: `John Doe`,
       title: `New Issue`,
@@ -1787,7 +2002,7 @@ describe(`Query Collections`, () => {
 
         // When callback returns undefined, should return disabled state
         expect(rendered.result.state.size).toBe(0)
-        expect(rendered.result.data).toEqual([])
+        expect(rendered.result()).toEqual([])
         expect(rendered.result.collection).toBeNull()
         expect(rendered.result.status).toBe(`disabled`)
         expect(rendered.result.isLoading).toBe(false)
@@ -1800,7 +2015,7 @@ describe(`Query Collections`, () => {
         await waitFor(() => {
           expect(rendered.result.state.size).toBe(1) // Only John Smith (age 35)
         })
-        expect(rendered.result.data).toHaveLength(1)
+        expect(rendered.result()).toHaveLength(1)
         expect(rendered.result.isReady).toBe(true)
 
         // Disable the query again
@@ -1844,7 +2059,7 @@ describe(`Query Collections`, () => {
 
         // When callback returns null, should return disabled state
         expect(rendered.result.state.size).toBe(0)
-        expect(rendered.result.data).toEqual([])
+        expect(rendered.result()).toEqual([])
         expect(rendered.result.collection).toBeNull()
         expect(rendered.result.status).toBe(`disabled`)
         expect(rendered.result.isLoading).toBe(false)
@@ -1857,15 +2072,196 @@ describe(`Query Collections`, () => {
         await waitFor(() => {
           expect(rendered.result.state.size).toBe(1)
         })
-        expect(rendered.result.data).toHaveLength(1)
+        expect(rendered.result()).toHaveLength(1)
         expect(rendered.result.isReady).toBe(true)
 
+        dispose()
+      })
+    })
+
+    /**
+     * Driver: public `useLiveQuery` with a Solid signal. Initial reads and each
+     * `waitFor` completion are observation cuts for disabled, enabled, and
+     * disabled-again public results. Collection/state behavior remains in
+     * shared conformance; this test isolates conditional `findOne` data.
+     */
+    it(`keeps conditional findOne data empty while disabled`, async () => {
+      return createRoot(async (dispose) => {
+        const collection = createCollection(
+          mockSyncCollectionOptions<Person>({
+            id: `disabled-find-one-solid`,
+            getKey: (person: Person) => person.id,
+            initialData: initialPersons,
+          }),
+        )
+        const [enabled, setEnabled] = createSignal(false)
+        const rendered = renderHook(() =>
+          useLiveQuery((q) =>
+            enabled()
+              ? q
+                  .from({ collection })
+                  .where(({ collection: person }) => eq(person.id, `3`))
+                  .findOne()
+              : null,
+          ),
+        )
+
+        expect(rendered.result.status).toBe(`disabled`)
+        expect(rendered.result()).toEqual([])
+
+        setEnabled(true)
+        await waitFor(() => {
+          expect(rendered.result()).toMatchObject({ id: `3` })
+        })
+
+        setEnabled(false)
+        await waitFor(() => {
+          expect(rendered.result.status).toBe(`disabled`)
+        })
+        expect(rendered.result()).toEqual([])
         dispose()
       })
     })
   })
 
   describe(`Suspense Integration`, () => {
+    /**
+     * A suspended owner can disappear before its initial preload settles. Its
+     * later completion belongs to that disposed owner and must not publish
+     * resource state or touch the released preload observer.
+     */
+    it(`discards a pending preload after its Suspense owner unmounts`, async () => {
+      let markReady: (() => void) | undefined
+      const source = createCollection<Person>({
+        id: `solid-suspense-abandoned-pending-preload`,
+        getKey: (row) => row.id,
+        sync: {
+          sync: ({ begin, write, commit, markReady: ready }) => {
+            begin()
+            write({ type: `insert`, value: initialPersons[0]! })
+            commit()
+            markReady = ready
+          },
+        },
+      })
+      let queryCollection: Collection<any, any, any> | undefined
+      let readAbandoned: (() => unknown) | undefined
+      let readAbandonedStatus: (() => string) | undefined
+
+      function Pending() {
+        const query = useLiveQuery((q) => q.from({ person: source }))
+        queryCollection = query.collection
+        readAbandoned = () => query()
+        readAbandonedStatus = () => query.status
+        return <span data-testid="pending-person">{query()[0]?.name}</span>
+      }
+
+      const view = render(() => (
+        <Suspense fallback={<div data-testid="pending-waiting">Waiting</div>}>
+          <Pending />
+        </Suspense>
+      ))
+
+      try {
+        await waitFor(() => expect(markReady).toBeDefined())
+        expect(view.getByTestId(`pending-waiting`)).toBeTruthy()
+        view.unmount()
+        markReady!()
+        await queryCollection!.preload()
+        await waitFor(() => expect(queryCollection!.status).toBe(`cleaned-up`))
+        expect(readAbandonedStatus!()).not.toBe(`error`)
+        expect(readAbandoned!).not.toThrow()
+      } finally {
+        view.unmount()
+        await source.cleanup()
+      }
+    })
+
+    /**
+     * A resource that becomes ready while a sibling still suspends has
+     * completed its preload but has not committed its effect subscription.
+     * The preload is temporary ownership: it must keep the live-query
+     * Collection alive through that gap, then hand ownership to the committed
+     * observer so ordinary 1 ms retirement still applies after unmount.
+     */
+    it.each([`commit`, `abandon`] as const)(
+      `retains a ready sibling until the Suspense boundary reaches %s`,
+      async (outcome) => {
+        type Controls = { markReady: () => void }
+        const controls: Array<Controls> = []
+        const makePendingSource = (id: string, person: Person) =>
+          createCollection<Person>({
+            id,
+            getKey: (row) => row.id,
+            sync: {
+              sync: ({ begin, write, commit, markReady }) => {
+                begin()
+                write({ type: `insert`, value: person })
+                commit()
+                controls.push({ markReady })
+              },
+            },
+          })
+        const first = makePendingSource(
+          `solid-suspense-retained-first`,
+          initialPersons[0]!,
+        )
+        const second = makePendingSource(
+          `solid-suspense-retained-second`,
+          initialPersons[1]!,
+        )
+        let firstQueryCollection: Collection<any, any, any> | undefined
+
+        function First() {
+          const query = useLiveQuery((q) => q.from({ person: first }))
+          firstQueryCollection = query.collection
+          return <span data-testid="suspense-first">{query()[0]?.name}</span>
+        }
+
+        function Second() {
+          const query = useLiveQuery((q) => q.from({ person: second }))
+          return <span data-testid="suspense-second">{query()[0]?.name}</span>
+        }
+
+        vi.useFakeTimers()
+        const view = render(() => (
+          <Suspense fallback={<div data-testid="sibling-waiting">Waiting</div>}>
+            <First />
+            <Second />
+          </Suspense>
+        ))
+
+        try {
+          expect(controls).toHaveLength(2)
+          controls[0]!.markReady()
+          await firstQueryCollection!.preload()
+          await vi.advanceTimersByTimeAsync(100)
+          vi.useRealTimers()
+          expect(firstQueryCollection!.status).not.toBe(`cleaned-up`)
+
+          if (outcome === `commit`) {
+            controls[1]!.markReady()
+            expect(
+              (await view.findByTestId(`suspense-first`)).textContent,
+            ).toBe(`John Doe`)
+            expect(
+              (await view.findByTestId(`suspense-second`)).textContent,
+            ).toBe(`Jane Doe`)
+          }
+
+          view.unmount()
+          await waitFor(() =>
+            expect(firstQueryCollection!.status).toBe(`cleaned-up`),
+          )
+        } finally {
+          vi.useRealTimers()
+          view.unmount()
+          await first.cleanup()
+          await second.cleanup()
+        }
+      },
+    )
+
     it(`should work with Suspense boundaries`, async () => {
       const collection = createCollection(
         mockSyncCollectionOptions<Person>({
@@ -2133,6 +2529,260 @@ describe(`Query Collections`, () => {
       expect(keys).toEqual([`1`, `3`])
     })
 
+    it(`keeps custom-key rows distinct when an update changes rendered order`, async () => {
+      type CustomKeyItem = {
+        _id: string
+        name: string
+      }
+
+      const initialItems: Array<CustomKeyItem> = [
+        { _id: `bob1`, name: `Bob` },
+        { _id: `kevin1`, name: `Kevin` },
+        { _id: `stuart1`, name: `Stuart` },
+      ]
+      const reference = new Map(
+        initialItems.map((item) => [item._id, { ...item }]),
+      )
+      const expectedRows = () =>
+        Array.from(reference.values())
+          .sort(
+            (left, right) =>
+              left.name.localeCompare(right.name) ||
+              left._id.localeCompare(right._id),
+          )
+          .map((item) => ({
+            key: item._id,
+            text: `${item._id}:${item.name}`,
+          }))
+      const collection = createCollection(
+        mockSyncCollectionOptions<CustomKeyItem>({
+          id: `custom-key-rendered-reorder`,
+          getKey: (item) => item._id,
+          initialData: initialItems.map((item) => ({ ...item })),
+        }),
+      )
+      const renderedKeys: Array<string | number> = []
+      const initialNodes = new Map<string, HTMLLIElement>()
+      const initialTokens = new Map<string, string>()
+      let tokenSequence = 0
+
+      function TestComponent() {
+        const query = useLiveQuery((q) =>
+          q
+            .from({ items: collection })
+            .orderBy(({ items }) => items.name, `asc`),
+        )
+
+        return (
+          <ol
+            data-testid="custom-key-list"
+            data-ready={query.isReady ? `true` : `false`}
+          >
+            <For each={query()}>
+              {(item) => {
+                renderedKeys.push(item.$key)
+                const keyAtCreation = item._id
+                const token = `mapper-${++tokenSequence}`
+                if (!initialTokens.has(keyAtCreation)) {
+                  initialTokens.set(keyAtCreation, token)
+                }
+                return (
+                  <li
+                    ref={(node) => {
+                      if (!initialNodes.has(keyAtCreation)) {
+                        initialNodes.set(keyAtCreation, node)
+                      }
+                    }}
+                    data-row-key={item.$key}
+                    data-token={token}
+                  >
+                    {item._id}:{item.name}
+                  </li>
+                )
+              }}
+            </For>
+          </ol>
+        )
+      }
+
+      const rendered = render(() => <TestComponent />)
+      const readRenderedRows = () =>
+        Array.from(rendered.getByTestId(`custom-key-list`).children).map(
+          (element) => ({
+            key: element.getAttribute(`data-row-key`),
+            text: element.textContent,
+            token: element.getAttribute(`data-token`),
+            node: element,
+          }),
+        )
+      const readRenderedValues = () =>
+        readRenderedRows().map(({ key, text }) => ({ key, text }))
+      const expectedIdentityRows = () =>
+        expectedRows().map(({ key }) => ({
+          key,
+          token: initialTokens.get(key),
+          retainedOwnNode: true,
+        }))
+
+      await waitFor(() => {
+        expect(rendered.getByTestId(`custom-key-list`).dataset.ready).toBe(
+          `true`,
+        )
+        expect(renderedKeys).toEqual([`bob1`, `kevin1`, `stuart1`])
+        expect(readRenderedValues()).toEqual(expectedRows())
+      })
+
+      const updatedItem = { _id: `stuart1`, name: `Alvin` }
+      reference.set(updatedItem._id, { ...updatedItem })
+      collection.utils.begin()
+      collection.utils.write({ type: `update`, value: updatedItem })
+      collection.utils.commit()
+
+      await waitFor(() => {
+        expect(collection.get(`stuart1`)?.name).toBe(`Alvin`)
+        expect(readRenderedValues()).toEqual(expectedRows())
+        expect(
+          readRenderedRows().map(({ key, token, node }) => ({
+            key,
+            token,
+            retainedOwnNode: node === initialNodes.get(key!),
+          })),
+        ).toEqual(expectedIdentityRows())
+      })
+    })
+
+    it(`keeps union rows with colliding public keys tied to their live result identities`, async () => {
+      type UnionItem = {
+        id: string
+        label: string
+      }
+
+      const left = createCollection(
+        mockSyncCollectionOptions<UnionItem>({
+          id: `solid-colliding-union-left`,
+          getKey: (item) => item.id,
+          initialData: [{ id: `shared`, label: `Left` }],
+        }),
+      )
+      const right = createCollection(
+        mockSyncCollectionOptions<UnionItem>({
+          id: `solid-colliding-union-right`,
+          getKey: (item) => item.id,
+          initialData: [{ id: `shared`, label: `Right` }],
+        }),
+      )
+      const live = createLiveQueryCollection((q) =>
+        q.unionAll(q.from({ left }), q.from({ right })),
+      )
+      const initialNodes = new Map<string, HTMLLIElement>()
+      const initialTokens = new Map<string, string>()
+      let tokenSequence = 0
+
+      function TestComponent() {
+        const query = useLiveQuery(() => live)
+        return (
+          <ol
+            data-testid="colliding-union-list"
+            data-ready={query.isReady ? `true` : `false`}
+            data-hook-count={query().length}
+          >
+            <For each={query()}>
+              {(item) => {
+                const labelAtCreation = item.label
+                const token = `mapper-${++tokenSequence}`
+                if (!initialTokens.has(labelAtCreation)) {
+                  initialTokens.set(labelAtCreation, token)
+                }
+                return (
+                  <li
+                    ref={(node) => {
+                      if (!initialNodes.has(labelAtCreation)) {
+                        initialNodes.set(labelAtCreation, node)
+                      }
+                    }}
+                    data-label={item.label}
+                    data-token={token}
+                    data-upstream-key={item.$key}
+                  >
+                    {item.label}
+                  </li>
+                )
+              }}
+            </For>
+          </ol>
+        )
+      }
+
+      const rendered = render(() => <TestComponent />)
+      const list = () => rendered.getByTestId(`colliding-union-list`)
+      const renderedRows = () =>
+        Array.from(list().children).map((element) => ({
+          label: element.getAttribute(`data-label`),
+          text: element.textContent,
+          token: element.getAttribute(`data-token`),
+          upstreamKey: element.getAttribute(`data-upstream-key`),
+          node: element,
+        }))
+
+      await waitFor(() => {
+        expect(list().dataset.ready).toBe(`true`)
+        expect(list().dataset.hookCount).toBe(`2`)
+        expect(
+          renderedRows().map(({ label, text, upstreamKey }) => ({
+            label,
+            text,
+            upstreamKey,
+          })),
+        ).toEqual([
+          { label: `Left`, text: `Left`, upstreamKey: `shared` },
+          { label: `Right`, text: `Right`, upstreamKey: `shared` },
+        ])
+      })
+
+      const initialLiveRows = [...live.entries()].map(([resultKey, item]) => ({
+        resultKey,
+        label: item.label,
+        upstreamKey: item.$key,
+      }))
+      expect(
+        new Set(initialLiveRows.map(({ resultKey }) => resultKey)).size,
+      ).toBe(2)
+      expect(initialLiveRows.map(({ upstreamKey }) => upstreamKey)).toEqual([
+        `shared`,
+        `shared`,
+      ])
+
+      left.utils.begin()
+      left.utils.write({
+        type: `delete`,
+        value: { id: `shared`, label: `Left` },
+      })
+      left.utils.commit()
+
+      await waitFor(() => {
+        expect(live.toArray.map(({ label }) => label)).toEqual([`Right`])
+        expect(list().dataset.hookCount).toBe(`1`)
+        expect(
+          renderedRows().map(({ label, text, token, node }) => ({
+            label,
+            text,
+            token,
+            retainedOwnNode: node === initialNodes.get(label!),
+          })),
+        ).toEqual([
+          {
+            label: `Right`,
+            text: `Right`,
+            token: initialTokens.get(`Right`),
+            retainedOwnNode: true,
+          },
+        ])
+      })
+
+      rendered.unmount()
+      expect(rendered.container.childElementCount).toBe(0)
+    })
+
     it(`should reflect optimistic inserts in the data array and reconcile after sync`, async () => {
       const collection = createCollection(
         mockSyncCollectionOptions<Person>({
@@ -2195,7 +2845,7 @@ describe(`Query Collections`, () => {
 
       // Resolve the pending sync to complete the transaction
       collection.utils.resolveSync()
-      await tx.isPersisted.promise
+      await tx.when(`settled`)
 
       // After sync, should still have 4 items (no duplicates)
       await waitFor(() => {
@@ -2268,7 +2918,7 @@ describe(`Query Collections`, () => {
 
       // Resolve the pending sync
       collection.utils.resolveSync()
-      await tx.isPersisted.promise
+      await tx.when(`settled`)
 
       // After sync, should still have 3 items with the update persisted
       await waitFor(() => {
@@ -2337,7 +2987,7 @@ describe(`Query Collections`, () => {
 
       // Resolve the pending sync
       collection.utils.resolveSync()
-      await tx.isPersisted.promise
+      await tx.when(`settled`)
 
       // After sync, should still have 2 items
       await waitFor(() => {
@@ -2433,8 +3083,8 @@ describe(`Query Collections`, () => {
 
       // Resolve the shared sync promise — both onInsert and onUpdate complete
       collection.utils.resolveSync()
-      await txInsert.isPersisted.promise
-      await txUpdate.isPersisted.promise
+      await txInsert.when(`settled`)
+      await txUpdate.when(`settled`)
 
       // After sync complete, should have 4 items with correct data
       await waitFor(() => {
@@ -2585,6 +3235,157 @@ describe(`Query Collections`, () => {
       })
 
       expect(rendered.result()).toBeUndefined()
+    })
+  })
+})
+
+describe(`includes subqueries`, () => {
+  type Project = {
+    id: number
+    name: string
+  }
+
+  type ProjectIssue = {
+    id: number
+    projectId: number
+    title: string
+  }
+
+  function includedIssues(value: unknown): Array<ProjectIssue> {
+    if (Array.isArray(value)) {
+      return value as Array<ProjectIssue>
+    }
+    if (
+      value !== null &&
+      typeof value === `object` &&
+      `toArray` in value &&
+      Array.isArray(value.toArray)
+    ) {
+      return value.toArray as Array<ProjectIssue>
+    }
+    return []
+  }
+
+  it(`updates a rendered array include after a child insert`, async () => {
+    const projects = createCollection(
+      mockSyncCollectionOptions<Project>({
+        id: `includes-solid-array-projects`,
+        getKey: (project) => project.id,
+        initialData: [
+          { id: 1, name: `Alpha` },
+          { id: 2, name: `Beta` },
+        ],
+      }),
+    )
+    const issues = createCollection(
+      mockSyncCollectionOptions<ProjectIssue>({
+        id: `includes-solid-array-issues`,
+        getKey: (issue) => issue.id,
+        initialData: [
+          { id: 10, projectId: 1, title: `Bug in Alpha` },
+          { id: 20, projectId: 2, title: `Bug in Beta` },
+        ],
+      }),
+    )
+
+    function TestComponent() {
+      const query = useLiveQuery((q) =>
+        q.from({ project: projects }).select(({ project }) => ({
+          id: project.id,
+          issueTitles: toArray(
+            q
+              .from({ issue: issues })
+              .where(({ issue }) => eq(issue.projectId, project.id))
+              .select(({ issue }) => ({
+                id: issue.id,
+                title: issue.title,
+              })),
+          ),
+        })),
+      )
+
+      return (
+        <For each={query()}>
+          {(project) => (
+            <p data-testid={`project-${project.id}`}>
+              {project.issueTitles.map((issue) => issue.title).join(`|`)}
+            </p>
+          )}
+        </For>
+      )
+    }
+
+    const rendered = render(() => <TestComponent />)
+    await waitFor(() => {
+      expect(rendered.getByTestId(`project-1`).textContent).toBe(`Bug in Alpha`)
+    })
+
+    issues.utils.begin()
+    issues.utils.write({
+      type: `insert`,
+      value: { id: 11, projectId: 1, title: `Feature for Alpha` },
+    })
+    issues.utils.commit()
+
+    await waitFor(() => {
+      expect(rendered.getByTestId(`project-1`).textContent).toBe(
+        `Bug in Alpha|Feature for Alpha`,
+      )
+    })
+  })
+
+  it(`populates an initially empty collection include after its first child insert`, async () => {
+    const projects = createCollection(
+      mockSyncCollectionOptions<Project>({
+        id: `includes-solid-empty-projects`,
+        getKey: (project) => project.id,
+        initialData: [{ id: 1, name: `Alpha` }],
+      }),
+    )
+    const issues = createCollection(
+      mockSyncCollectionOptions<ProjectIssue>({
+        id: `includes-solid-empty-issues`,
+        getKey: (issue) => issue.id,
+        initialData: [],
+      }),
+    )
+
+    const rendered = renderHook(() =>
+      useLiveQuery((q) =>
+        q.from({ project: projects }).select(({ project }) => ({
+          id: project.id,
+          issues: include(
+            q
+              .from({ issue: issues })
+              .where(({ issue }) => eq(issue.projectId, project.id))
+              .select(({ issue }) => ({
+                id: issue.id,
+                projectId: issue.projectId,
+                title: issue.title,
+              })),
+          ),
+        })),
+      ),
+    )
+
+    await waitFor(() => {
+      expect(rendered.result.isReady).toBe(true)
+      expect(includedIssues(rendered.result()[0]?.issues)).toEqual([])
+    })
+
+    issues.utils.begin()
+    issues.utils.write({
+      type: `insert`,
+      value: { id: 10, projectId: 1, title: `Bug in Alpha` },
+    })
+    issues.utils.commit()
+
+    await waitFor(() => {
+      expect(
+        includedIssues(rendered.result()[0]?.issues).map(
+          (issue) => issue.title,
+        ),
+      ).toEqual([`Bug in Alpha`])
     })
   })
 })

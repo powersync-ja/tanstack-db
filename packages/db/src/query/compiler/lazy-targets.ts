@@ -1,7 +1,14 @@
-import { PropRef, followRef } from '../ir.js'
+import {
+  PropRef,
+  collectCollectionSources,
+  followRef,
+  getFromSources,
+  requireCollectionSource,
+} from '../ir.js'
 import type {
   BasicExpression,
   CollectionRef,
+  CollectionSourceRef,
   From,
   QueryIR,
   QueryRef,
@@ -9,6 +16,7 @@ import type {
 import type { Collection } from '../../collection/index.js'
 
 export type LazyLoadTarget = {
+  sourceId: string
   alias: string
   collection: Collection
   path: Array<string>
@@ -49,9 +57,26 @@ export function getLazyLoadTargets(
     return []
   }
 
+  const alias = followRefResult.alias || aliasRemapping[lazyAlias] || lazyAlias
+  const source = resolveLazySource(rawQuery, lazyFrom, {
+    alias,
+    collection: followRefResult.collection,
+    sourceId: followRefResult.sourceId,
+  })
+  if (!source) {
+    return []
+  }
+
+  // The subscription we drive lazy loading through must be the one for the
+  // collection the join key actually resolves to. When the key traces through a
+  // subquery's select into a *joined* source, that collection differs from the
+  // subquery's from clause (which is what `aliasRemapping[lazyAlias]` yields),
+  // so prefer the alias reported by `followRef`. Fall back to the from-clause
+  // remapping when the key resolves directly to the from source.
   return [
     {
-      alias: aliasRemapping[lazyAlias] || lazyAlias,
+      sourceId: source.sourceId,
+      alias,
       collection: followRefResult.collection,
       path: followRefResult.path,
     },
@@ -137,16 +162,29 @@ function getTargetsFromPropRef(
   }
 
   const [alias, ...path] = ref.path
-  const source = getSourceFromAlias(query, alias!)
+  const source = getSourceFromAlias(query, alias!, ref.bindingId)
   if (!source) {
     return []
   }
 
   if (source.type === `collectionRef`) {
-    return [{ alias: source.alias, collection: source.collection, path }]
+    return [
+      {
+        sourceId: source.sourceId,
+        alias: source.alias,
+        collection: source.collection,
+        path,
+      },
+    ]
   }
 
-  if (source.query.limit || source.query.offset) {
+  if (source.type === `descriptorRef`) return requireCollectionSource(source)
+
+  if (
+    source.query.limit !== undefined ||
+    source.query.offset !== undefined ||
+    source.query.singleResult
+  ) {
     return []
   }
 
@@ -156,23 +194,52 @@ function getTargetsFromPropRef(
 function getSourceFromAlias(
   query: QueryIR,
   alias: string,
-): CollectionRef | QueryRef | undefined {
+  bindingId?: string,
+): CollectionSourceRef | QueryRef | undefined {
   if (query.join) {
     for (const join of query.join) {
-      if (join.from.alias === alias) {
+      if (
+        join.from.alias === alias &&
+        (bindingId === undefined || join.from.bindingId === bindingId)
+      ) {
         return join.from
       }
     }
   }
 
-  const from = query.from
-  const sources =
-    from.type === `unionFrom`
-      ? from.sources
-      : from.type === `unionAll`
-        ? []
-        : [from]
-  return sources.find((source) => source.alias === alias)
+  return getFromSources(query.from).find(
+    (source) =>
+      source.alias === alias &&
+      (bindingId === undefined || source.bindingId === bindingId),
+  )
+}
+
+function resolveLazySource(
+  query: QueryIR,
+  lazyFrom: From,
+  target: { alias: string; collection: Collection; sourceId?: string },
+): CollectionRef | undefined {
+  // Subscription and demand callbacks belong to one lexical source. An alias
+  // may also name a source in a nested scope, so text cannot resolve it here.
+  if (target.sourceId !== undefined) {
+    return collectCollectionSources(query).find(
+      (source) =>
+        source.sourceId === target.sourceId &&
+        source.collection === target.collection,
+    )
+  }
+
+  // A direct source has no recursive alias ambiguity. A recursive source with
+  // no resolved ID cannot safely receive a keyed demand.
+  if (
+    lazyFrom.type === `collectionRef` &&
+    lazyFrom.collection === target.collection &&
+    lazyFrom.alias === target.alias
+  ) {
+    return lazyFrom
+  }
+
+  return undefined
 }
 
 function dedupeLazyLoadTargets(
@@ -181,7 +248,7 @@ function dedupeLazyLoadTargets(
   const seen = new Set<string>()
   const deduped: Array<LazyLoadTarget> = []
   for (const target of targets) {
-    const key = `${target.alias}:${target.path.join(`.`)}`
+    const key = `${target.sourceId}:${JSON.stringify(target.path)}`
     if (!seen.has(key)) {
       seen.add(key)
       deduped.push(target)
@@ -201,7 +268,11 @@ function toPropRef(expr: unknown): PropRef | undefined {
     (expr as { type?: string }).type === `ref` &&
     Array.isArray((expr as { path?: unknown }).path)
   ) {
-    return new PropRef((expr as unknown as { path: Array<string> }).path)
+    const ref = expr as unknown as {
+      path: Array<string>
+      sourceAlias?: string
+    }
+    return new PropRef(ref.path, ref.sourceAlias)
   }
   return undefined
 }

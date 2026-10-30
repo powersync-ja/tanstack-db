@@ -1,0 +1,1000 @@
+import { fc, test as fcTest } from '@fast-check/vitest'
+import { afterEach, describe, expect, vi } from 'vitest'
+import {
+  oraclePropertyOptions,
+  oracleReplayTest,
+  oracleRuns,
+} from '../../db/tests/oracle-config'
+import { declareOracle } from '../../db/tests/oracle-declaration'
+import { openBrowserWASQLiteOPFSDatabase } from '../src/opfs-database'
+import {
+  ControlledWorker,
+  cleanupEnvironment,
+  expectDisposed,
+  installEnvironment,
+  track,
+} from './opfs-page-lifecycle-harness'
+import type {
+  ReleaseDirection,
+  RequestKind,
+  Settlement,
+  TerminalEventType,
+  TrackedResult,
+} from './opfs-page-lifecycle-harness'
+import type { BrowserOPFSWorkerErrorCode } from '../src/opfs-worker-protocol'
+
+/**
+ * # Who owns an OPFS worker when the browser page leaves?
+ *
+ * A database request, open deadline, caller abort, pagehide, worker response,
+ * terminal worker event, and close can race. Every accepted request must settle
+ * once.
+ * Pagehide terminates the worker and rejects pending work for either persisted
+ * value. A restored page must open a new connection. Completed init and execute
+ * requests leave the connection active until pagehide or close. Listener and
+ * worker resources release exactly once even when init or close fails.
+ * Explicit close ends admission when it starts: a later execute is refused
+ * without reaching the worker, and a concurrent close shares the first close's
+ * outcome. A response that arrives while close is in flight settles its own
+ * request. Work still pending when close settles rejects with AbortError,
+ * whether close succeeds or reports a worker error. Pagehide or a Worker
+ * terminal event during close wins: close and pending siblings reject with that
+ * event's failure.
+ *
+ * The real worker answers earlier requests before close; the request-order
+ * oracle owns that law. This file's controlled worker can answer in any order,
+ * so the close lane also checks that pending work settles when close settles
+ * first.
+ *
+ * Controlled page and worker objects implement only the browser event and
+ * message grammar. Generated products vary pending request kind, delivery
+ * stage, persisted flag, execute count, release direction, terminal event,
+ * responses answered during close, close outcome, admission during close, and
+ * an interruption during close.
+ * The driver observes exact requests, settlements, errors, listener counts,
+ * held responses, close, and termination against this state machine. Fixed
+ * open histories check the default, overridden, and zero-boundary deadlines
+ * plus caller abort.
+ *
+ * This proves page/worker ownership in jsdom. It does not prove native OPFS
+ * locking, real bfcache admission, or browser process teardown. The open
+ * histories begin after asset resolution. The OPFS open outcome oracle in
+ * opfs-open-outcome-oracle.ts owns how an open settles across asset lookup,
+ * worker start, WASM load, and initialization, with jsdom and Chromium drivers.
+ */
+
+type Database = Awaited<ReturnType<typeof openBrowserWASQLiteOPFSDatabase>>
+type DeliveryStage =
+  | `pagehide-before-response-production`
+  | `pagehide-after-response-production`
+  | `response-before-pagehide`
+
+type PagehideHistory = {
+  pending: RequestKind
+  delivery: DeliveryStage
+  persisted: boolean
+  executeCount: number
+  releaseDirection: ReleaseDirection
+}
+
+type FailureHistory = {
+  stage: `init` | `close`
+  code: BrowserOPFSWorkerErrorCode
+}
+
+type MixedExecuteHistory = {
+  executeCount: number
+  completedBeforePagehide: number
+  persisted: boolean
+  releaseDirection: ReleaseDirection
+}
+
+type CloseHistory = {
+  executeCount: number
+  answeredDuringClose: number
+  releaseDirection: ReleaseDirection
+  closeCode: BrowserOPFSWorkerErrorCode | undefined
+  concurrentClose: boolean
+  executeDuringClose: boolean
+  interruption: CloseInterruption
+}
+
+type CloseInterruption = `none` | `pagehide` | TerminalEventType
+
+type TerminalEventHistory = {
+  pending: RequestKind
+  eventType: TerminalEventType
+  executeCount: number
+}
+
+// Authority: the public error classes exported by sqlite-persistence-core and
+// the three protocol classifications in opfs-worker-protocol.ts. Keeping the
+// table declarative makes an accidental production remapping observable.
+const workerFailureContracts = {
+  PERSISTENCE_UNAVAILABLE: {
+    name: `PersistenceUnavailableError`,
+    messagePrefix: `Persistence unavailable: `,
+  },
+  INVALID_CONFIG: {
+    name: `InvalidPersistedCollectionConfigError`,
+    messagePrefix: ``,
+  },
+  INTERNAL: { name: `OPFSWorkerRequestError`, messagePrefix: `` },
+} satisfies Record<
+  BrowserOPFSWorkerErrorCode,
+  { name: string; messagePrefix: string }
+>
+
+const pagehideAbort = {
+  name: `AbortError`,
+  message: `The page is closing its SQLite connection`,
+}
+
+const closedConnection = {
+  name: `SQLiteConnectionClosedError`,
+  message: `Browser OPFS worker connection is closed`,
+}
+
+const closeAbort = {
+  name: `AbortError`,
+  message: `The SQLite connection is closed`,
+}
+
+// Which of `count` held responses a partial release delivers.
+function isReleased(
+  index: number,
+  count: number,
+  released: number,
+  direction: ReleaseDirection,
+): boolean {
+  return direction === `fifo` ? index < released : index >= count - released
+}
+
+// The close model: answered siblings keep their rows, the rest abort at close
+// settlement, admission after close starts is refused, and every close call
+// observes the worker's close outcome. An interruption before the close
+// response is a terminal event: it rejects the close request and every pending
+// sibling with its own failure, and the close response never arrives.
+function expectedCloseSettlements(history: CloseHistory): Array<Settlement> {
+  const interruptionFailure =
+    history.interruption === `none`
+      ? undefined
+      : history.interruption === `pagehide`
+        ? pagehideAbort
+        : terminalEventFailures[history.interruption]
+  const pendingFailure = interruptionFailure ?? closeAbort
+  const closeOutcome: Omit<Settlement, `label`> =
+    interruptionFailure !== undefined
+      ? { status: `rejected`, observation: interruptionFailure }
+      : history.closeCode === undefined
+        ? { status: `fulfilled`, observation: `closed` }
+        : {
+            status: `rejected`,
+            observation: {
+              name: workerFailureContracts[history.closeCode].name,
+              message: `${workerFailureContracts[history.closeCode].messagePrefix}controlled close failure`,
+            },
+          }
+  return [
+    ...Array.from({ length: history.executeCount }, (_, index): Settlement =>
+      isReleased(
+        index,
+        history.executeCount,
+        history.answeredDuringClose,
+        history.releaseDirection,
+      )
+        ? {
+            label: `execute-${index}`,
+            status: `fulfilled`,
+            observation: [{ sql: `SELECT ${index}` }],
+          }
+        : {
+            label: `execute-${index}`,
+            status: `rejected`,
+            observation: pendingFailure,
+          },
+    ),
+    { label: `close`, ...closeOutcome },
+    ...(history.concurrentClose
+      ? [{ label: `concurrent-close`, ...closeOutcome }]
+      : []),
+    ...(history.executeDuringClose
+      ? [
+          {
+            label: `execute-during-close`,
+            status: `rejected` as const,
+            observation: closedConnection,
+          },
+        ]
+      : []),
+  ]
+}
+
+const terminalEventFailures = {
+  error: {
+    name: `PersistenceUnavailableError`,
+    message: `Persistence unavailable: OPFS worker terminated unexpectedly`,
+  },
+  messageerror: {
+    name: `PersistenceUnavailableError`,
+    message: `Persistence unavailable: OPFS worker message serialization failed`,
+  },
+} satisfies Record<TerminalEventType, { name: string; message: string }>
+
+function canonicalSettlements(
+  settlements: ReadonlyArray<Settlement>,
+): Array<Settlement> {
+  return [...settlements].sort((left, right) =>
+    left.label.localeCompare(right.label),
+  )
+}
+
+function expectSettlementSet(
+  actual: ReadonlyArray<Settlement>,
+  expected: ReadonlyArray<Settlement>,
+): void {
+  // Keep raw arrays and compare lengths before canonicalizing: an accidental
+  // duplicate cannot disappear behind request-keyed normalization.
+  expect(actual).toHaveLength(expected.length)
+  expect(canonicalSettlements(actual)).toEqual(canonicalSettlements(expected))
+}
+
+async function runPagehideHistory(history: PagehideHistory): Promise<void> {
+  const page = installEnvironment({ heldResponseType: history.pending })
+  const settlements: Array<Settlement> = []
+  const expectedFulfilled: Array<Settlement> = []
+  const tracked: Array<Promise<TrackedResult<unknown>>> = []
+  let database: Database | undefined
+
+  try {
+    if (history.pending === `init`) {
+      tracked.push(
+        track(
+          `init`,
+          openBrowserWASQLiteOPFSDatabase({ databaseName: `oracle.sqlite` }),
+          () => `database`,
+          settlements,
+        ),
+      )
+      expectedFulfilled.push({
+        label: `init`,
+        status: `fulfilled`,
+        observation: `database`,
+      })
+    } else {
+      database = await openBrowserWASQLiteOPFSDatabase({
+        databaseName: `oracle.sqlite`,
+      })
+      if (history.pending === `execute`) {
+        for (let index = 0; index < history.executeCount; index++) {
+          const sql = `SELECT ${index}`
+          tracked.push(
+            track(
+              `execute-${index}`,
+              database.execute(sql),
+              (rows) => rows,
+              settlements,
+            ),
+          )
+          expectedFulfilled.push({
+            label: `execute-${index}`,
+            status: `fulfilled`,
+            observation: [{ sql }],
+          })
+        }
+      } else {
+        tracked.push(
+          track(
+            `close`,
+            Promise.resolve(database.close!()),
+            () => `closed`,
+            settlements,
+          ),
+        )
+        expectedFulfilled.push({
+          label: `close`,
+          status: `fulfilled`,
+          observation: `closed`,
+        })
+      }
+    }
+
+    const worker = ControlledWorker.instances[0]!
+    const pendingCount =
+      history.pending === `execute` ? history.executeCount : 1
+    expect(page.addCalls).toBe(1)
+    expect(
+      worker.requests.filter(({ type }) => type === history.pending),
+    ).toHaveLength(pendingCount)
+
+    let completed: Array<TrackedResult<unknown>>
+    if (history.delivery === `pagehide-before-response-production`) {
+      expect(worker.heldResponseCount).toBe(0)
+      page.dispatchPageHide(history.persisted)
+      // The listener must exist, reject pending requests, and dispose before
+      // the worker's queued response-production microtask runs.
+      expectDisposed(page, worker)
+      completed = await Promise.all(tracked)
+      const terminalLedger = [...settlements]
+      worker.releaseHeldResponses()
+      await Promise.resolve()
+      expect(settlements).toEqual(terminalLedger)
+    } else {
+      await Promise.resolve()
+      expect(worker.heldResponseCount).toBe(pendingCount)
+      if (history.delivery === `response-before-pagehide`) {
+        worker.releaseHeldResponses(undefined, history.releaseDirection)
+        completed = await Promise.all(tracked)
+        if (history.pending === `init`) {
+          database = completed[0]?.value as Database
+        }
+        if (history.pending !== `close`) {
+          // A completed request does not dispose an otherwise open connection.
+          expect(worker.terminationCalls).toBe(0)
+          expect(page.listenerCount).toBe(1)
+        }
+        page.dispatchPageHide(history.persisted)
+      } else {
+        page.dispatchPageHide(history.persisted)
+        // This checkpoint is intentionally before any Promise continuation.
+        expectDisposed(page, worker)
+        completed = await Promise.all(tracked)
+        const terminalLedger = [...settlements]
+        worker.releaseHeldResponses(undefined, history.releaseDirection)
+        await Promise.resolve()
+        expect(settlements).toEqual(terminalLedger)
+      }
+    }
+
+    const expectedSettlements =
+      history.delivery === `response-before-pagehide`
+        ? expectedFulfilled
+        : expectedFulfilled.map((settlement) => ({
+            ...settlement,
+            status: `rejected` as const,
+            observation: pagehideAbort,
+          }))
+    expectSettlementSet(settlements, expectedSettlements)
+    expectSettlementSet(
+      completed.map(({ settlement }) => settlement),
+      expectedSettlements,
+    )
+    expect(worker.heldResponseCount).toBe(0)
+    expectDisposed(page, worker)
+
+    if (database) {
+      await expectPostDisposalNoReach(database, worker)
+    }
+
+    page.dispatchPageHide(!history.persisted)
+    expect(worker.terminationCalls).toBe(1)
+    expect(page.removeCalls).toBe(1)
+  } finally {
+    await cleanupEnvironment()
+  }
+}
+
+async function expectPostDisposalNoReach(
+  database: Database,
+  worker: ControlledWorker,
+): Promise<void> {
+  const requestCount = worker.requests.length
+  const postDisposal: Array<Settlement> = []
+  const completed = await Promise.all([
+    track(
+      `post-disposal-execute`,
+      database.execute(`SELECT 99`),
+      (rows) => rows,
+      postDisposal,
+    ),
+    track(
+      `post-disposal-close`,
+      Promise.resolve(database.close!()),
+      () => `closed`,
+      postDisposal,
+    ),
+  ])
+  const expected = [
+    {
+      label: `post-disposal-execute`,
+      status: `rejected` as const,
+      observation: closedConnection,
+    },
+    {
+      label: `post-disposal-close`,
+      status: `fulfilled` as const,
+      observation: `closed`,
+    },
+  ]
+  expectSettlementSet(postDisposal, expected)
+  expectSettlementSet(
+    completed.map(({ settlement }) => settlement),
+    expected,
+  )
+  expect(worker.requests).toHaveLength(requestCount)
+  expect(worker.terminationCalls).toBe(1)
+}
+
+async function runMixedExecuteHistory(
+  history: MixedExecuteHistory,
+): Promise<void> {
+  const page = installEnvironment({ heldResponseType: `execute` })
+  const settlements: Array<Settlement> = []
+
+  try {
+    const database = await openBrowserWASQLiteOPFSDatabase({
+      databaseName: `oracle.sqlite`,
+    })
+    const worker = ControlledWorker.instances[0]!
+    const tracked = Array.from({ length: history.executeCount }, (_, index) => {
+      const sql = `SELECT ${index}`
+      return track(
+        `execute-${index}`,
+        database.execute(sql),
+        (rows) => rows,
+        settlements,
+      )
+    })
+
+    await Promise.resolve()
+    expect(worker.heldResponseCount).toBe(history.executeCount)
+    worker.releaseHeldResponses(
+      history.completedBeforePagehide,
+      history.releaseDirection,
+    )
+    await Promise.resolve()
+    expect(settlements).toHaveLength(history.completedBeforePagehide)
+
+    page.dispatchPageHide(history.persisted)
+    expectDisposed(page, worker)
+    const completed = await Promise.all(tracked)
+    const terminalLedger = [...settlements]
+    worker.releaseHeldResponses(undefined, history.releaseDirection)
+    await Promise.resolve()
+    expect(settlements).toEqual(terminalLedger)
+
+    const expected = Array.from(
+      { length: history.executeCount },
+      (_, index): Settlement => {
+        return isReleased(
+          index,
+          history.executeCount,
+          history.completedBeforePagehide,
+          history.releaseDirection,
+        )
+          ? {
+              label: `execute-${index}`,
+              status: `fulfilled`,
+              observation: [{ sql: `SELECT ${index}` }],
+            }
+          : {
+              label: `execute-${index}`,
+              status: `rejected`,
+              observation: pagehideAbort,
+            }
+      },
+    )
+    expectSettlementSet(settlements, expected)
+    expectSettlementSet(
+      completed.map(({ settlement }) => settlement),
+      expected,
+    )
+    await expectPostDisposalNoReach(database, worker)
+  } finally {
+    await cleanupEnvironment()
+  }
+}
+
+async function runCloseHistory(history: CloseHistory): Promise<void> {
+  const page = installEnvironment({
+    heldResponseType: `execute`,
+    closeErrorCode: history.closeCode,
+  })
+  const settlements: Array<Settlement> = []
+
+  try {
+    const database = await openBrowserWASQLiteOPFSDatabase({
+      databaseName: `oracle.sqlite`,
+    })
+    const worker = ControlledWorker.instances[0]!
+    const tracked: Array<Promise<TrackedResult<unknown>>> = Array.from(
+      { length: history.executeCount },
+      (_, index) =>
+        track(
+          `execute-${index}`,
+          database.execute(`SELECT ${index}`),
+          (rows) => rows,
+          settlements,
+        ),
+    )
+    await Promise.resolve()
+    expect(worker.heldResponseCount).toBe(history.executeCount)
+
+    const closing = track(
+      `close`,
+      Promise.resolve(database.close!()),
+      () => `closed`,
+      settlements,
+    )
+    tracked.push(closing)
+    if (history.concurrentClose) {
+      tracked.push(
+        track(
+          `concurrent-close`,
+          Promise.resolve(database.close!()),
+          () => `closed`,
+          settlements,
+        ),
+      )
+    }
+    if (history.executeDuringClose) {
+      tracked.push(
+        track(
+          `execute-during-close`,
+          database.execute(`SELECT 99`),
+          (rows) => rows,
+          settlements,
+        ),
+      )
+    }
+    // The close response is produced in a later microtask, so these responses
+    // arrive while close is in flight.
+    worker.releaseHeldResponses(
+      history.answeredDuringClose,
+      history.releaseDirection,
+    )
+    if (history.interruption === `pagehide`) {
+      page.dispatchPageHide(false)
+    } else if (history.interruption !== `none`) {
+      worker.emitTerminalEvent(history.interruption)
+    }
+
+    // Close settlement is the checkpoint. Awaiting every tracked promise here
+    // would turn an unsettled sibling into a timeout instead of a mismatch.
+    await closing
+    await Promise.resolve()
+    const expected = expectedCloseSettlements(history)
+    expectSettlementSet(settlements, expected)
+    expectSettlementSet(
+      (await Promise.all(tracked)).map(({ settlement }) => settlement),
+      expected,
+    )
+    expect(worker.requests.map(({ type }) => type)).toEqual([
+      `init`,
+      ...Array.from({ length: history.executeCount }, () => `execute`),
+      `close`,
+    ])
+    expect(worker.heldResponseCount).toBe(
+      history.executeCount - history.answeredDuringClose,
+    )
+    expectDisposed(page, worker)
+    await expectPostDisposalNoReach(database, worker)
+  } finally {
+    await cleanupEnvironment()
+  }
+}
+
+async function runTerminalEventHistory(
+  history: TerminalEventHistory,
+): Promise<void> {
+  const page = installEnvironment({ heldResponseType: history.pending })
+  const settlements: Array<Settlement> = []
+  const tracked: Array<Promise<TrackedResult<unknown>>> = []
+  let database: Database | undefined
+
+  try {
+    if (history.pending === `init`) {
+      tracked.push(
+        track(
+          `init`,
+          openBrowserWASQLiteOPFSDatabase({ databaseName: `oracle.sqlite` }),
+          () => `database`,
+          settlements,
+        ),
+      )
+    } else {
+      database = await openBrowserWASQLiteOPFSDatabase({
+        databaseName: `oracle.sqlite`,
+      })
+      if (history.pending === `execute`) {
+        for (let index = 0; index < history.executeCount; index++) {
+          tracked.push(
+            track(
+              `execute-${index}`,
+              database.execute(`SELECT ${index}`),
+              (rows) => rows,
+              settlements,
+            ),
+          )
+        }
+      } else {
+        tracked.push(
+          track(
+            `close`,
+            Promise.resolve(database.close!()),
+            () => `closed`,
+            settlements,
+          ),
+        )
+      }
+    }
+
+    const worker = ControlledWorker.instances[0]!
+    const pendingCount =
+      history.pending === `execute` ? history.executeCount : 1
+    await Promise.resolve()
+    expect(worker.heldResponseCount).toBe(pendingCount)
+    worker.emitTerminalEvent(history.eventType)
+    expectDisposed(page, worker)
+
+    const completed = await Promise.all(tracked)
+    const terminalLedger = [...settlements]
+    worker.releaseHeldResponses()
+    await Promise.resolve()
+    expect(settlements).toEqual(terminalLedger)
+
+    const expected = tracked.map((_, index): Settlement => ({
+      label:
+        history.pending === `execute` ? `execute-${index}` : history.pending,
+      status: `rejected`,
+      observation: terminalEventFailures[history.eventType],
+    }))
+    expectSettlementSet(settlements, expected)
+    expectSettlementSet(
+      completed.map(({ settlement }) => settlement),
+      expected,
+    )
+    if (database) await expectPostDisposalNoReach(database, worker)
+
+    worker.emitTerminalEvent(history.eventType)
+    page.dispatchPageHide(false)
+    expect(worker.terminationCalls).toBe(1)
+  } finally {
+    await cleanupEnvironment()
+  }
+}
+
+async function runFailureHistory(history: FailureHistory): Promise<void> {
+  const page = installEnvironment(
+    history.stage === `init`
+      ? { initErrorCode: history.code }
+      : { closeErrorCode: history.code },
+  )
+  const settlements: Array<Settlement> = []
+
+  try {
+    let result: TrackedResult<unknown>
+    if (history.stage === `init`) {
+      result = await track(
+        `init`,
+        openBrowserWASQLiteOPFSDatabase({ databaseName: `oracle.sqlite` }),
+        () => `database`,
+        settlements,
+      )
+    } else {
+      const database = await openBrowserWASQLiteOPFSDatabase({
+        databaseName: `oracle.sqlite`,
+      })
+      result = await track(
+        `close`,
+        Promise.resolve(database.close!()),
+        () => `closed`,
+        settlements,
+      )
+    }
+
+    expect(result.settlement).toEqual({
+      label: history.stage,
+      status: `rejected`,
+      observation: {
+        name: workerFailureContracts[history.code].name,
+        message: `${workerFailureContracts[history.code].messagePrefix}controlled ${history.stage} failure`,
+      },
+    })
+    expectDisposed(page, ControlledWorker.instances[0]!)
+  } finally {
+    await cleanupEnvironment()
+  }
+}
+
+afterEach(async () => {
+  await cleanupEnvironment()
+  vi.useRealTimers()
+})
+
+const pagehideHistory = fc.record({
+  pending: fc.constantFrom<RequestKind>(`init`, `execute`, `close`),
+  delivery: fc.constantFrom<DeliveryStage>(
+    `pagehide-before-response-production`,
+    `pagehide-after-response-production`,
+    `response-before-pagehide`,
+  ),
+  persisted: fc.boolean(),
+  executeCount: fc.integer({ min: 1, max: 3 }),
+  releaseDirection: fc.constantFrom<ReleaseDirection>(`fifo`, `reverse`),
+})
+
+const mixedExecuteHistory = fc
+  .integer({ min: 2, max: 3 })
+  .chain((executeCount) =>
+    fc.record({
+      executeCount: fc.constant(executeCount),
+      completedBeforePagehide: fc.integer({
+        min: 1,
+        max: executeCount - 1,
+      }),
+      persisted: fc.boolean(),
+      releaseDirection: fc.constantFrom<ReleaseDirection>(`fifo`, `reverse`),
+    }),
+  )
+
+const failureHistory = fc.record({
+  stage: fc.constantFrom<FailureHistory[`stage`]>(`init`, `close`),
+  code: fc.constantFrom<BrowserOPFSWorkerErrorCode>(
+    `PERSISTENCE_UNAVAILABLE`,
+    `INVALID_CONFIG`,
+    `INTERNAL`,
+  ),
+})
+
+const closeCodes = [
+  undefined,
+  `PERSISTENCE_UNAVAILABLE`,
+  `INVALID_CONFIG`,
+  `INTERNAL`,
+] as const satisfies ReadonlyArray<BrowserOPFSWorkerErrorCode | undefined>
+
+const closeInterruptions = [
+  `none`,
+  `pagehide`,
+  `error`,
+  `messageerror`,
+] as const satisfies ReadonlyArray<CloseInterruption>
+
+const closeHistory = fc.integer({ min: 0, max: 3 }).chain((executeCount) =>
+  fc.record({
+    executeCount: fc.constant(executeCount),
+    answeredDuringClose: fc.integer({ min: 0, max: executeCount }),
+    releaseDirection: fc.constantFrom<ReleaseDirection>(`fifo`, `reverse`),
+    closeCode: fc.constantFrom(...closeCodes),
+    concurrentClose: fc.boolean(),
+    executeDuringClose: fc.boolean(),
+    interruption: fc.constantFrom(...closeInterruptions),
+  }),
+)
+
+const terminalEventHistory = fc.record({
+  pending: fc.constantFrom<RequestKind>(`init`, `execute`, `close`),
+  eventType: fc.constantFrom<TerminalEventType>(`error`, `messageerror`),
+  executeCount: fc.integer({ min: 1, max: 3 }),
+})
+
+const pagehideExamples: Array<[PagehideHistory]> = (
+  [`init`, `execute`, `close`] as const
+).flatMap((pending) =>
+  (
+    [
+      `pagehide-before-response-production`,
+      `pagehide-after-response-production`,
+      `response-before-pagehide`,
+    ] as const
+  ).flatMap((delivery) =>
+    [false, true].flatMap((persisted) =>
+      (pending === `execute` ? [1, 2, 3] : [1]).flatMap((executeCount) =>
+        (delivery === `response-before-pagehide` && executeCount > 1
+          ? ([`fifo`, `reverse`] as const)
+          : ([`fifo`] as const)
+        ).map((releaseDirection): [PagehideHistory] => [
+          { pending, delivery, persisted, executeCount, releaseDirection },
+        ]),
+      ),
+    ),
+  ),
+)
+
+const mixedExamples: Array<[MixedExecuteHistory]> = [2, 3].flatMap(
+  (executeCount) =>
+    Array.from({ length: executeCount - 1 }, (_, index) => index + 1).flatMap(
+      (completedBeforePagehide) =>
+        [false, true].flatMap((persisted) =>
+          ([`fifo`, `reverse`] as const).map(
+            (releaseDirection): [MixedExecuteHistory] => [
+              {
+                executeCount,
+                completedBeforePagehide,
+                persisted,
+                releaseDirection,
+              },
+            ],
+          ),
+        ),
+    ),
+)
+
+// Direction matters only for a partial release.
+const closeExamples: Array<[CloseHistory]> = [0, 1, 2, 3].flatMap(
+  (executeCount) =>
+    Array.from({ length: executeCount + 1 }, (_, answered) => answered).flatMap(
+      (answeredDuringClose) =>
+        (answeredDuringClose > 0 && answeredDuringClose < executeCount
+          ? ([`fifo`, `reverse`] as const)
+          : ([`fifo`] as const)
+        ).flatMap((releaseDirection) =>
+          closeInterruptions.flatMap((interruption) =>
+            // An interruption hides the close response, so its outcome code
+            // adds no distinct expectation.
+            (interruption === `none`
+              ? closeCodes
+              : ([undefined] as const)
+            ).flatMap((closeCode) =>
+              [false, true].flatMap((concurrentClose) =>
+                [false, true].map((executeDuringClose): [CloseHistory] => [
+                  {
+                    executeCount,
+                    answeredDuringClose,
+                    releaseDirection,
+                    closeCode,
+                    concurrentClose,
+                    executeDuringClose,
+                    interruption,
+                  },
+                ]),
+              ),
+            ),
+          ),
+        ),
+    ),
+)
+
+const failureExamples: Array<[FailureHistory]> = (
+  [`init`, `close`] as const
+).flatMap((stage) =>
+  ([`PERSISTENCE_UNAVAILABLE`, `INVALID_CONFIG`, `INTERNAL`] as const).map(
+    (code): [FailureHistory] => [{ stage, code }],
+  ),
+)
+
+const terminalEventExamples: Array<[TerminalEventHistory]> = (
+  [`init`, `execute`, `close`] as const
+).flatMap((pending) =>
+  ([`error`, `messageerror`] as const).flatMap((eventType) =>
+    (pending === `execute` ? [1, 2, 3] : [1]).map(
+      (executeCount): [TerminalEventHistory] => [
+        { pending, eventType, executeCount },
+      ],
+    ),
+  ),
+)
+
+/*
+Law/source: the README Notes section requires pagehide to synchronously dispose
+the dedicated worker and reject pending work with AbortError. It gives opening
+a default deadline and permits caller abort; either must dispose a pending
+worker. Its capability bullet and the public sqlite-persistence-core errors
+define terminal failures. Its close bullet ends admission when close starts and
+aborts work still pending when close settles.
+The worker protocol defines the three response-error classifications.
+Domain/histories: pending init/execute/close; one to three sibling queries;
+pagehide before response production, after production, or after delivery; mixed
+completed/pending siblings; both persisted values; Worker error/messageerror;
+late delivery; repeated disposal; and every response code at init and close.
+Explicit close varies zero to three pending siblings, how many answer while
+close is in flight and in which order, every close outcome, a concurrent close,
+an execute submitted during close, and pagehide or a Worker terminal event
+before the close response.
+Fixed open cases cover default, overridden, minimum-positive, and disabled
+deadlines; pending and pre-aborted signals; an abort during synchronous option
+evaluation; a late response; and no cancellation after successful open.
+Reference: an independent settlement ledger and terminal-state model. The model
+uses a declarative public error table and derives outcomes from history, without
+consulting the production request map, disposal flag, or completion order.
+Production path/checkpoint: the public OPFS opener and database methods using a
+controlled Worker. Compare immediately when pagehide returns, after settlement,
+after late delivery, and after post-disposal next use. Explicit close compares
+at close settlement, before any held response is released.
+Observed: raw settlement multiplicity plus order-independent sibling outcomes,
+exact values/errors, positive and negative request reach, listener ownership,
+and termination count. Synthetic events and a fake worker do not prove real
+bfcache admission, durability, native handle release, or wa-sqlite #88. The
+Chromium Web Lock fixture checks native queued-lock release separately.
+Challenge/replay: fixed examples exhaust the cheap structural products. Each
+generated lane runs a fixed and an unseeded campaign with the same grammar and
+run budget. Verbose FastCheck output retains original/reduced traces. A path
+replay selects only the direct replay of its lane's property, named by
+TANSTACK_DB_ORACLE_PROPERTY: opfs.page-lifecycle, opfs.mixed-execute,
+opfs.terminal-event, opfs.close, or opfs.failure-cleanup. A seed without a
+path reseeds the unseeded campaigns. Run it with this file's package-local
+Vitest command.
+*/
+declareOracle({
+  check: [runFailureHistory],
+  model: [expectedCloseSettlements],
+})
+
+describe(`OPFS page lifecycle oracle`, () => {
+  oracleReplayTest(fcTest).prop([pagehideHistory], {
+    seed: 1844,
+    numRuns: oracleRuns(48),
+    examples: pagehideExamples,
+    verbose: true,
+  })(
+    `matches the independent model across generated histories (fixed)`,
+    runPagehideHistory,
+  )
+  oracleReplayTest(fcTest, `opfs.page-lifecycle`).prop([pagehideHistory], {
+    ...oraclePropertyOptions(48, `opfs.page-lifecycle`),
+    examples: pagehideExamples,
+    verbose: true,
+  })(
+    `matches the independent model across generated histories (random)`,
+    runPagehideHistory,
+  )
+  oracleReplayTest(fcTest).prop([mixedExecuteHistory], {
+    seed: 1845,
+    numRuns: oracleRuns(32),
+    examples: mixedExamples,
+    verbose: true,
+  })(
+    `preserves completed siblings while aborting pending siblings (fixed)`,
+    runMixedExecuteHistory,
+  )
+  oracleReplayTest(fcTest, `opfs.mixed-execute`).prop([mixedExecuteHistory], {
+    ...oraclePropertyOptions(32, `opfs.mixed-execute`),
+    examples: mixedExamples,
+    verbose: true,
+  })(
+    `preserves completed siblings while aborting pending siblings (random)`,
+    runMixedExecuteHistory,
+  )
+  oracleReplayTest(fcTest).prop([terminalEventHistory], {
+    seed: 1847,
+    numRuns: oracleRuns(24),
+    examples: terminalEventExamples,
+    verbose: true,
+  })(
+    `rejects pending work across Worker terminal event paths (fixed)`,
+    runTerminalEventHistory,
+  )
+  oracleReplayTest(fcTest, `opfs.terminal-event`).prop([terminalEventHistory], {
+    ...oraclePropertyOptions(24, `opfs.terminal-event`),
+    examples: terminalEventExamples,
+    verbose: true,
+  })(
+    `rejects pending work across Worker terminal event paths (random)`,
+    runTerminalEventHistory,
+  )
+  oracleReplayTest(fcTest).prop([closeHistory], {
+    seed: 1848,
+    numRuns: oracleRuns(32),
+    examples: closeExamples,
+    verbose: true,
+  })(
+    `settles pending work and refuses new work across explicit close (fixed)`,
+    runCloseHistory,
+  )
+  oracleReplayTest(fcTest, `opfs.close`).prop([closeHistory], {
+    ...oraclePropertyOptions(32, `opfs.close`),
+    examples: closeExamples,
+    verbose: true,
+  })(
+    `settles pending work and refuses new work across explicit close (random)`,
+    runCloseHistory,
+  )
+  oracleReplayTest(fcTest).prop([failureHistory], {
+    seed: 1846,
+    numRuns: oracleRuns(18),
+    examples: failureExamples,
+    verbose: true,
+  })(
+    `matches terminal cleanup and error mapping across worker failures (fixed)`,
+    runFailureHistory,
+  )
+  oracleReplayTest(fcTest, `opfs.failure-cleanup`).prop([failureHistory], {
+    ...oraclePropertyOptions(18, `opfs.failure-cleanup`),
+    examples: failureExamples,
+    verbose: true,
+  })(
+    `matches terminal cleanup and error mapping across worker failures (random)`,
+    runFailureHistory,
+  )
+})

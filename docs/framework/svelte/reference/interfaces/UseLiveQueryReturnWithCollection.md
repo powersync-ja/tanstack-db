@@ -3,9 +3,7 @@ id: UseLiveQueryReturnWithCollection
 title: UseLiveQueryReturnWithCollection
 ---
 
-# Interface: UseLiveQueryReturnWithCollection\<T, TKey, TUtils, TData\>
-
-Defined in: [useLiveQuery.svelte.ts:45](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L45)
+Defined in: [packages/svelte-db/src/useLiveQuery.svelte.ts:94](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L94)
 
 ## Type Parameters
 
@@ -33,7 +31,7 @@ Defined in: [useLiveQuery.svelte.ts:45](https://github.com/TanStack/db/blob/main
 collection: Collection<T, TKey, TUtils>;
 ```
 
-Defined in: [useLiveQuery.svelte.ts:53](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L53)
+Defined in: [packages/svelte-db/src/useLiveQuery.svelte.ts:102](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L102)
 
 ***
 
@@ -43,7 +41,17 @@ Defined in: [useLiveQuery.svelte.ts:53](https://github.com/TanStack/db/blob/main
 data: TData;
 ```
 
-Defined in: [useLiveQuery.svelte.ts:52](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L52)
+Defined in: [packages/svelte-db/src/useLiveQuery.svelte.ts:101](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L101)
+
+***
+
+### health
+
+```ts
+health: HealthNode | undefined;
+```
+
+Defined in: [packages/svelte-db/src/useLiveQuery.svelte.ts:114](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L114)
 
 ***
 
@@ -53,17 +61,19 @@ Defined in: [useLiveQuery.svelte.ts:52](https://github.com/TanStack/db/blob/main
 isCleanedUp: boolean;
 ```
 
-Defined in: [useLiveQuery.svelte.ts:59](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L59)
+Defined in: [packages/svelte-db/src/useLiveQuery.svelte.ts:111](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L111)
 
 ***
 
-### isError
+### isCrashed
 
 ```ts
-isError: boolean;
+isCrashed: boolean;
 ```
 
-Defined in: [useLiveQuery.svelte.ts:58](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L58)
+Defined in: [packages/svelte-db/src/useLiveQuery.svelte.ts:110](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L110)
+
+Local storage or an invariant broke. Only a cascade cleanup and a fresh start recover.
 
 ***
 
@@ -73,7 +83,7 @@ Defined in: [useLiveQuery.svelte.ts:58](https://github.com/TanStack/db/blob/main
 isIdle: boolean;
 ```
 
-Defined in: [useLiveQuery.svelte.ts:57](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L57)
+Defined in: [packages/svelte-db/src/useLiveQuery.svelte.ts:106](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L106)
 
 ***
 
@@ -83,7 +93,19 @@ Defined in: [useLiveQuery.svelte.ts:57](https://github.com/TanStack/db/blob/main
 isLoading: boolean;
 ```
 
-Defined in: [useLiveQuery.svelte.ts:55](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L55)
+Defined in: [packages/svelte-db/src/useLiveQuery.svelte.ts:104](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L104)
+
+***
+
+### isLoadingError
+
+```ts
+isLoadingError: boolean;
+```
+
+Defined in: [packages/svelte-db/src/useLiveQuery.svelte.ts:108](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L108)
+
+The first load failed: there is nothing to show.
 
 ***
 
@@ -93,7 +115,19 @@ Defined in: [useLiveQuery.svelte.ts:55](https://github.com/TanStack/db/blob/main
 isReady: boolean;
 ```
 
-Defined in: [useLiveQuery.svelte.ts:56](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L56)
+Defined in: [packages/svelte-db/src/useLiveQuery.svelte.ts:105](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L105)
+
+***
+
+### isSyncError
+
+```ts
+isSyncError: boolean;
+```
+
+Defined in: [packages/svelte-db/src/useLiveQuery.svelte.ts:113](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L113)
+
+The data is shown, and a sync problem or failed request is in `health`.
 
 ***
 
@@ -103,7 +137,7 @@ Defined in: [useLiveQuery.svelte.ts:56](https://github.com/TanStack/db/blob/main
 state: Map<TKey, T>;
 ```
 
-Defined in: [useLiveQuery.svelte.ts:51](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L51)
+Defined in: [packages/svelte-db/src/useLiveQuery.svelte.ts:100](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L100)
 
 ***
 
@@ -113,4 +147,4 @@ Defined in: [useLiveQuery.svelte.ts:51](https://github.com/TanStack/db/blob/main
 status: CollectionStatus;
 ```
 
-Defined in: [useLiveQuery.svelte.ts:54](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L54)
+Defined in: [packages/svelte-db/src/useLiveQuery.svelte.ts:103](https://github.com/TanStack/db/blob/main/packages/svelte-db/src/useLiveQuery.svelte.ts#L103)

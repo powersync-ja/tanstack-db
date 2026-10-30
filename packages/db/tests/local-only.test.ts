@@ -215,6 +215,33 @@ describe(`LocalOnly Collection`, () => {
     expect(items).toHaveLength(2)
   })
 
+  // Local-only rows stay in memory, so the guide lets them hold values that a
+  // persisted Collection cannot store. A function keeps its identity through
+  // insert and an unrelated update, and a draft can replace it.
+  it(`keeps a function property by reference across insert and update`, () => {
+    const greet = () => `hi`
+    const functions = createCollection(
+      localOnlyCollectionOptions<{
+        id: number
+        n: number
+        greet: () => string
+      }>({ getKey: (item) => item.id }),
+    )
+    functions.insert({ id: 1, n: 0, greet })
+    expect(functions.get(1)!.greet).toBe(greet)
+
+    functions.update(1, (draft) => {
+      draft.n = 1
+    })
+    expect(functions.get(1)!.greet).toBe(greet)
+
+    const bye = () => `bye`
+    functions.update(1, (draft) => {
+      draft.greet = bye
+    })
+    expect(functions.get(1)!.greet).toBe(bye)
+  })
+
   describe(`Pure optimistic behavior`, () => {
     it(`should handle insert operations optimistically`, () => {
       // Insert an item - this works purely optimistically
@@ -744,10 +771,55 @@ describe(`LocalOnly Collection`, () => {
       }
 
       // Catch the rejected promise to avoid unhandled rejection
-      tx.isPersisted.promise.catch(() => {})
+      tx.when(`settled`).catch(() => {})
 
       // Item should be rolled back
       expect(collection.has(700)).toBe(false)
+    })
+
+    it(`keeps fields omitted by a same-key replacement absent`, async () => {
+      const replacementCollection = createCollection<
+        TestItem,
+        number,
+        LocalOnlyCollectionUtils
+      >(
+        localOnlyCollectionOptions<TestItem, number>({
+          id: `local-only-replacement`,
+          getKey: (item: TestItem) => item.id,
+          initialData: [
+            { id: 1, name: `replacement`, completed: true, number: 1 },
+          ],
+        }),
+      )
+      const transaction = createTransaction({
+        autoCommit: false,
+        mutationFn: ({ transaction: committed }: any) =>
+          Promise.resolve(
+            replacementCollection.utils.acceptMutations(committed),
+          ),
+      })
+
+      try {
+        await replacementCollection.stateWhenReady()
+        transaction.mutate(() => {
+          replacementCollection.delete(1)
+          replacementCollection.insert({ id: 1, name: `replacement` })
+        })
+        await transaction.commit()
+
+        expect(stripVirtualProps(replacementCollection.get(1))).toStrictEqual({
+          id: 1,
+          name: `replacement`,
+        })
+      } finally {
+        if (
+          transaction.state === `pending` ||
+          transaction.state === `persisting`
+        )
+          transaction.rollback()
+        await transaction.when(`settled`).catch(() => undefined)
+        await replacementCollection.cleanup()
+      }
     })
   })
 })

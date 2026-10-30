@@ -1,8 +1,7 @@
 # @tanstack/db-sqlite-persistence-core
 
-Shared SQLite persistence primitives for TanStack DB. Runtime-specific wrappers
-(Node, Electron, React Native, Cloudflare Durable Objects) build on top of this
-package.
+Shared SQLite persistence primitives for TanStack DB. Runtime packages provide
+the database drivers. Start with the [SQLite Persistence guide](../../docs/guides/sqlite-persistence.md) if you are adding persistence to an application.
 
 ## What this package provides
 
@@ -25,17 +24,40 @@ binding. Provide a runtime `SQLiteDriver` implementation from a wrapper package.
 - `TxCommitted`
 - `EnsureRemoteSubsetRequest`
 - `EnsureRemoteSubsetResponse`
+- `ReleaseRemoteSubsetRequest`
+- `ReleaseRemoteSubsetResponse`
+- `RemoteSubsetOwner`
+- `DuplicateRemoteSubsetOwnerError`
+- `TransportedLoadSubsetOptions`
+- `RemoteSubsetWirePrimitive`
+- `RemoteSubsetWireTypedArray`
+- `RemoteSubsetWireRecord`
+- `RemoteSubsetWireValue`
+- `RemoteSubsetWireExpression`
+- `RemoteSubsetWireCompareOptions`
+- `RemoteSubsetWireOrderByClause`
+- `RemoteSubsetWireCursor`
+- `RemoteSubsetWireValueError`
+- `toTransportedLoadSubsetOptions(...)`
 - `ApplyLocalMutationsRequest`
 - `ApplyLocalMutationsResponse`
+- `ApplyCommittedTxRequest`
+- `ApplyCommittedTxResponse`
 - `PullSinceRequest`
 - `PullSinceResponse`
 - `CollectionReset`
 - `PersistedIndexSpec`
+- `PersistedRowMetadataMutation<TKey>`
+- `PersistedCollectionMetadataMutation`
+- `ReplayableTxDelta<T, TKey>`
+- `PersistedScannedRow<T, TKey>`
+- `PersistedRowScanOptions`
+- `PersistedKeySetEvidence`
 - `PersistedTx<T, TKey>`
-- `PersistenceAdapter<T, TKey>`
+- `PersistenceAdapter`
 - `SQLiteDriver`
 - `PersistedCollectionCoordinator`
-- `PersistedCollectionPersistence<T, TKey>`
+- `PersistedCollectionPersistence`
 - `PersistedCollectionMode`
 - `PersistedCollectionLeadershipState`
 - `PersistedCollectionUtils`
@@ -64,12 +86,246 @@ and resolves persistence using:
 This lets runtime wrappers expose one shared persistence instance per database
 while still handling per-collection schema versions correctly.
 
+### Network-first initial rendering
+
+Set `initialRender` to let the Collection become ready from restored SQLite
+rows when the network is slow or unavailable:
+
+```ts
+const todos = createCollection(
+  persistedCollectionOptions({
+    id: 'todos',
+    getKey: (todo) => todo.id,
+    persistence,
+    sync,
+    initialRender: {
+      strategy: 'network-first',
+      networkTimeoutMs: 3_000,
+    },
+  }),
+)
+```
+
+The Collection waits for its sync adapter for `networkTimeoutMs` (default 3
+seconds). After the deadline, or as soon as the sync adapter fails its first
+load, a completed restore that installed rows makes the Collection `ready`.
+Collection `status` is the only signal; hooks, Suspense, and `preload()`
+follow it.
+
+- An empty restore keeps the Collection `loading` until the network answers.
+- A sync adapter answer that arrives before the restore completes waits for
+  it. A remote failure then opens the Collection from restored rows and shows
+  as a sync error on `collection.health`; without rows, the first load fails.
+- A failed restore crashes the Collection.
+- The deadline never cancels network sync.
+
+Without `initialRender`, the Collection becomes ready only through its sync
+adapter.
+
+Restored rows do not prove current authorization. Applications with user- or
+tenant-specific data must isolate persisted storage by identity and clear or
+replace it when the identity changes. If a policy denial must hide cached rows,
+gate the view separately.
+
+`initialRender` is rejected with `syncMode: 'on-demand'`, since an on-demand
+Collection has no complete startup snapshot.
+
+### Coordinator contract
+
+Every `PersistedCollectionCoordinator` must implement
+`requestApplyCommittedTx(collectionId, tx)`. A sync transaction with durable
+effects is routed in full to the persistence adapter owned by that collection.
+The `PersistedTx` includes any truncate, row mutations, row metadata mutations,
+collection metadata mutations, and stream position. Multiprocess coordinators
+must preserve the complete transaction when they forward it to the elected
+writer. An effect-free source commit does not allocate a stream position,
+publish an invalidation, or call persistence; the next durable transaction
+retains the next coordinator-owned sequence.
+
+This is a required invariant, not a capability to detect at commit time. The
+TypeScript interface requires the method, and `persistedCollectionOptions(...)`
+validates custom coordinators when it configures a collection. An untyped
+integration that omits the method throws
+`InvalidPersistedCollectionCoordinatorError` before the sync source starts or
+publishes rows. Implementations must not fall back to a row-only route such as
+`requestApplyLocalMutations(...)`, because that would discard transaction
+semantics.
+
+After a mutating RPC transport failure, replay is allowed only while the
+requester can prove the same non-null leader id and term still own the route.
+If either value was unknown for the first attempt, or either value changes,
+the direct request rejects with `IndeterminateCommitError` and requires
+application reconciliation. Coordinators never retry that mutation against an
+unknown or replacement leader.
+
+A source sync transaction has a separate exact-ID reconciliation path. The
+persisted wrapper holds its applied receipt while an elected coordinator and
+SQLite adapter check the transaction under the writer lock. An existing ID
+acknowledges the original durable position. An absent ID permits one application
+only if the durable row version and reset epoch equal the wrapper's pre-send
+snapshot; another durable write may carry newer row values or an opaque source
+cursor and cannot be overwritten safely. On a certified result the wrapper
+fulfills the receipt in the same sync run and the coordinator invalidates peers,
+including a peer that missed the original notification. An uncertified result
+retains `IndeterminateCommitError` and terminal source failure. Custom adapters
+and coordinators without this optional operation keep that terminal behavior.
+One generated `txId` identifies one immutable source transaction payload.
+
+`SingleProcessCoordinator` also implements the complete route. It is always
+leader and has no cross-process transport, but it applies the transaction to
+the resolved adapter registered for the specific collection. The Browser and
+Electron coordinators provide the corresponding elected-owner route in their
+runtime packages.
+
+An adapter/storage rejection is surfaced as
+`PersistedCollectionDurabilityError`, never as `CONFLICT`. The error preserves
+the original local cause and its `code` and `path` fields. A transported
+`PERSISTENCE_ERROR` response carries the source code/path that can cross the
+coordinator boundary. Source writes remain published before their applied
+receipt settles; if persistence then fails, the receipt rejects with the named
+error and the collection enters its existing `error` lifecycle state. The
+collection does not continue, retry, or fall back to a partial writer.
+
+### Remote subset wire contract
+
+`requestEnsureRemoteSubset(collectionId, options)` accepts the full live
+`LoadSubsetOptions` input. Before choosing a local owner or remote transport,
+every built-in coordinator projects it once to the exported
+`TransportedLoadSubsetOptions` contract. A registered remote-subset owner
+receives that transported type, never live-only fields such as `signal` or
+`subscription`.
+
+Expression values may contain structured-clone-safe primitives, plain records,
+arrays (including sparse arrays), `Date`, zero-position `RegExp`, fixed
+`ArrayBuffer`, fixed `DataView`, the views listed by the exported
+`RemoteSubsetWireTypedArray` union (`Int8Array`, `Uint8Array`,
+`Uint8ClampedArray`, `Int16Array`, `Uint16Array`, `Int32Array`, `Uint32Array`,
+`Float32Array`, `Float64Array`, `BigInt64Array`, and `BigUint64Array`), `Map`,
+and `Set`. Cycles and aliases are preserved. Other view types; shared,
+resizable, growable, or detached buffers; accessors; non-enumerable or symbol
+keys; native expandos; custom prototypes; promises; weak collections;
+functions; and symbols are outside the contract. A rejected value throws the exported
+`RemoteSubsetWireValueError` before owner work or transport, with its exact
+path in the request. The wire contract does not provide codecs, coercion, or
+lossy normalization for unsupported values.
+
+Remote subset ownership is lease-based. A coordinator gives each accepted
+request object a stable acquisition identity scoped to its collection and
+requester. Retrying the same acquisition coalesces with the original; a second
+request object with equal values is an independent lease. Releasing a lease
+calls the registered owner's required `unloadSubset(...)` method with the exact
+transported options object that was loaded. Releasing it again is a no-op.
+`EnsureRemoteSubsetRequest.acquisitionId` is the wire identity established by
+acquisition; `ReleaseRemoteSubsetRequest.acquisitionId` must carry that same
+identity so the elected owner releases the matching lease.
+
+The owner also provides a required `onError(error)` callback. A load or unload
+throw by the actual elected owner, or a runtime thenable rejection from either
+operation, is reported through that callback with the original value before
+the awaited request rejects. A follower transport or remote-owner admission
+failure rejects the acquisition and remains eligible for the existing demand
+retry; it is not a failure of that follower's local owner lifecycle. Retirement
+and disposal observe and report actual owner failures while continuing cleanup
+of sibling leases; they do not retry or silently recover the failed lifecycle.
+
+Only one remote subset owner may be registered per collection in a coordinator.
+A second live registration throws `DuplicateRemoteSubsetOwnerError` instead of
+replacing the first, and startup reports the named failure before readiness
+rather than leaving a rejected registration promise unobserved. Released
+acquisition identities remain as dedupe tombstones for the coordinator's
+existing RPC dedupe horizon, then expire during later subset traffic. When a
+leader loses ownership or is disposed, it unloads every transferred lease. A
+requester that still owns a lease replays that same acquisition when the next
+leader is observed. There is no adapter fallback or direct-writer escape hatch
+for missing ownership.
+
+The named-error and exact-path guarantee covers values the boundary can
+identify with standard JavaScript reflection. A fully transparent `Proxy` is
+outside the public wire type and cannot be portably distinguished from its
+target. Untyped callers must not rely on Proxy identity, traps, or a
+Proxy-specific diagnostic; no non-standard detection is attempted.
+
+### Source replay ordering
+
+The persisted wrapper buffers authoritative source sync transactions and
+replays them into the Collection in FIFO order, one transaction at a time.
+Local optimistic mutations remain visible immediately; this queue governs
+source publication and its durable suffix. A source may mark a transaction
+`immediate` when it must update the authoritative base beneath an active
+optimistic layer. The wrapper still gives that transaction one FIFO turn and
+writes its durable suffix before admitting the next source turn.
+
+Persisted rows establish a baseline for newer changes from the sync adapter.
+Once an ordinary sync transaction is accepted at `commit()`, queued reads of
+that baseline cannot revoke acceptance. This includes subset reads and rereads
+requested by coordinator reset or full-reload notifications. This rule assumes
+a compatible baseline; it does not authorize using an invalidated resume point.
+A truncate replay replaces earlier source rows in the same sync run. Sync
+transactions ordered after that replacement apply to the replacement.
+
+An `immediate` sync transaction cannot enter while an earlier normal source
+publication is waiting. The wrapper also currently rejects a sync transaction
+that remains open across another persistence read. These admission restrictions
+throw `InvalidPersistedCollectionConfigError`; an internal wait after accepted
+`commit()` is not an admission failure. The open-transaction restriction is
+separate from the accepted-transaction precedence rule.
+
+### Atomic resume snapshots
+
+Persistence adapters implement
+`loadResumeSnapshot(target, options)` to let a sync source certify a
+persisted resume baseline. One call must read rows, collection metadata, stream
+position, reset epoch, and key-set evidence from the same atomic database
+snapshot. `includeRows: false` requests the same certification data without
+materializing rows; `requiredIndexSignatures` carries the indexes needed by a
+row-bearing snapshot.
+
+The adapter's data methods require an explicit `PersistedStorageTarget`. Use
+`{ kind: 'eager', collectionId }` for an eager Collection, or
+`{ kind: 'managed', storageCollectionId, claimId }` for a claimed on-demand
+persisted cache generation. A bare string ID is rejected. The managed target
+checks the claim even after its generation has been collected from SQLite;
+choosing an eager target explicitly may reuse the same ID. Claim and
+rotation methods take the logical Collection ID; renewal takes the physical
+storage ID and release takes the claim ID.
+
+`PersistedKeySetEvidence.status` has three states:
+
+- `consistent`: the persisted rows match the adapter's durable expected-key
+  ledger.
+- `incompatible`: row loss, substitution, or a reset-generation change makes
+  the saved resume baseline unsafe.
+- `unknown`: the adapter has no authoritative pre-migration key set and does
+  not claim completeness.
+
+A no-write election can reserve a greater durable term and reset its sequence
+to zero without changing persisted rows or the source resume cursor. The
+persisted wrapper keeps an already certified resume baseline across that
+transition only when the atomic snapshot has the same row version and reset
+epoch. A committed write or schema reset requires fresh certification and
+cannot inherit the earlier baseline merely because the key set still matches.
+
+The method is required because the versioned `metadata.persistence` capability
+always carries hydration, durable row scanning, certification, evidence, and
+generation ownership as one complete bundle. Sync wrappers must forward the
+capability object unchanged rather than copying individual methods. Adapter
+methods are invoked with their receiver and may rely on instance state through
+`this`.
+
+`SyncMetadataApi.persistence` is always present. Core sync sources receive
+`null`, which explicitly means that no persistence bridge is active. The
+persisted wrapper replaces that sentinel with the complete versioned
+capability. A wrapper that omits the property is invalid and fails before a
+consumer can resume or query against uncertified durable state.
+
 ### SQLite core adapter APIs
 
 - `SQLiteCoreAdapterOptions`
 - `SQLitePullSinceResult<TKey>`
-- `SQLiteCorePersistenceAdapter<T, TKey>`
-- `createSQLiteCorePersistenceAdapter<T, TKey>(...)`
+- `SQLiteCorePersistenceAdapter`
+- `DEFAULT_APPLIED_TX_PRUNE_MAX_ROWS`
+- `DEFAULT_APPLIED_TX_PRUNE_MAX_AGE_SECONDS`
+- `createSQLiteCorePersistenceAdapter(...)`
 
 ### Error APIs
 
@@ -78,9 +334,20 @@ while still handling per-collection schema versions correctly.
 - `InvalidSyncConfigError`
 - `InvalidPersistedCollectionCoordinatorError`
 - `InvalidPersistenceAdapterError`
+- `PersistedCollectionDurabilityErrorOptions`
+- `PersistedCollectionDurabilityError`
+- `toPersistedCollectionDurabilityError(...)`
+- `IndeterminateCommitRequestType`
+- `IndeterminateCommitErrorOptions`
+- `IndeterminateCommitError`
 - `InvalidPersistedStorageKeyError`
 - `InvalidPersistedStorageKeyEncodingError`
 - `PersistenceUnavailableError`
+
+Adapter and coordinator commit failures reject the applied receipt and become
+the collection's terminal sync error as `PersistedCollectionDurabilityError`.
+That error preserves its original `cause`, `code`, and `path`. Hydration and
+source errors remain distinct and are not wrapped as durability errors.
 
 ## Typical usage (via runtime wrappers)
 
@@ -90,6 +357,9 @@ In most applications, use a runtime package directly:
 - `@tanstack/browser-db-sqlite-persistence`
 - `@tanstack/electron-db-sqlite-persistence`
 - `@tanstack/react-native-db-sqlite-persistence`
+- `@tanstack/expo-db-sqlite-persistence`
+- `@tanstack/capacitor-db-sqlite-persistence`
+- `@tanstack/tauri-db-sqlite-persistence`
 - `@tanstack/cloudflare-durable-objects-db-sqlite-persistence`
 
 Those packages provide concrete drivers and runtime wiring.

@@ -1,3 +1,5 @@
+import { safeRandomUUID } from './utils/uuid'
+import { withCollectionConfigFactory } from './client.js'
 import type {
   BaseCollectionConfig,
   CollectionConfig,
@@ -28,8 +30,9 @@ export interface LocalOnlyCollectionConfig<
   `gcTime` | `startSync`
 > {
   /**
-   * Optional initial data to populate the collection with on creation
-   * This data will be applied during the initial sync process
+   * Optional initial data to populate the collection with on creation.
+   * It loads when the Collection starts empty: at creation, or after
+   * cleanup. `reload()` keeps the rows, including the user's writes.
    */
   initialData?: Array<T>
 }
@@ -182,10 +185,14 @@ export function localOnlyCollectionOptions<
   const { initialData, onInsert, onUpdate, onDelete, id, ...restConfig } =
     config
 
-  const collectionId = id ?? crypto.randomUUID()
+  const collectionId = id ?? safeRandomUUID()
 
   // Create the sync configuration with transaction confirmation capability
-  const syncResult = createLocalOnlySync<T, TKey>(initialData)
+  const directTypes = new Set<OperationType>()
+  if (!onInsert) directTypes.add(`insert`)
+  if (!onUpdate) directTypes.add(`update`)
+  if (!onDelete) directTypes.add(`delete`)
+  const syncResult = createLocalOnlySync<T, TKey>(initialData, directTypes)
 
   /**
    * Create wrapper handlers that call user handlers first, then confirm transactions
@@ -194,16 +201,10 @@ export function localOnlyCollectionOptions<
   const wrappedOnInsert = async (
     params: InsertMutationFnParams<T, TKey, LocalOnlyCollectionUtils>,
   ) => {
-    // Call user handler first if provided
-    let handlerResult
-    if (onInsert) {
-      handlerResult = (await onInsert(params)) ?? {}
-    }
+    if (onInsert) await onInsert(params)
 
     // Then synchronously confirm the transaction by looping through mutations
     syncResult.confirmOperationsSync(params.transaction.mutations)
-
-    return handlerResult
   }
 
   /**
@@ -212,16 +213,10 @@ export function localOnlyCollectionOptions<
   const wrappedOnUpdate = async (
     params: UpdateMutationFnParams<T, TKey, LocalOnlyCollectionUtils>,
   ) => {
-    // Call user handler first if provided
-    let handlerResult
-    if (onUpdate) {
-      handlerResult = (await onUpdate(params)) ?? {}
-    }
+    if (onUpdate) await onUpdate(params)
 
     // Then synchronously confirm the transaction by looping through mutations
     syncResult.confirmOperationsSync(params.transaction.mutations)
-
-    return handlerResult
   }
 
   /**
@@ -230,16 +225,10 @@ export function localOnlyCollectionOptions<
   const wrappedOnDelete = async (
     params: DeleteMutationFnParams<T, TKey, LocalOnlyCollectionUtils>,
   ) => {
-    // Call user handler first if provided
-    let handlerResult
-    if (onDelete) {
-      handlerResult = (await onDelete(params)) ?? {}
-    }
+    if (onDelete) await onDelete(params)
 
     // Then synchronously confirm the transaction by looping through mutations
     syncResult.confirmOperationsSync(params.transaction.mutations)
-
-    return handlerResult
   }
 
   /**
@@ -263,7 +252,7 @@ export function localOnlyCollectionOptions<
     )
   }
 
-  return {
+  const options = {
     ...restConfig,
     id: collectionId,
     sync: syncResult.sync,
@@ -278,6 +267,17 @@ export function localOnlyCollectionOptions<
   } as LocalOnlyCollectionOptionsResult<T, TKey, TSchema> & {
     schema?: StandardSchemaV1
   }
+
+  return withCollectionConfigFactory(options, () =>
+    (
+      localOnlyCollectionOptions as (
+        nextConfig: LocalOnlyCollectionConfig<T, TSchema, TKey>,
+      ) => typeof options
+    )({
+      ...config,
+      id: collectionId,
+    }),
+  )
 }
 
 /**
@@ -291,7 +291,9 @@ export function localOnlyCollectionOptions<
  * @returns Object with sync configuration and confirmOperationsSync function
  */
 function createLocalOnlySync<T extends object, TKey extends string | number>(
-  initialData?: Array<T>,
+  initialData: Array<T> | undefined,
+  // Operation types without a user handler, which confirm synchronously.
+  directTypes: ReadonlySet<OperationType>,
 ) {
   // Capture sync functions and collection for transaction confirmation
   let syncBegin: (() => void) | null = null
@@ -301,6 +303,7 @@ function createLocalOnlySync<T extends object, TKey extends string | number>(
   let collection: Collection<T, TKey, LocalOnlyCollectionUtils> | null = null
 
   const sync: SyncConfig<T, TKey> = {
+    rowUpdateMode: `full`,
     /**
      * Sync function that captures sync parameters and applies initial data
      * @param params - Sync parameters containing begin, write, and commit functions
@@ -315,17 +318,18 @@ function createLocalOnlySync<T extends object, TKey extends string | number>(
       syncCommit = commit
       collection = params.collection
       params.collection._state.isLocalOnly = true
+      params.collection._state.localOnlyDirectWrite = {
+        types: directTypes,
+        write: confirmOperationsSync,
+      }
 
-      // Apply initial data if provided
-      if (initialData && initialData.length > 0) {
-        // Mark initial data as local so $origin is 'local' for local-only collections
-        for (const item of initialData) {
-          const key = params.collection.getKeyFromItem(item)
-          params.collection._state.pendingLocalChanges.add(key)
-        }
-
+      // initialData loads only into an empty Collection: at creation or
+      // after cleanup. A reload's run starts while the Collection is ready,
+      // and its rows are the only copy of the user's writes, so it keeps
+      // them. `isLocalOnly` makes the rows' $origin 'local'.
+      if (params.collection.status !== `ready`) {
         begin()
-        initialData.forEach((item) => {
+        initialData?.forEach((item) => {
           write({
             type: `insert`,
             value: item,

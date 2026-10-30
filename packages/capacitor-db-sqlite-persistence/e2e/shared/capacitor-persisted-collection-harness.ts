@@ -1,6 +1,9 @@
 import { BTreeIndex, createCollection } from '@tanstack/db'
 import { persistedCollectionOptions } from '../../src'
-import { generateSeedData } from '../../../db-collection-e2e/src/fixtures/seed-data'
+import {
+  captureSeedData,
+  generateSeedData,
+} from '../../../db-collection-e2e/src/fixtures/seed-data'
 import type { Collection } from '@tanstack/db'
 import type { PersistedCollectionPersistence } from '@tanstack/db-sqlite-persistence-core'
 import type {
@@ -20,9 +23,7 @@ type PersistedCollectionHarness<T extends PersistableRow> = {
 }
 
 type PersistedTransactionHandle = {
-  isPersisted: {
-    promise: Promise<unknown>
-  }
+  when: (state: 'settled') => Promise<unknown>
 }
 
 type PersistenceFactory<TDatabase> = (
@@ -50,17 +51,20 @@ function createPersistedCollection<T extends PersistableRow, TDatabase>(
     }
 
     seedTxSequence++
-    await persistence.adapter.applyCommittedTx(id, {
-      txId: `seed-${id}-${seedTxSequence}`,
-      term: 1,
-      seq: seedTxSequence,
-      rowVersion: seedTxSequence,
-      mutations: rows.map((row) => ({
-        type: `insert` as const,
-        key: row.id,
-        value: row,
-      })),
-    })
+    await persistence.adapter.applyCommittedTx(
+      { kind: `eager`, collectionId: id },
+      {
+        txId: `seed-${id}-${seedTxSequence}`,
+        term: 1,
+        seq: seedTxSequence,
+        rowVersion: seedTxSequence,
+        mutations: rows.map((row) => ({
+          type: `insert` as const,
+          key: row.id,
+          value: row,
+        })),
+      },
+    )
   }
 
   const collection = createCollection(
@@ -83,7 +87,7 @@ function createPersistedCollection<T extends PersistableRow, TDatabase>(
 async function waitForPersisted(
   transaction: PersistedTransactionHandle,
 ): Promise<void> {
-  await transaction.isPersisted.promise
+  await transaction.when(`settled`)
 }
 
 async function seedCollection<T extends PersistableRow>(
@@ -153,6 +157,11 @@ export async function createCapacitorPersistedCollectionHarnessConfig<
     cleanup = () => Promise.resolve(),
   } = options
   const seedData = generateSeedData()
+  const fixture = captureSeedData(seedData, {
+    registration:
+      'packages/capacitor-db-sqlite-persistence/e2e/shared/capacitor-persisted-collection-harness.ts',
+    provider: 'Supplied Capacitor persistence factory',
+  })
 
   const eagerUsers = createPersistedCollection<User, TDatabase>(
     database,
@@ -219,6 +228,7 @@ export async function createCapacitorPersistedCollectionHarnessConfig<
   }
 
   const config: CapacitorPersistedCollectionHarnessConfig = {
+    fixture,
     collections: {
       eager: {
         users: eagerUsers.collection,
@@ -252,6 +262,11 @@ export async function createCapacitorPersistedCollectionHarnessConfig<
         insertRowIntoCollections(
           [eagerPosts.collection, onDemandPosts.collection],
           post,
+        ),
+      deletePost: async (id) =>
+        deleteRowAcrossCollections(
+          [eagerPosts.collection, onDemandPosts.collection],
+          id,
         ),
     },
     setup: async () => {},

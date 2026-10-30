@@ -1,0 +1,269 @@
+# Project glossary
+
+Use one term for one concept across production code, models, tests, and design
+documents. Do not rotate synonyms for style. Shared words let a reader move
+between the contract, the model, and the implementation without translating.
+
+This glossary owns terms that cross subsystem boundaries. A subsystem may add
+narrower terms in its architecture document. It must not redefine a term here.
+When an independent model needs a different abstraction, state the mapping next
+to the model.
+
+Aligned vocabulary does not mean copied logic. A reference model should not use
+production queues, caches, or semantic helpers merely to share their names.
+
+## Runtime terms
+
+| Term | Meaning | Do not use as a synonym |
+| --- | --- | --- |
+| Collection | The public keyed data container. Capitalize it when referring to the TanStack DB type. | Relation, table, or query result. |
+| source Collection | A Collection read by a query or adapter. | Source relation when the value is a public Collection. |
+| live-query Collection | A Collection whose rows are produced by a live query. | Query, observer, or result set. |
+| framework binding | What one mounted framework hook or injector keeps between updates: its compiled live query or window binding, its observer or controller, and its source Collection ID claims. | Subscription, observer, or live-query Collection. |
+| query identity | The value that decides whether a framework binding compiles its query input again: a nonempty `queryKey`, or the identity derived from the query IR. A `DbClient` matches preloaded and hydrated queries by its hash. React and Preact compare it on every render; reactive adapters compile again when their reads change and compare none. | Query hash when the value is not hashed, or dependency list. |
+| source Collection ID claim | A framework binding's record of which source Collection object each Collection ID named, per `DbClient` scope, kept while the binding is mounted. A binding that compares query identity rejects a different object under a claimed ID. | Collection registry or source identity. |
+| window binding | The infinite-query state a framework binding keeps between updates: the input, its identity dependencies, the page shape, the window collection, and its controller. `bindLiveQueryWindow` decides whether to keep it, replace its controller, or bind a new window collection. | Window controller or live-query Collection. |
+| pooled live query | A live query on one source Collection whose `where` has at least one `eq(field, literal)` conjunct and otherwise reads only the row, optionally ordered by the row's own fields without a limit, served from an equality partition; its live-query Collection is built only when read. | Cached query or shared live-query Collection. |
+| equality partition | Source rows grouped by the `eq`-normalized values of one set of fields, shared by pooled live queries on the same source Collection with the same equality fields and order terms, including resolved comparison options. | Index or bucket relation. |
+| partition group | The rows of an equality partition whose fields equal one tuple of literals. | Bucket or active bucket. |
+| relation | An internal weighted multiset maintained by D2. | Collection. |
+| row | One keyed public Collection value or one relation value. Qualify source row, relation row, or public row when more than one kind appears. | Event or transaction. |
+| change message | One insert, update, or delete delivered through the Collection sync boundary. | Transaction or publication. |
+| sync transaction | The changes between one `begin()` and `commit()` pair. | Optimistic transaction or publication. |
+| optimistic transaction | A local mutation transaction whose intent may later complete or roll back. | Sync transaction. |
+| optimistic state | The rows an optimistic transaction overlays on the applied synced rows while its mutation function runs. It drops when the mutation function settles, whether it fulfills or rejects. | Retained snapshot or accepted local snapshot. |
+| accepted sync transaction | A committed sync transaction that core, or a wrapping sync after its durable step, has taken. It always applies, in commit order. While an optimistic transaction is persisting it is held, and it applies in the publication that drops that transaction's optimistic state. Handler-facing writes and Collection readiness wait for acceptance; commit receipts and subset loads wait for visibility. | Visible or applied sync transaction. |
+| deferred sync transaction | A committed sync transaction that a wrapping sync has not handed to the Collection yet, because an earlier durable write is still running. Like a queued sync transaction, it holds settled optimistic rows on its keys until it applies. | Queued or accepted sync transaction. |
+| reserved sync transaction | A sync transaction whose source called `reserveCommitTurn` and that has not committed or been abandoned. Every persisted hydration that would start while it is open waits for its commit. A source that stops for good abandons it. | Deferred sync transaction or held optimistic row. |
+| held optimistic row | A successful transaction's optimistic row kept only while a committed sync transaction that has not applied touches its key, so the drop and that transaction publish together. The transaction may be queued in the Collection or deferred behind a wrapping sync's durable step. Its source attribution follows the key-and-timing rules in [VirtualOrigin](../reference/type-aliases/VirtualOrigin.md), not source-client identity. | Retained or accepted snapshot. |
+| Collection status | One public Collection lifecycle value: `idle`, `loading`, `ready`, `error`, `crashed`, or `cleaned-up`. | Subscription status. |
+| subscription status | One subscription value: `ready` or `loadingSubset`. | Collection status. |
+| subscription | A consumer of Collection changes with its own subset demands and lifecycle. | Collection, query, or transport. |
+| sync adapter | The code supplied through Collection sync configuration that starts a sync run and translates between TanStack DB and a provider. | Provider or source Collection. |
+| provider | The external database, service, or SDK from which a sync adapter acquires data. | Sync adapter or source Collection. |
+| sync run | One invocation of a Collection's sync function, plus the callbacks and resources installed by that invocation, until cleanup invalidates them. A run may own zero or more provider requests and may outlive any one request. Component-owned `syncRunGeneration` counters fence this lifetime in Collection state, sync ownership, and live-query graph work. | Provider session, replay, generation, or request. |
+| provider session | A provider-defined remote stream, connection, or SDK lifetime. Always qualify it with the provider. | Sync run. |
+| cleanup | The transition that ends the current sync run and releases its resources. Public `cleanup()` rejects while a live query or Effect reads the Collection; `cleanup({ dependents: true })` ends those dependents first. A direct subscription survives cleanup. Callback invalidation and local teardown begin synchronously. The public cleanup promise and final `cleaned-up` status settle after adapter cleanup settles. The Collection object remains available for cleanup or restart. | Collection destruction, restart, or replay. |
+| cleanup start | The internal boundary at which cleanup synchronously closes restart admission, invalidates the current sync run, crashes dependent live queries, and marks dependent Effects disposed. The public Collection status keeps its prior value while adapter cleanup is pending. | A Collection status, cleanup settlement, or proof that adapter resources or Effect handlers settled. |
+| restart | Starting a new sync run after the prior sync run has ended. | Same-run recovery or replay. |
+| reload | `collection.reload()`: starting a new sync run while the rows, status, and node problems stay. The new run's writes apply on the kept rows, which are its baseline: an insert of a key the Collection holds throws, as at any time. Only a snapshot transaction or the adapter's `truncate()` replaces every row; core deletes no kept row on its own, so removing a row the backend deleted is the adapter's job ([#2269](https://github.com/TanStack/db/issues/2269)). The reload completes when that replacement applies on a ready Collection, or at the new run's `markReady()`, which keeps the rows when no snapshot came. Completion drops the retired run's problems and keeps what the new run reported. A live query's own reload keeps its settled window and commits its new run's first complete graph result as its snapshot. | Restart, truncate replay, or retry. |
+| snapshot transaction | A sync transaction the adapter begins with `begin({ snapshot: true })`. It declares that it carries every row, so its commit replaces every synced row, as `truncate()` at its start does, without marking the Collection ready. It means the same at any time. A subset load's transaction is partial and is never one. | Source snapshot or public snapshot. |
+| truncate replay | An authoritative source replacement after a truncate, inside the current sync run. The Collection subscription remains active; any dependent live-query graph remains active behind its publication barrier. | Restart, reload, retry, or repair. |
+| source snapshot | The source rows established by one snapshot operation within its declared predicate and window. It proves full-source state only when the provider says that scope is authoritative and exhausted. | Public snapshot or proof of full-source coverage. |
+| public snapshot | The last coherent set of rows exposed to reads, events, and downstream queries. | Private replacement or source snapshot. |
+| hydration seed | A row, with optional row metadata, that `DbClient.hydrate`, `applyCollectionChunk`, or `initialData` supplies to a Collection from outside its sync source. It is provisional base state: it supplies only an object (row data or row metadata) that no surviving source write has written, and a seed that arrives after such a write is ignored for that object. A seed is judged when it arrives: one that lands after a committed source write stays ignored for that object even if a persisted Collection later abandons the write before applying it. Among seeds of an unwritten row, the latest wins whole. | A sync transaction, a source write, persisted rows, or a live-query snapshot. |
+| exposed authoritative base | The applied source rows available before a Collection adds optimistic mutations. Committed sync writes queued for reconciliation are not part of this base. `collection.base` reads it without starting sync. | Visible Collection state or a pending sync queue. |
+| private replacement | Source or graph state withheld while an authoritative replay or repair is incomplete. | Public snapshot. |
+| publication | The boundary that makes one coherent result observable to reads, events, and downstream queries. | Provider return, request settlement, or sync commit by itself. |
+| atomic publication | One publication boundary at which state, events, and consumers observe the same result without an intermediate public state. | Any individual `commit()` call or source snapshot. |
+| readiness | Evidence that a named consumer may proceed. Always qualify Collection readiness, subscription readiness, or initial-query readiness; they settle at different boundaries. | Provider completion or publication in general. |
+| persisted restore | The eager persisted source Collection's startup read and publication of its durable rows, including an empty snapshot, in the current sync run. | Upstream/provider readiness or an SSR seed. |
+| persisted readiness | The persisted wrapper's internal record that the current sync run's persisted restore completed or failed. Network-first initial render reads it; Collection status is the only public signal. | Collection readiness, network availability, or row nonemptiness. |
+| persisted cache generation | One version of an on-demand Collection's durable rows and resume metadata, identified by a monotonic generation number and a distinct storage ID. One current generation accepts new claims; a retired generation remains available to sync runs that already claim it. A stale run may create a new retired generation for its own recovery without replacing the current one. Rotating a generation does not change the public Collection identity. | Sync run, provider session, or source snapshot. |
+| persisted cache claim | A sync run's expiring authority to read and write one persisted cache generation. It is checked before durable access and is separate from a TanStack DB acquisition lease. | Acquisition lease, subset demand, or proof that cached rows are authoritative. |
+| persisted subset restore | The persisted wrapper's read of one demand's request data from the current persisted cache generation, and publication of those rows to the Collection, in the current sync run. The result may be empty. | Persisted restore of an eager Collection, or proof that the rows are complete. |
+| persisted demand coverage | A record, in one persisted cache generation, that a load of one exact demand reached applied settlement with its rows durably committed, and how many rows the demand read then. It counts only while the persisted subset restore returns at least that many rows; for an ordered window, only while it returns the same rows. It is the durable, cross-session form of the coverage that a settled acquisition establishes in one sync run: when a covered demand settles from SQLite, it is covered in that sense too. It proves completeness when that load settled, not freshness or broader extent. | Rows present in SQLite, a broader or overlapping demand, or persisted readiness. |
+| network-first initial render | An opt-in persisted Collection setting, `initialRender: { strategy: 'network-first', networkTimeoutMs }`. The Collection waits for its sync adapter until the deadline passes or the remote fails, then a completed persisted restore that installed rows makes it `ready`. An empty restore keeps it `loading`. A remote failure before the restore completes waits for the restore. Network sync continues. An on-demand Collection instead settles each covered demand's load from SQLite once that load's wait passes or its remote load fails (persisted demand coverage); query readiness follows its loads. | Collection readiness from the sync adapter, an SSR seed, or a separate status. |
+
+`source` names a role in a data flow; it does not own a lifecycle. Do not coin a
+`source session`. Use `sync run` for the local Collection sync invocation
+and a provider-qualified `provider session` for a remote lifecycle.
+
+## Collection status and health terms
+
+Collection status and the health tree are separate axes. Status says whether the
+data can be shown; the health tree says whether the data on screen is still kept
+current. After Collection readiness in a sync run, only a crash changes status
+until cleanup ends the run.
+
+| Term | Meaning | Do not use as a synonym |
+| --- | --- | --- |
+| initial gate | The role of Collection status during a sync run's first load. The status stays `loading` while the sync adapter retries, then becomes `ready` through `markReady()` or `error` through `fail()`. After Collection readiness in a sync run, sync problems never change the status. | The health tree or a live query's request errors. |
+| loading error | The `fail()` that ends a sync run's first load in status `error` (`isLoadingError`). It is final for its sync run: `markReady()` afterward does nothing, and only a new sync run can reach `ready`. | Sync error or a retry. |
+| crash | Moving a Collection to status `crashed` (`isCrashed`) from any active status, because it can no longer serve reads or admit writes. Core uses it for IndexedDB closure, terminal local persistence failures, a throwing sync function, and internal invariant failures. It cannot be recovered in place: nothing restarts it and `reload()` rejects. Only cleanup leaves it, and cleanup discards all of the Collection's state, so a later start is a fresh start. After a crash, the sync adapter's status calls (`markReady()`, `fail()`, `reportError()`, `reportHealthy()`) do nothing. Sync data that the run commits still applies, because closure keeps accepted sync obligations such as the confirmation of a write admitted before it. | Loading error, sync error, or cleanup. |
+| sync error | A problem after Collection readiness on a source's health node, from the sync adapter: a failure reason (`reportError()`, still trying; `reportHealthy()` clears it, and `reportHealthy(error)` removes one failure) or an error (`fail()`, stopped; it stays for the sync run, every later report throws, and a second `fail()` does nothing). A live query's `isSyncError` is `true` when it is `ready` and its tree has any problem. It never changes status or rows. Cleanup resets it. | Loading error or subscription status. |
+| failure reason | A node's `failureReason`: the problem while the sync adapter keeps trying, after TanStack Query's `failureReason`. Its frame is the sync run: it lists each `reportError()` since the slot was last clear, once per error value (a value already listed keeps its failure's place and `at`), `reportHealthy(error)` removes that value's failure, `reportHealthy()` ends it, and a reload's new run that reports starts a new one. The slot clears when its list empties. | An error or a retry count. |
+| problem | A health node's `failureReason` or `error` (`HealthProblem`). Its `message`, `cause`, and `at` are its newest failure's, and `errors` lists every failure of its frame still open, oldest first, each `{ name, message, code?, at, cause }`. A failure that clears leaves the list; one error value is one failure, which keeps the place of its first failure. Adding or removing a failure changes the problem, so its node is a new object. | A failure, which is one entry of a problem. |
+| failure | One reported value in a problem's `errors`: one `reportError()`, the `fail()` of a sync run, a crash, or one failed request. | A problem. |
+| request error | A failed subset load (a rejection, or a synchronous throw, which is a rejection) for demand that a live query or Effect started after its initial-query readiness, shown as the `error` on that query's own node. The source Collection's node does not change. The node's problem lists every request failure still open. The public name stays general on purpose: an application sees a failed request for more data, not the subset-load mechanism. It clears when a later subset load for that demand fulfills, including one that the query's own reload issues, or when the demand retires. A load that core aborted decides nothing. A truncate's or a source reload's replay decides every request error of the demand it replayed: its success clears them all, and its failure replaces them with the replay's failures, which stay until a replay succeeds for the demand that remains (a replay failure belongs to the logical demand that failed, ARCHITECTURE law 9) or the demand retires. | Sync error or request data. |
+| health tree | The `health` value of a Collection, live query, or Effect: one node for a Collection; for a query, one health node per query alias, in query order, fixed by the query definition. It keeps stable object identity while its content is unchanged, and `health:change` announces a change. | An error list. |
+| health node | One `HealthNode` in a health tree, for a source Collection, a nested live-query Collection, or one include. It shows at most one problem, `failureReason` or `error`. A nested live-query node carries its own health tree in `sources`. | Bucket or Collection facade. |
+
+## Persistence coordination terms
+
+| Term | Meaning |
+| --- | --- |
+| durable election term | A per-Collection leadership term reserved in SQLite before a Browser or Electron coordinator announces ownership. Each election gets a greater term even when the previous owner committed no row. |
+| publicly applied row version | The durable row version whose rows the persisted wrapper has applied to the public Collection. A position-only resume snapshot can observe a later version without applying its rows. A schema reset rebinds this version to the new reset epoch. |
+| durable anchor | The row version and reset epoch observed before one source sync transaction is sent to a coordinator. If both still match and the exact transaction ID is absent, the replacement leader may apply that transaction once. |
+| exact-ID reconciliation | The replacement leader checks one immutable source transaction ID under the SQLite writer lock after its RPC result becomes indeterminate. A present ID acknowledges the original commit; an absent ID needs an unchanged durable anchor. |
+| reconciliation reload | A peer notification after exact-ID reconciliation that reloads persisted rows even when the receiver has already observed the same stream position. Equal public rows do not publish a second change batch. |
+| source progress token | A sync adapter's opaque identity for one complete materialization at a provider position. Re-delivering that position is idempotent. Its predecessor expectation lets persistence detect a discontinuity between interleaved source commits without ordering provider handles. A discontinuity invalidates source progress evidence until an authoritative replacement. It is separate from a durable row version and a sync-run generation. |
+
+## Offline outbox terms
+
+| Term | Meaning |
+| --- | --- |
+| offline executor restart | Replacing an executor with a fresh one over retained durable outbox state. This does not restart a Collection sync run. |
+| outbox replay | Resuming unfinished durable offline transaction work, including outbox reconciliation and permitted mutation execution or terminal-phase deletion. This is separate from truncate replay and oracle replay. |
+| `deletion-pending` | The mutation function fulfilled; only acknowledged outbox deletion remains before caller success. An offline executor restart must not call the mutation function again. |
+| `rejection-pending` | The named mutation function failed and the executor chose terminal rejection, or the retry decision hook failed. The caller rejects with that failure. An offline executor restart removes the marked row without calling the mutation function again or restoring its optimistic state. |
+
+## Demand and pagination terms
+
+These terms form a graph, not a one-to-one pipeline. Keep the ownership, work,
+evidence, and visibility boundaries visible:
+
+```text
+logical subset owner --retains--> demand
+demand --starts or replaces--> 0..n acquisition attempts
+accepted attempt --establishes--> physical acquisition + acquisition lease
+physical acquisition --may drive--> 0..n sync transactions
+commit(sync transaction) --returns--> applied receipt
+acquisitions + receipts + graph work --may gate--> publication
+publication --advances or replaces--> public snapshot
+```
+
+One demand may need several acquisitions. One acquisition may write through
+several sync transactions. One publication may wait for several acquisitions,
+receipts, or graph participants. Do not infer success or visibility from an
+earlier node alone.
+
+| Term | Meaning | Do not use as a synonym |
+| --- | --- | --- |
+| demand | The logical need for source data. Demand may outlive or replace physical work. | Request, transport, or row ownership. |
+| logical subset owner | One subscription claim that keeps a subset demand active. | Physical acquisition. |
+| request data | The immutable `LoadSubsetOptions` and attached signal passed to an adapter. | Demand or established coverage. |
+| acquisition attempt | One invocation that asks a sync adapter to start physical work. A synchronous throw is a rejection: the attempt fails, keeps its owner, and the owner's release unloads it. If cleanup invalidates the captured sync run after the adapter returns but before activation, core cancels the tentative acquisition without retaining its lease; cleanup owns the adapter resources. | Physical acquisition or transport. |
+| physical acquisition | Request-scoped work accepted by a sync adapter for a demand. | Acquisition attempt, logical demand, or transport. |
+| lease | An ownership token that requires a matching release. TanStack DB leases do not expire on a timer. Always qualify which resource the lease owns. | Demand, request, or data coverage. |
+| acquisition lease | The release obligation created when an adapter accepts a physical acquisition. | The acquisition attempt itself. |
+| window lease | One window-controller caller's contribution to the requested window. | Acquisition lease. |
+| observer lease | One Query DB owner's claim that retains a query observer or its rows. | Subscription or acquisition lease. |
+| deferred acquisition | The state of a live-query Collection's subscription to a source Collection before the live-query Collection has a subscriber or a preload in its current sync run. Its demand is active and reads rows the source already holds, but it starts no idle source sync run and no acquisition attempt. | Paused sync, render deferral, or demand retirement. |
+| demand retirement | Removing one logical owner's claim on demand. | Acquisition release or row deletion. |
+| acquisition release | Fulfilling one acquisition lease by aborting its signal and giving the owning adapter one unload opportunity. | Demand retirement, guaranteed transport cancellation, or row deletion. |
+| adapter unload | The adapter callback invoked during acquisition release. | Demand retirement or proof that transport stopped. |
+| abort | A cancellation signal sent to work that may still be in flight. When core aborts a subset load, that load is over for core: its later outcome decides nothing, holds no readiness, and no replay waits for it. | Release, rollback, or guaranteed transport cancellation. |
+| transport | Provider work such as an HTTP request or stream. A transport may be shared, may outlive abort, and need not map one-to-one to a physical acquisition. | Acquisition attempt or demand. |
+| settlement | A promise becoming fulfilled or rejected. Qualify what settled. | Success, application, or publication. |
+| applied receipt | The `SyncAppliedReceipt` returned by `commit()`. It settles when that sync transaction's writes and events become visible, or rejects if they are abandoned. | Provider completion or source exhaustion. |
+| applied settlement | The law that a successful subset load waits for every applied receipt that establishes its result. | Publication of a larger graph result. |
+| window | The requested ordered view described by offset and limit. | Loaded prefix or established source extent. |
+| prefix | Source rows from the start of one declared order through a finite boundary. | Page, window, or proof of exhaustion. |
+| cursor | Values and expressions that continue an ordered request from a boundary. | Offset or general request identity. |
+| boundary | The last value that an ordered acquisition has safely established for continuation. | Any last local row. |
+| tie group | Rows equal under the order terms used by a continuation boundary. | Page. |
+| source exhaustion | Authoritative evidence that no more matching source rows exist. | A short response unless the provider says it is authoritative. |
+| generation | A monotonic token used to reject obsolete asynchronous work. Qualify the clock it fences, such as sync-run, replay, ordered-load, window-operation, cursor-sequence, post-write-refetch, or demand generation. | Session, replay, or request. |
+| repair | Work that tries to restore an authoritative source result after finite coverage becomes invalid or an acquisition fails. Repair may use a replay, but the terms are not synonyms. | Retry, replay, or restart. |
+| recovery | Regaining a named capability after failure. Always qualify what recovered and whether it stayed in the same sync run. | Restart or repair in general. |
+
+## Live-query materialization terms
+
+The live-query architecture defines the full laws and local vocabulary. These
+cross-file terms keep their exact meanings:
+
+| Term | Meaning |
+| --- | --- |
+| data plane | The D2 graph that joins, reduces, orders, and materializes relations. |
+| demand plane | The asynchronous adapter that starts acquisition attempts and releases acquisition leases. |
+| bucket key | The canonical identity of one correlated child partition. |
+| active bucket | A bucket referenced by at least one current route. |
+| route relation | Weighted links from bucket keys to materialization cells. |
+| materialization cell | One include field on one parent-row occurrence. |
+| Collection facade | The stable public Collection shared by parents routed to one active bucket. |
+| weighted delta | A positive or negative change to a relation row. |
+
+See
+[`packages/db/src/query/live/ARCHITECTURE.md`](https://github.com/TanStack/db/blob/main/packages/db/src/query/live/ARCHITECTURE.md)
+for bucket relations, bucket values, arrangements, reductions, and the normative
+materialization laws.
+
+## Value comparison terms
+
+Equality depends on the declared comparison domain. Qualify the term when
+crossing subsystem boundaries; these comparisons are not interchangeable.
+
+| Term | Meaning |
+| --- | --- |
+| D2 value identity | The value domain compared by `hash` and `equalHashValues`, including their documented reference leaves. A matching hash digest alone does not establish identity. The [identity oracle](https://github.com/TanStack/db/blob/main/packages/db-ivm/tests/hash-identity-oracle.property.test.ts) defines its bounded value rules. Map/Set insertion-order sensitivity is pinned current behavior, not a universal D2 operator contract. |
+| change-event equality | The `deepEquals` comparison used for Collection change-event suppression. Its supported domain ignores Map/Set insertion order, RegExp `lastIndex`, and array holes versus `undefined`. The [change-event equality oracle](https://github.com/TanStack/db/blob/main/packages/db/tests/utils-oracle.property.test.ts) defines its value-class rules. |
+| draft equality | The comparison that recognizes a reverted draft value. Its [revert oracle](https://github.com/TanStack/db/blob/main/packages/db/tests/proxy-revert-oracle.property.test.ts) preserves Map/Set insertion order, RegExp `lastIndex`, and array holes, with explicit snapshot rules for class instances. Native mutator methods have separate change-tracking laws. |
+| persisted-snapshot equality | The value-shape comparison used before skipping a reconciliation reload. It preserves array holes, enumerable array properties, and exact nested prototypes. Equal keyed class, null-prototype, or cross-realm records with different prototypes require reload; Map and Set insertion order remains significant. |
+
+## Oracle and model terms
+
+| Term | Meaning |
+| --- | --- |
+| contract or law | The promised behavior and its declared boundary. |
+| oracle | The rule or mechanism that judges production behavior. |
+| reference model | A simpler, independent computation or state machine used as an oracle. |
+| history | Starting conditions plus a sequence of actions or events, including relevant dependencies and timing. |
+| history grammar | The values, actions, constraints, and schedules that can form legal histories. |
+| production driver | Test code that invokes the real entry point and controls relevant external events. |
+| observation | One recorded public fact. |
+| trace | An ordered sequence of observations. |
+| checkpoint or observation cut | The exact point where the contract requires comparison. |
+| oracle replay | Re-running a recorded oracle failure from its seed, shrink path, actions, or other replay inputs. Do not use it for runtime truncate replay, retry, or a new random campaign. |
+| projection or abstraction | The parts of concrete state retained for one judgment. |
+| refinement check | An executable comparison at a named checkpoint that accepts only production observations allowed by the model. A sampled check is not a proof for every behavior. |
+| partial oracle | An oracle that judges only named parts of the contract. |
+| reach witness | Evidence that the production driver reached the claimed boundary. |
+| versioned review record | Review evidence stored at a stable location with the exact reviewed head and append-only entries, so later edits cannot silently change the recorded verdict. |
+| mutant | A deliberate wrong answer or implementation used to test oracle sensitivity. |
+| fault injection | A deliberate runtime failure, delay, cancellation, or malformed response used to test a system boundary. |
+| shrinking | Reducing a failing generated history while preserving the failure. |
+| bounded exhaustiveness | Executing every case inside stated finite bounds. |
+| held-out challenge | A challenge not used to shape the tested design. After it guides a change, retain it but stop calling it held out. |
+
+## Grammar rules
+
+Use nouns for state and verbs for transitions:
+
+- A demand **becomes active** or **retires**.
+- Core **starts an acquisition attempt**. If the adapter accepts it, the attempt
+  **establishes a physical acquisition** and its **acquisition lease**. A
+  synchronous throw **fails the attempt** as a rejection does. Cleanup
+  may instead invalidate a returned attempt before activation; core then
+  **cancels the tentative acquisition** without retaining its lease.
+- A logical owner **retires**. Core **releases an acquisition lease**. The
+  adapter **unloads** its acquisition.
+- An abort signal **requests cancellation**; transport **stops** only when the
+  provider does so.
+- A promise **settles**; it **fulfills** or **rejects**.
+- Core **accepts** a sync transaction at `commit()`; a wrapping sync accepts
+  it after its durable step. An accepted sync transaction always applies.
+- A sync transaction **applies** when its writes and events become visible.
+- A replay or repair **publishes** one coherent public snapshot.
+- Cleanup start **invalidates** a sync run and **closes** restart admission.
+  Ordinary subscription admission and deferred acquisition resumption **throw**
+  during active cleanup without changing subscriber ownership.
+  Cleanup **settles** after adapter cleanup settles and the Collection publishes
+  `cleaned-up`. Restart then **starts** a new sync run.
+- Truncate replay **replaces** source state inside the current sync run and
+  any current dependent graph.
+- A sync adapter **fails** with `fail()`: a loading error before Collection
+  readiness, a node `error` after it. While it keeps trying, it **reports an
+  error** (a failure reason) and **reports healthy**. A new sync run
+  **clears** a node `error`.
+- A Collection **crashes** when it can no longer serve reads or admit writes.
+
+Use `settled` for a promise that fulfilled or rejected. Use `complete` for named
+coverage, content, history, or a non-promise operation only when no stronger
+boundary term applies. Use `success` only for fulfillment. Qualify overloaded words such as `state`,
+`request`, `snapshot`, `session`, `owner`, `release`, `recovery`, and
+`generation` at first use.
+
+## Model alignment rule
+
+For every model state, action, and observation, apply one of these rules:
+
+1. If it represents a production concept, use the canonical production term.
+2. If it combines production concepts, name the abstraction and list what it
+   combines.
+3. If it splits one production concept, qualify each part and state the split.
+4. If it exists only in the model, say so. Do not give it a production name.
+
+The same check applies in reverse. New production terminology should update
+this glossary and every model that represents that concept in the same change.

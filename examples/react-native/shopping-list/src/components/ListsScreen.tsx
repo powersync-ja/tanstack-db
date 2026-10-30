@@ -10,7 +10,7 @@ import {
   View,
 } from 'react-native'
 import { useRouter } from 'expo-router'
-import { count, eq, useLiveQuery } from '@tanstack/react-db'
+import { count, eq, include, useLiveQuery } from '@tanstack/react-db'
 import { itemsCollection, listsCollection } from '../db/collections'
 import { useShopping } from '../db/ShoppingContext'
 
@@ -26,7 +26,7 @@ function ListCard({
     totalItems: any
     checkedItems: any
     uncheckedPreview: any
-    $synced?: boolean
+    hasPendingWrites?: boolean
   }
   onPress: () => void
   onDelete: () => void
@@ -48,7 +48,7 @@ function ListCard({
   const [showSavingBadge, setShowSavingBadge] = useState(false)
 
   useEffect(() => {
-    if (list.$synced !== false) {
+    if (!list.hasPendingWrites) {
       setShowSavingBadge(false)
       return
     }
@@ -60,7 +60,7 @@ function ListCard({
     return () => {
       clearTimeout(timer)
     }
-  }, [list.id, list.$synced])
+  }, [list.id, list.hasPendingWrites])
 
   return (
     <TouchableOpacity
@@ -107,42 +107,49 @@ export function ListsScreen() {
 
   // ★ Includes query with aggregate subqueries: each list gets child collections
   // with computed counts. ListCard subscribes to them via useLiveQuery.
-  const queryResult = useLiveQuery((q) =>
-    q
-      .from({ list: listsCollection })
-      .select(({ list }) => ({
-        id: list.id,
-        name: list.name,
-        createdAt: list.createdAt,
-        $synced: list.$synced,
-        totalItems: q
-          .from({ item: itemsCollection })
-          .where(({ item }) => eq(item.listId, list.id))
-          .select(({ item }) => ({ n: count(item.id) })),
-        uncheckedPreview: q
-          .from({ item: itemsCollection })
-          .where(({ item }) => eq(item.listId, list.id))
-          .where(({ item }) => eq(item.checked, false))
-          .select(({ item }) => ({
-            id: item.id,
-            text: item.text,
-            createdAt: item.createdAt,
-          }))
-          .orderBy(({ item }) => item.createdAt, `asc`)
-          .limit(3),
-        checkedItems: q
-          .from({ item: itemsCollection })
-          .where(({ item }) => eq(item.listId, list.id))
-          .where(({ item }) => eq(item.checked, true))
-          .select(({ item }) => ({ n: count(item.id) })),
-      }))
-      .orderBy(({ list }) => list.createdAt, `desc`),
-  )
+  const queryResult = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ list: listsCollection })
+        .select(({ list }) => ({
+          id: list.id,
+          name: list.name,
+          createdAt: list.createdAt,
+          hasPendingWrites: list.$hasPendingWrites,
+          totalItems: include(
+            q
+              .from({ item: itemsCollection })
+              .where(({ item }) => eq(item.listId, list.id))
+              .select(({ item }) => ({ n: count(item.id) })),
+          ),
+          uncheckedPreview: include(
+            q
+              .from({ item: itemsCollection })
+              .where(({ item }) => eq(item.listId, list.id))
+              .where(({ item }) => eq(item.checked, false))
+              .select(({ item }) => ({
+                id: item.id,
+                text: item.text,
+                createdAt: item.createdAt,
+              }))
+              .orderBy(({ item }) => item.createdAt, `asc`)
+              .limit(3),
+          ),
+          checkedItems: include(
+            q
+              .from({ item: itemsCollection })
+              .where(({ item }) => eq(item.listId, list.id))
+              .where(({ item }) => eq(item.checked, true))
+              .select(({ item }) => ({ n: count(item.id) })),
+          ),
+        }))
+        .orderBy(({ list }) => list.createdAt, `desc`),
+  })
   const lists = queryResult.data as unknown as Array<{
     id: string
     name: string
     createdAt: string
-    $synced?: boolean
+    hasPendingWrites?: boolean
     totalItems: any
     uncheckedPreview: any
     checkedItems: any

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { processArgument } from '../../../src/query/compiler/select.js'
+import { grouping } from '../../../src/query/compiler/grouping.js'
+import { compileExpression } from '../../../src/query/compiler/evaluators.js'
 import { Aggregate, Func, PropRef, Value } from '../../../src/query/ir.js'
 
 describe(`select compiler`, () => {
@@ -7,12 +8,12 @@ describe(`select compiler`, () => {
   // tests in basic.test.ts and other compiler tests. Here we focus on the standalone
   // functions that can be tested in isolation.
 
-  describe(`processArgument`, () => {
+  describe(`compileExpression`, () => {
     it(`processes non-aggregate expressions correctly`, () => {
       const arg = new PropRef([`users`, `name`])
       const namespacedRow = { users: { name: `John` } }
 
-      const result = processArgument(arg, namespacedRow)
+      const result = compileExpression(arg)(namespacedRow)
       expect(result).toBe(`John`)
     })
 
@@ -20,7 +21,7 @@ describe(`select compiler`, () => {
       const arg = new Value(42)
       const namespacedRow = {}
 
-      const result = processArgument(arg, namespacedRow)
+      const result = compileExpression(arg)(namespacedRow)
       expect(result).toBe(42)
     })
 
@@ -28,19 +29,22 @@ describe(`select compiler`, () => {
       const arg = new Func(`upper`, [new Value(`hello`)])
       const namespacedRow = {}
 
-      const result = processArgument(arg, namespacedRow)
+      const result = compileExpression(arg)(namespacedRow)
       expect(result).toBe(`HELLO`)
     })
 
     it(`throws error for aggregate expressions`, () => {
-      const arg = new Aggregate(`count`, [new PropRef([`users`, `id`])])
+      const arg = new Aggregate(
+        `count`,
+        [new PropRef([`users`, `id`])],
+        grouping,
+      )
       const namespacedRow = { users: { id: 1 } }
 
       expect(() => {
-        processArgument(arg, namespacedRow)
-      }).toThrow(
-        `Aggregate expressions are not supported in this context. Use GROUP BY clause for aggregates.`,
-      )
+        // @ts-expect-error Aggregate IR is not a single-row expression.
+        compileExpression(arg)(namespacedRow)
+      }).toThrow(`Unknown expression type: agg`)
     })
 
     it(`processes reference expressions from different tables`, () => {
@@ -50,7 +54,7 @@ describe(`select compiler`, () => {
         orders: { amount: 100.5 },
       }
 
-      const result = processArgument(arg, namespacedRow)
+      const result = compileExpression(arg)(namespacedRow)
       expect(result).toBe(100.5)
     })
 
@@ -64,7 +68,7 @@ describe(`select compiler`, () => {
         },
       }
 
-      const result = processArgument(arg, namespacedRow)
+      const result = compileExpression(arg)(namespacedRow)
       expect(result).toBe(`New York`)
     })
 
@@ -72,7 +76,7 @@ describe(`select compiler`, () => {
       const arg = new Func(`length`, [new PropRef([`users`, `name`])])
       const namespacedRow = { users: { name: `Alice` } }
 
-      const result = processArgument(arg, namespacedRow)
+      const result = compileExpression(arg)(namespacedRow)
       expect(result).toBe(5)
     })
 
@@ -89,7 +93,7 @@ describe(`select compiler`, () => {
         },
       }
 
-      const result = processArgument(arg, namespacedRow)
+      const result = compileExpression(arg)(namespacedRow)
       expect(result).toBe(`John Doe`)
     })
 
@@ -97,7 +101,7 @@ describe(`select compiler`, () => {
       const arg = new PropRef([`users`, `middleName`])
       const namespacedRow = { users: { name: `John`, middleName: null } }
 
-      const result = processArgument(arg, namespacedRow)
+      const result = compileExpression(arg)(namespacedRow)
       expect(result).toBe(null)
     })
 
@@ -105,7 +109,7 @@ describe(`select compiler`, () => {
       const arg = new PropRef([`nonexistent`, `field`])
       const namespacedRow = { users: { name: `John` } }
 
-      const result = processArgument(arg, namespacedRow)
+      const result = compileExpression(arg)(namespacedRow)
       expect(result).toBe(undefined)
     })
 
@@ -113,7 +117,7 @@ describe(`select compiler`, () => {
       const arg = new PropRef([`users`, `nonexistent`])
       const namespacedRow = { users: { name: `John` } }
 
-      const result = processArgument(arg, namespacedRow)
+      const result = compileExpression(arg)(namespacedRow)
       expect(result).toBe(undefined)
     })
 
@@ -121,7 +125,7 @@ describe(`select compiler`, () => {
       const arg = new Value({ nested: { value: 42 } })
       const namespacedRow = {}
 
-      const result = processArgument(arg, namespacedRow)
+      const result = compileExpression(arg)(namespacedRow)
       expect(result).toEqual({ nested: { value: 42 } })
     })
 
@@ -129,7 +133,7 @@ describe(`select compiler`, () => {
       const arg = new Func(`and`, [new Value(true), new Value(false)])
       const namespacedRow = {}
 
-      const result = processArgument(arg, namespacedRow)
+      const result = compileExpression(arg)(namespacedRow)
       expect(result).toBe(false)
     })
 
@@ -137,7 +141,7 @@ describe(`select compiler`, () => {
       const arg = new Func(`gt`, [new PropRef([`users`, `age`]), new Value(18)])
       const namespacedRow = { users: { age: 25 } }
 
-      const result = processArgument(arg, namespacedRow)
+      const result = compileExpression(arg)(namespacedRow)
       expect(result).toBe(true)
     })
 
@@ -153,24 +157,20 @@ describe(`select compiler`, () => {
         },
       }
 
-      const result = processArgument(arg, namespacedRow)
+      const result = compileExpression(arg)(namespacedRow)
       expect(result).toBe(108.5)
     })
   })
 
   describe(`helper functions`, () => {
     // Test the helper function that can be imported and tested directly
-    it(`correctly identifies aggregate expressions`, () => {
-      // This test would require accessing the isAggregateExpression function
-      // which is private. Since we can't test it directly, we test it indirectly
-      // through the processArgument function's error handling.
-
+    it(`rejects aggregate IR at the single-row compiler boundary`, () => {
       const aggregateExpressions = [
-        new Aggregate(`count`, [new PropRef([`users`, `id`])]),
-        new Aggregate(`sum`, [new PropRef([`orders`, `amount`])]),
-        new Aggregate(`avg`, [new PropRef([`products`, `price`])]),
-        new Aggregate(`min`, [new PropRef([`dates`, `created`])]),
-        new Aggregate(`max`, [new PropRef([`dates`, `updated`])]),
+        new Aggregate(`count`, [new PropRef([`users`, `id`])], grouping),
+        new Aggregate(`sum`, [new PropRef([`orders`, `amount`])], grouping),
+        new Aggregate(`avg`, [new PropRef([`products`, `price`])], grouping),
+        new Aggregate(`min`, [new PropRef([`dates`, `created`])], grouping),
+        new Aggregate(`max`, [new PropRef([`dates`, `updated`])], grouping),
       ]
 
       const namespacedRow = {
@@ -183,12 +183,13 @@ describe(`select compiler`, () => {
       // All of these should throw errors since they're aggregates
       aggregateExpressions.forEach((expr) => {
         expect(() => {
-          processArgument(expr, namespacedRow)
-        }).toThrow(`Aggregate expressions are not supported in this context`)
+          // @ts-expect-error Aggregate IR is not a single-row expression.
+          compileExpression(expr)(namespacedRow)
+        }).toThrow(`Unknown expression type: agg`)
       })
     })
 
-    it(`correctly identifies non-aggregate expressions`, () => {
+    it(`accepts supported single-row expression forms`, () => {
       const nonAggregateExpressions = [
         new PropRef([`users`, `name`]),
         new Value(42),
@@ -201,7 +202,7 @@ describe(`select compiler`, () => {
       // None of these should throw errors since they're not aggregates
       nonAggregateExpressions.forEach((expr) => {
         expect(() => {
-          processArgument(expr, namespacedRow)
+          compileExpression(expr)(namespacedRow)
         }).not.toThrow()
       })
     })

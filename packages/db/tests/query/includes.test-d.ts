@@ -4,6 +4,7 @@ import {
   concat,
   createLiveQueryCollection,
   eq,
+  include,
   materialize,
   queryOnce,
   toArray,
@@ -104,20 +105,22 @@ describe(`includes subquery types`, () => {
         q.from({ p: projects }).select(({ p }) => ({
           id: p.id,
           name: p.name,
-          issues: q
-            .from({ i: issues })
-            .where(({ i }) => eq(i.projectId, p.id))
-            .select(({ i }) => ({
-              id: i.id,
-              title: i.title,
-            })),
+          issues: include(
+            q
+              .from({ i: issues })
+              .where(({ i }) => eq(i.projectId, p.id))
+              .select(({ i }) => ({
+                id: i.id,
+                title: i.title,
+              })),
+          ),
         })),
       )
 
       const result = collection.toArray[0]!
       expectTypeOf(result.id).toEqualTypeOf<number>()
       expectTypeOf(result.name).toEqualTypeOf<string>()
-      expectTypeOf(result.$synced).toEqualTypeOf<boolean>()
+      expectTypeOf(result.$hasPendingWrites).toEqualTypeOf<boolean>()
       expectTypeOf(result.$origin).toEqualTypeOf<`local` | `remote`>()
       expectTypeOf(result.$key).toEqualTypeOf<string | number>()
       expectTypeOf(result.$collectionId).toEqualTypeOf<string>()
@@ -130,13 +133,15 @@ describe(`includes subquery types`, () => {
       const collection = createLiveQueryCollection((q) =>
         q.from({ p: projects }).select(({ p }) => ({
           id: p.id,
-          issues: q.from({ i: issues }).where(({ i }) => eq(i.projectId, p.id)),
+          issues: include(
+            q.from({ i: issues }).where(({ i }) => eq(i.projectId, p.id)),
+          ),
         })),
       )
 
       const result = collection.toArray[0]!
       expectTypeOf(result.id).toEqualTypeOf<number>()
-      expectTypeOf(result.$synced).toEqualTypeOf<boolean>()
+      expectTypeOf(result.$hasPendingWrites).toEqualTypeOf<boolean>()
       expectTypeOf(result.$origin).toEqualTypeOf<`local` | `remote`>()
       expectTypeOf(result.$key).toEqualTypeOf<string | number>()
       expectTypeOf(result.$collectionId).toEqualTypeOf<string>()
@@ -149,20 +154,24 @@ describe(`includes subquery types`, () => {
       const collection = createLiveQueryCollection((q) =>
         q.from({ p: projects }).select(({ p }) => ({
           id: p.id,
-          issues: q
-            .from({ i: issues })
-            .where(({ i }) => eq(i.projectId, p.id))
-            .select(({ i }) => ({
-              id: i.id,
-              title: i.title,
-            })),
-          comments: q
-            .from({ c: comments })
-            .where(({ c }) => eq(c.issueId, p.id))
-            .select(({ c }) => ({
-              id: c.id,
-              body: c.body,
-            })),
+          issues: include(
+            q
+              .from({ i: issues })
+              .where(({ i }) => eq(i.projectId, p.id))
+              .select(({ i }) => ({
+                id: i.id,
+                title: i.title,
+              })),
+          ),
+          comments: include(
+            q
+              .from({ c: comments })
+              .where(({ c }) => eq(c.issueId, p.id))
+              .select(({ c }) => ({
+                id: c.id,
+                body: c.body,
+              })),
+          ),
         })),
       )
 
@@ -179,27 +188,33 @@ describe(`includes subquery types`, () => {
       const collection = createLiveQueryCollection((q) =>
         q.from({ p: projects }).select(({ p }) => ({
           id: p.id,
-          issues: q
-            .from({ i: issues })
-            .where(({ i }) => eq(i.projectId, p.id))
-            .select(({ i }) => ({
-              id: i.id,
-              title: i.title,
-              comments: q
-                .from({ c: comments })
-                .where(({ c }) => eq(c.issueId, i.id))
-                .select(({ c }) => ({
-                  id: c.id,
-                  body: c.body,
-                })),
-            })),
+          issues: include(
+            q
+              .from({ i: issues })
+              .where(({ i }) => eq(i.projectId, p.id))
+              .select(({ i }) => ({
+                id: i.id,
+                title: i.title,
+                comments: include(
+                  q
+                    .from({ c: comments })
+                    .where(({ c }) => eq(c.issueId, i.id))
+                    .select(({ c }) => ({
+                      id: c.id,
+                      body: c.body,
+                    })),
+                ),
+              })),
+          ),
         })),
       )
 
       const result = collection.toArray[0]!
       expectTypeOf(result.issues.toArray[0]!.id).toEqualTypeOf<number>()
       expectTypeOf(result.issues.toArray[0]!.title).toEqualTypeOf<string>()
-      expectTypeOf(result.issues.toArray[0]!.$synced).toEqualTypeOf<boolean>()
+      expectTypeOf(
+        result.issues.toArray[0]!.$hasPendingWrites,
+      ).toEqualTypeOf<boolean>()
       expectTypeOf(result.issues.toArray[0]!.$origin).toEqualTypeOf<
         `local` | `remote`
       >()
@@ -236,13 +251,14 @@ describe(`includes subquery types`, () => {
       const result = collection.toArray[0]!
       expectTypeOf(result.id).toEqualTypeOf<number>()
       expectTypeOf(result.name).toEqualTypeOf<string>()
-      expectTypeOf(result.$synced).toEqualTypeOf<boolean>()
+      expectTypeOf(result.$hasPendingWrites).toEqualTypeOf<boolean>()
       expectTypeOf(result.$origin).toEqualTypeOf<`local` | `remote`>()
       expectTypeOf(result.$key).toEqualTypeOf<string | number>()
       expectTypeOf(result.$collectionId).toEqualTypeOf<string>()
-      expectTypeOf(result.issues[0]!).toMatchTypeOf<
-        WithVirtualProps<{ id: number; title: string }>
-      >()
+      expectTypeOf(result.issues[0]!).toEqualTypeOf<{
+        id: number
+        title: string
+      }>()
     })
 
     test(`toArray includes without select infers child type`, () => {
@@ -257,7 +273,7 @@ describe(`includes subquery types`, () => {
 
       const result = collection.toArray[0]!
       expectTypeOf(result.id).toEqualTypeOf<number>()
-      expectTypeOf(result.$synced).toEqualTypeOf<boolean>()
+      expectTypeOf(result.$hasPendingWrites).toEqualTypeOf<boolean>()
       expectTypeOf(result.$origin).toEqualTypeOf<`local` | `remote`>()
       expectTypeOf(result.$key).toEqualTypeOf<string | number>()
       expectTypeOf(result.$collectionId).toEqualTypeOf<string>()
@@ -291,17 +307,15 @@ describe(`includes subquery types`, () => {
 
       const result = collection.toArray[0]!
       expectTypeOf(result.id).toEqualTypeOf<number>()
-      expectTypeOf(result.$synced).toEqualTypeOf<boolean>()
+      expectTypeOf(result.$hasPendingWrites).toEqualTypeOf<boolean>()
       expectTypeOf(result.$origin).toEqualTypeOf<`local` | `remote`>()
       expectTypeOf(result.$key).toEqualTypeOf<string | number>()
       expectTypeOf(result.$collectionId).toEqualTypeOf<string>()
-      expectTypeOf(result.issues[0]!).toMatchTypeOf<
-        WithVirtualProps<{
-          id: number
-          title: string
-          comments: Array<WithVirtualProps<{ id: number; body: string }>>
-        }>
-      >()
+      expectTypeOf(result.issues[0]!).toEqualTypeOf<{
+        id: number
+        title: string
+        comments: Array<{ id: number; body: string }>
+      }>()
     })
 
     test(`toArray supports scalar child subquery selects`, () => {
@@ -444,8 +458,8 @@ describe(`includes subquery types`, () => {
       const result = collection.toArray[0]!
       expectTypeOf(result.id).toEqualTypeOf<number>()
       expectTypeOf(result.name).toEqualTypeOf<string>()
-      expectTypeOf(result.issues).toMatchTypeOf<
-        Array<WithVirtualProps<{ id: number; title: string }>>
+      expectTypeOf(result.issues).toEqualTypeOf<
+        Array<{ id: number; title: string }>
       >()
     })
 
@@ -470,8 +484,8 @@ describe(`includes subquery types`, () => {
       const result = collection.toArray[0]!
       expectTypeOf(result.id).toEqualTypeOf<number>()
       expectTypeOf(result.title).toEqualTypeOf<string>()
-      expectTypeOf(result.project).toMatchTypeOf<
-        WithVirtualProps<{ id: number; name: string }> | undefined
+      expectTypeOf(result.project).toEqualTypeOf<
+        { id: number; name: string } | undefined
       >()
     })
 
@@ -537,15 +551,32 @@ describe(`includes subquery types`, () => {
       )
 
       const result = collection.toArray[0]!
-      expectTypeOf(result.issues[0]!).toMatchTypeOf<
-        WithVirtualProps<{
-          id: number
-          title: string
-          firstComment:
-            | WithVirtualProps<{ id: number; body: string }>
-            | undefined
-        }>
-      >()
+      expectTypeOf(result.issues[0]!).toEqualTypeOf<{
+        id: number
+        title: string
+        firstComment: { id: number; body: string } | undefined
+      }>()
     })
+  })
+})
+
+describe(`a subquery in select needs an include function`, () => {
+  test(`rejects a bare subquery field, also when nested`, () => {
+    const projects = createProjectsCollection()
+    const issues = createIssuesCollection()
+    createLiveQueryCollection((q) =>
+      // @ts-expect-error A bare subquery field needs include().
+      q.from({ p: projects }).select(({ p }) => ({
+        issues: q.from({ i: issues }).where(({ i }) => eq(i.projectId, p.id)),
+      })),
+    )
+    createLiveQueryCollection((q) =>
+      // @ts-expect-error A nested bare subquery field needs include().
+      q.from({ p: projects }).select(({ p }) => ({
+        detail: {
+          issues: q.from({ i: issues }).where(({ i }) => eq(i.projectId, p.id)),
+        },
+      })),
+    )
   })
 })

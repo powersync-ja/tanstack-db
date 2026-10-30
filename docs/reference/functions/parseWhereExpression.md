@@ -3,13 +3,11 @@ id: parseWhereExpression
 title: parseWhereExpression
 ---
 
-# Function: parseWhereExpression()
-
 ```ts
 function parseWhereExpression<T>(expr, options): T | null;
 ```
 
-Defined in: [packages/db/src/query/expression-helpers.ts:201](https://github.com/TanStack/db/blob/main/packages/db/src/query/expression-helpers.ts#L201)
+Defined in: [packages/db/src/query/expression-helpers.ts:204](https://github.com/TanStack/db/blob/main/packages/db/src/query/expression-helpers.ts#L204)
 
 Parses a WHERE expression into a custom format using provided handlers.
 

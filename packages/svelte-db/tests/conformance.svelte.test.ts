@@ -1,0 +1,298 @@
+/**
+ * Svelte driver for the shared live-query conformance suite.
+ *
+ * Svelte 5 runes: each mount runs inside a persistent `$effect.root` so the
+ * internal `$effect` keeps updating rune state after mount; `unmount` disposes
+ * the root. Reads happen after `flushSync()`. Realm-sensitive pieces come from
+ * Svelte's `@tanstack/db`.
+ *
+ * All registered laws must pass; the driver has no whole-test waivers.
+ */
+import {
+  coalesce,
+  count,
+  createCollection,
+  createLiveQueryCollection,
+  createOptimisticAction,
+  eq,
+  groupKeys,
+  gt,
+  sum,
+} from '@tanstack/db'
+import { flushSync } from 'svelte'
+import { expect, it } from 'vitest'
+import {
+  mockSyncCollectionOptions,
+  mockSyncCollectionOptionsNoInitialState,
+} from '../../db/tests/utils'
+import { useLiveQuery } from '../src/useLiveQuery.svelte.js'
+import { runSuite } from '../../db/tests/conformance/suite'
+import { createPublicationLog } from '../../db/tests/conformance/publication-log'
+import { makeLaggingSource } from '../../db/tests/conformance/lagging-source'
+import { makeSyncSource } from '../../db/tests/conformance/sync-source'
+import { makeErrorSource as makeSharedErrorSource } from '../../db/tests/conformance/error-source'
+import { expectResultSurface } from '../../db/tests/conformance/result-laws'
+import type { PooledLiveQueries } from '@tanstack/db'
+import type {
+  ConformanceResult,
+  ControllableHandle,
+  DeferredSourceHandle,
+  LiveQueryDriver,
+  LiveQueryHandle,
+  QueryBuild,
+  SourceHandle,
+} from '../../db/tests/conformance/contract'
+
+let sourceSeq = 0
+
+function writer<T extends { id: string }>(collection: any) {
+  return (type: `insert` | `update` | `delete`, value: T) => {
+    collection.utils.begin()
+    collection.utils.write({ type, value })
+    collection.utils.commit()
+  }
+}
+
+function makeSource<T extends { id: string }>(
+  initialData: ReadonlyArray<T>,
+  collectionId?: string,
+): SourceHandle<T> {
+  const collection = createCollection(
+    mockSyncCollectionOptions<T>({
+      id: collectionId ?? `conformance-svelte-${sourceSeq++}`,
+      getKey: (r) => r.id,
+      initialData: [...initialData],
+    }),
+  )
+  const write = writer<T>(collection)
+  return {
+    collection,
+    insert: (row) => write(`insert`, row),
+    update: (row) => write(`update`, row),
+    remove: (row) => write(`delete`, row),
+  }
+}
+
+function makeDeferredSource<
+  T extends { id: string },
+>(): DeferredSourceHandle<T> {
+  const collection = createCollection(
+    mockSyncCollectionOptionsNoInitialState<T>({
+      id: `conformance-svelte-${sourceSeq++}`,
+      getKey: (r) => r.id,
+    }),
+  )
+  collection.startSyncImmediate()
+  const write = writer<T>(collection)
+  return {
+    collection,
+    insert: (row) => write(`insert`, row),
+    update: (row) => write(`update`, row),
+    remove: (row) => write(`delete`, row),
+    emit: (rows) => {
+      collection.utils.begin()
+      rows.forEach((value) => collection.utils.write({ type: `insert`, value }))
+      collection.utils.commit()
+    },
+    markReady: () => collection.utils.markReady(),
+  }
+}
+
+function makePrecreated(
+  build: QueryBuild,
+  opts?: { startSync?: boolean; gcTime?: number },
+) {
+  const collection = createLiveQueryCollection({
+    query: build as any,
+    startSync: opts?.startSync ?? true,
+    gcTime: opts?.gcTime,
+  })
+  return { collection }
+}
+
+function makeErrorSource(kind: `fail` | `crash`) {
+  return makeSharedErrorSource(
+    createCollection,
+    `conformance-svelte-err-${sourceSeq++}`,
+    kind,
+  )
+}
+
+async function settle() {
+  flushSync()
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  flushSync()
+}
+
+function makeHandle(getQuery: () => any, dispose: () => void): LiveQueryHandle {
+  return {
+    collection: () => getQuery()?.collection ?? null,
+    current(): ConformanceResult {
+      const query = getQuery()
+      return expectResultSurface({
+        data: query?.data,
+        state: query?.state,
+        status: query?.status,
+        isReady: query?.isReady,
+        isLoadingError: query?.isLoadingError,
+        isCrashed: query?.isCrashed,
+        isSyncError: query?.isSyncError,
+        health: query?.health,
+        // svelte-db exposes no `isEnabled`; derive it from status (status-derived).
+        isEnabled: query?.status !== `disabled`,
+      })
+    },
+    flush: settle,
+    async apply(fn: () => void) {
+      fn()
+      await settle()
+    },
+    unmount() {
+      dispose()
+    },
+  }
+}
+
+function mount(build: QueryBuild) {
+  let query: any
+  const dispose = $effect.root(() => {
+    query = useLiveQuery(build as any)
+  })
+  return makeHandle(() => query, dispose)
+}
+
+function mountCollection(collection: any) {
+  let query: any
+  const dispose = $effect.root(() => {
+    query = useLiveQuery(collection)
+  })
+  return makeHandle(() => query, dispose)
+}
+
+function mountConfig(
+  build: QueryBuild,
+  opts?: { gcTime?: number; pool?: PooledLiveQueries },
+) {
+  let query: any
+  const dispose = $effect.root(() => {
+    query = useLiveQuery({ query: build, ...opts } as any)
+  })
+  return makeHandle(() => query, dispose)
+}
+
+function mountDisabled() {
+  // Svelte's disabled convention: the query callback returns null.
+  let query: any
+  const dispose = $effect.root(() => {
+    query = useLiveQuery(() => null as any)
+  })
+  return makeHandle(() => query, dispose)
+}
+
+function mountControllable<P>(
+  build: (q: any, param: P) => any,
+  initial: P,
+  opts?: { pool?: PooledLiveQueries },
+): ControllableHandle<P> {
+  let param = $state(initial)
+  let query: any
+  const published = createPublicationLog()
+  const dispose = $effect.root(() => {
+    query =
+      opts?.pool !== undefined
+        ? useLiveQuery(
+            { query: (q: any) => build(q, param), pool: opts.pool } as any,
+            [() => param],
+          )
+        : useLiveQuery((q: any) => build(q, param), [() => param])
+    // Svelte renders the value each pre-effect run reads.
+    $effect.pre(() => {
+      published.record(query.data, query.state)
+    })
+  })
+  const handle = makeHandle(() => query, dispose)
+  return {
+    ...handle,
+    publications: published.values,
+    statePublications: published.stateValues,
+    async setParam(next: P) {
+      param = next
+      // The first paint after the change: the framework has flushed its
+      // reactive work, but no later task has run.
+      flushSync()
+      published.record(query.data, query.state)
+      await settle()
+    },
+  }
+}
+
+const svelteDriver: LiveQueryDriver = {
+  name: `svelte`,
+  // Reactive reads decide when the query compiles again.
+  comparesQueryIdentity: false,
+  disabledRepresentation: `empty-reactive`,
+  ops: { eq, gt, count, sum, coalesce, groupKeys, createOptimisticAction },
+  makeSource,
+  makeDeferredSource,
+  makeLaggingSource: <T extends { id: string }>() =>
+    makeLaggingSource<T>(
+      createCollection,
+      `conformance-svelte-lagging-${sourceSeq++}`,
+    ),
+  makeSyncSource: <T extends { id: string }>(data: ReadonlyArray<T>) =>
+    makeSyncSource<T>(
+      createCollection,
+      `conformance-svelte-health-${sourceSeq++}`,
+      data,
+    ),
+  makePrecreated,
+  makeErrorSource,
+  mount,
+  mountControllable,
+  mountCollection,
+  mountConfig,
+  mountDisabled,
+  knownGaps: [],
+  features: { serverSnapshot: false, suspense: false, pooledEqFilters: true },
+}
+
+runSuite(svelteDriver)
+it(`preserves raw result types through the actual driver reader`, () => {
+  const raw: Record<string, unknown> = {
+    data: [{ id: `a`, value: undefined }],
+    state: new Map(),
+    status: `disabled`,
+    isReady: false,
+    isLoadingError: false,
+    isCrashed: false,
+    isSyncError: false,
+    isEnabled: false,
+  }
+  const handle = makeHandle(
+    () => raw,
+    () => {},
+  )
+  try {
+    const healthy = handle.current()
+    expect(healthy.data).toBe(raw.data)
+    expect(healthy.state).toBe(raw.state)
+    expect(healthy.isReady).toBe(false)
+    expect(healthy.isLoadingError).toBe(false)
+    expect(healthy.isEnabled).toBe(false)
+    for (const key of [`status`, `isReady`, `isLoadingError`]) {
+      const original = raw[key]
+      delete raw[key]
+      expect(() => handle.current()).toThrowError(new RegExp(`raw ${key}`))
+      for (const invalid of key === `status`
+        ? [undefined, 0]
+        : [undefined, 0, ``]) {
+        raw[key] = invalid
+        expect(() => handle.current()).toThrowError(new RegExp(`raw ${key}`))
+      }
+      raw[key] = original
+      expect(handle.current()[key as keyof ConformanceResult]).toBe(original)
+    }
+  } finally {
+    handle.unmount()
+  }
+})

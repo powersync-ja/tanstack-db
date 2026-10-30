@@ -1,3 +1,20 @@
+<div align="center">
+  <picture>
+    <source
+      media="(prefers-color-scheme: dark)"
+      srcset="https://tanstack.com/api/readme/db.png?title=TanStack%20Angular%20DB&theme=dark"
+    />
+    <source
+      media="(prefers-color-scheme: light)"
+      srcset="https://tanstack.com/api/readme/db.png?title=TanStack%20Angular%20DB"
+    />
+    <img
+      src="https://tanstack.com/api/readme/db.png?title=TanStack%20Angular%20DB"
+      alt="TanStack Angular DB"
+      width="900"
+    />
+  </picture>
+</div>
 # @tanstack/angular-db
 
 Angular hooks for TanStack DB. See [TanStack/db](https://github.com/TanStack/db) for more details.
@@ -209,11 +226,16 @@ Template Usage
 Use Angular's new control flow syntax for best performance:
 
     @if (query.isReady()) {
+      @if (query.isSyncError()) {
+        <div>Data may be out of date</div>
+      }
       @for (item of query.data(); track item.id) {
         <div>{{ item.text }}</div>
       }
-    } @else if (query.isError()) {
+    } @else if (query.isLoadingError()) {
       <div>Error loading data</div>
+    } @else if (query.isCrashed()) {
+      <div>Local storage failed</div>
     } @else {
       <div>Loading...</div>
     }
@@ -257,12 +279,15 @@ An object with Angular signals:
 - data: Signal<Array<T>> - Array of query results, automatically updates
 - state: Signal<Map<Key, T>> - Map of results by key, automatically updates
 - collection: Signal<Collection> - The underlying collection instance
-- status: Signal<CollectionStatus> - Current status ('idle' | 'loading' | 'ready' | 'error' | 'cleaned-up')
+- status: Signal<CollectionStatus | 'disabled'> - Current status ('idle' | 'loading' | 'ready' | 'error' | 'crashed' | 'cleaned-up' | 'disabled')
 - isLoading: Signal<boolean> - true when status is 'loading'
 - isReady: Signal<boolean> - true when status is 'ready'
 - isIdle: Signal<boolean> - true when status is 'idle'
-- isError: Signal<boolean> - true when status is 'error'
+- isLoadingError: Signal<boolean> - true when status is 'error': the first load failed
+- isCrashed: Signal<boolean> - true when status is 'crashed': local storage broke
 - isCleanedUp: Signal<boolean> - true when status is 'cleaned-up'
+- isSyncError: Signal<boolean> - true when status is 'ready' and the health tree has a problem
+- health: Signal<HealthNode | undefined> - The health tree: one node for the query and one per source; undefined for a disabled query
 
 Parameters
 

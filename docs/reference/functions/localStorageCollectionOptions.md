@@ -3,20 +3,22 @@ id: localStorageCollectionOptions
 title: localStorageCollectionOptions
 ---
 
-# Function: localStorageCollectionOptions()
-
 ## Call Signature
 
 ```ts
 function localStorageCollectionOptions<T, TKey>(config): CollectionConfig<InferSchemaOutput<T>, TKey, T, LocalStorageCollectionUtils> & object;
 ```
 
-Defined in: [packages/db/src/local-storage.ts:316](https://github.com/TanStack/db/blob/main/packages/db/src/local-storage.ts#L316)
+Defined in: [packages/db/src/local-storage.ts:496](https://github.com/TanStack/db/blob/main/packages/db/src/local-storage.ts#L496)
 
 Creates localStorage collection options for use with a standard Collection
 
 This function creates a collection that persists data to localStorage/sessionStorage
-and synchronizes changes across browser tabs using storage events.
+and synchronizes changes across browser tabs using storage events. Active
+Collections sharing this Storage object and storage key also synchronize
+writes in the same tab, without waiting for a browser event.
+Create fresh options for each direct `createCollection()` call. One options
+object contains state owned by one Collection and cannot be reused.
 
 **Fallback Behavior:**
 
@@ -28,9 +30,9 @@ be shared across tabs when using the in-memory fallback.
 
 **Using with Manual Transactions:**
 
-For manual transactions, you must call `utils.acceptMutations()` in your transaction's `mutationFn`
-to persist changes made during `tx.mutate()`. This is necessary because local-storage collections
-don't participate in the standard mutation handler flow for manual transactions.
+For manual transactions, call `utils.acceptMutations()` in your transaction's `mutationFn`
+to persist changes made during `tx.mutate()`. The transaction receipt waits for this work even
+when the call is not awaited. Await it when later mutationFn work depends on the storage write.
 
 ### Type Parameters
 
@@ -108,7 +110,7 @@ const tx = createTransaction({
     await api.updateUserProfile({ settings: settingsMutations[0]?.modified })
 
     // Persist local-storage mutations after API success
-    localSettings.utils.acceptMutations(transaction)
+    await localSettings.utils.acceptMutations(transaction)
   }
 })
 
@@ -126,12 +128,16 @@ await tx.commit()
 function localStorageCollectionOptions<T, TKey>(config): CollectionConfig<T, TKey, never, LocalStorageCollectionUtils> & object;
 ```
 
-Defined in: [packages/db/src/local-storage.ts:336](https://github.com/TanStack/db/blob/main/packages/db/src/local-storage.ts#L336)
+Defined in: [packages/db/src/local-storage.ts:516](https://github.com/TanStack/db/blob/main/packages/db/src/local-storage.ts#L516)
 
 Creates localStorage collection options for use with a standard Collection
 
 This function creates a collection that persists data to localStorage/sessionStorage
-and synchronizes changes across browser tabs using storage events.
+and synchronizes changes across browser tabs using storage events. Active
+Collections sharing this Storage object and storage key also synchronize
+writes in the same tab, without waiting for a browser event.
+Create fresh options for each direct `createCollection()` call. One options
+object contains state owned by one Collection and cannot be reused.
 
 **Fallback Behavior:**
 
@@ -143,9 +149,9 @@ be shared across tabs when using the in-memory fallback.
 
 **Using with Manual Transactions:**
 
-For manual transactions, you must call `utils.acceptMutations()` in your transaction's `mutationFn`
-to persist changes made during `tx.mutate()`. This is necessary because local-storage collections
-don't participate in the standard mutation handler flow for manual transactions.
+For manual transactions, call `utils.acceptMutations()` in your transaction's `mutationFn`
+to persist changes made during `tx.mutate()`. The transaction receipt waits for this work even
+when the call is not awaited. Await it when later mutationFn work depends on the storage write.
 
 ### Type Parameters
 
@@ -223,7 +229,7 @@ const tx = createTransaction({
     await api.updateUserProfile({ settings: settingsMutations[0]?.modified })
 
     // Persist local-storage mutations after API success
-    localSettings.utils.acceptMutations(transaction)
+    await localSettings.utils.acceptMutations(transaction)
   }
 })
 

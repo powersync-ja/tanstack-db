@@ -6,6 +6,7 @@ import {
   createLiveQueryCollection,
   eq,
   gt,
+  pooledLiveQueries,
 } from '@tanstack/db'
 import { injectLiveQuery } from '../src/index'
 import { mockSyncCollectionOptions } from '../../db/tests/utils'
@@ -80,12 +81,23 @@ function createMockCollection<T extends object, K extends string | number>(
   }
 
   let status: CollectionStatus = initialStatus
+  let stateRevision = 0
   const subs = new Set<(changes: Array<any>) => void>()
   const readySubs = new Set<() => void>()
+  const statusSubs = new Set<(event: any) => void>()
   const id = `mock-col-` + Math.random().toString(36).slice(2)
 
+  // Mirrors the real collection contract: committed changes advance the
+  // state revision before they are emitted.
   const notify = (changes: Array<any> = []) => {
+    if (changes.length > 0) stateRevision++
     for (const cb of subs) cb(changes)
+  }
+
+  const emitStatusChange = (previousStatus: CollectionStatus) => {
+    for (const cb of statusSubs) {
+      cb({ type: `status:change`, previousStatus, status })
+    }
   }
 
   const notifyReady = () => {
@@ -97,6 +109,13 @@ function createMockCollection<T extends object, K extends string | number>(
     get status() {
       return status
     },
+    get _stateRevision() {
+      return stateRevision
+    },
+    on: (event: string, cb: (e: any) => void) => {
+      if (event === `status:change`) statusSubs.add(cb)
+      return () => statusSubs.delete(cb)
+    },
     entries: () => Array.from(map.entries()),
     values: () => Array.from(map.values()),
     get: (key: K) => map.get(key),
@@ -104,6 +123,8 @@ function createMockCollection<T extends object, K extends string | number>(
     size: () => map.size,
     subscribeChanges: (cb: (changes: Array<any>) => void) => {
       subs.add(cb)
+      // Real collections start sync when the first subscriber attaches.
+      api.startSyncImmediate()
       return {
         unsubscribe: () => subs.delete(cb),
       }
@@ -118,26 +139,33 @@ function createMockCollection<T extends object, K extends string | number>(
     },
     preload: () => Promise.resolve(),
     startSyncImmediate: () => {
-      const wasNotReady = status !== `ready`
+      const previousStatus = status
       if (status === `idle`) {
         status = `ready`
-      }
-      if (wasNotReady && status === `ready`) {
+        emitStatusChange(previousStatus)
         setTimeout(notifyReady, 0)
       }
     },
     __setStatus: (s: CollectionStatus) => {
+      const previousStatus = status
       const wasNotReady = status !== `ready`
       status = s
-      notify([])
+      emitStatusChange(previousStatus)
       if (wasNotReady && status === `ready`) {
         setTimeout(notifyReady, 0)
       }
     },
     __replaceAll: (rows: Array<T & Record<`id`, K>>) => {
+      const changes: Array<any> = []
+      for (const [key, value] of map.entries()) {
+        changes.push({ type: `delete`, key, value })
+      }
       map.clear()
-      for (const r of rows) map.set(r.id, r)
-      notify([])
+      for (const r of rows) {
+        map.set(r.id, r)
+        changes.push({ type: `insert`, key: r.id, value: r })
+      }
+      notify(changes)
     },
     __upsert: (row: T & Record<`id`, K>) => {
       const isUpdate = map.has(row.id)
@@ -226,7 +254,7 @@ describe(`injectLiveQuery`, () => {
       expect(result.isReady()).toBe(true)
       expect(result.isLoading()).toBe(false)
       expect(result.isIdle()).toBe(false)
-      expect(result.isError()).toBe(false)
+      expect(result.isLoadingError()).toBe(false)
       expect(result.isCleanedUp()).toBe(false)
     })
   })
@@ -270,7 +298,7 @@ describe(`injectLiveQuery`, () => {
         [],
         `idle`,
       )
-      const { status, isReady, isLoading, isError, isCleanedUp } =
+      const { status, isReady, isLoading, isLoadingError, isCleanedUp } =
         injectLiveQuery(col)
 
       await waitForAngularUpdate()
@@ -288,7 +316,7 @@ describe(`injectLiveQuery`, () => {
       await waitForAngularUpdate()
 
       expect(status()).toBe(`error`)
-      expect(isError()).toBe(true)
+      expect(isLoadingError()).toBe(true)
 
       col.__setStatus(`cleaned-up`)
       await waitForAngularUpdate()
@@ -583,6 +611,48 @@ describe(`injectLiveQuery`, () => {
       await waitForAngularUpdate()
 
       expect(res.collection()).toBe(col)
+    })
+  })
+
+  it(`pools a reactive params query only when it passes pooledLiveQueries`, async () => {
+    await TestBed.runInInjectionContext(async () => {
+      const source = (id: string) =>
+        createCollection(
+          mockSyncCollectionOptions<Person>({
+            id,
+            getKey: (person: Person) => person.id,
+            initialData: initialPersons,
+          }),
+        )
+      const query =
+        (collection: Collection<Person>) =>
+        ({ params, q }: { params: { team: number }; q: any }) =>
+          q
+            .from({ persons: collection })
+            .where(({ persons }: any) => eq(persons.team, `team${params.team}`))
+      const pooledSource = source(`reactive-params-pooled-angular`)
+      const compiledSource = source(`reactive-params-compiled-angular`)
+      const results = [1, 2].flatMap((team) => [
+        injectLiveQuery({
+          params: () => ({ team }),
+          query: query(pooledSource),
+          pool: pooledLiveQueries,
+        }),
+        injectLiveQuery({
+          params: () => ({ team }),
+          query: query(compiledSource),
+        }),
+      ])
+
+      await waitForAngularUpdate()
+      for (const result of results) result.data()
+
+      // Pooled queries of one shape share the partition's one subscription.
+      expect(pooledSource.subscriberCount).toBe(1)
+      expect(compiledSource.subscriberCount).toBe(2)
+      const ids = (index: number) =>
+        (results[index]!.data() as Array<Person>).map((row) => row.id)
+      expect(ids(0)).toEqual(ids(1))
     })
   })
 
@@ -1102,7 +1172,7 @@ describe(`injectLiveQuery`, () => {
         expect(result.isReady()).toBe(true)
         expect(result.isLoading()).toBe(false)
         expect(result.isIdle()).toBe(false)
-        expect(result.isError()).toBe(false)
+        expect(result.isLoadingError()).toBe(false)
         expect(result.collection()).toBeNull()
         expect(result.data()).toEqual([])
         expect(result.state().size).toBe(0)
@@ -1154,7 +1224,7 @@ describe(`injectLiveQuery`, () => {
         expect(result.isReady()).toBe(true)
         expect(result.isLoading()).toBe(false)
         expect(result.isIdle()).toBe(false)
-        expect(result.isError()).toBe(false)
+        expect(result.isLoadingError()).toBe(false)
         expect(result.collection()).toBeNull()
         expect(result.data()).toEqual([])
         expect(result.state().size).toBe(0)
@@ -1178,6 +1248,48 @@ describe(`injectLiveQuery`, () => {
         expect(result.status()).toBe(`disabled`)
         expect(result.isReady()).toBe(true)
         expect(result.collection()).toBeNull()
+        expect(result.data()).toEqual([])
+      })
+    })
+
+    /**
+     * Driver: public `injectLiveQuery` with an Angular signal. Each
+     * `waitForAngularUpdate` is an observation cut after disabled, enabled, and
+     * disabled-again updates. This test observes status and public result data;
+     * array-query Collection/state behavior remains in shared conformance.
+     */
+    it(`keeps conditional findOne data empty while disabled`, async () => {
+      await TestBed.runInInjectionContext(async () => {
+        const collection = createCollection(
+          mockSyncCollectionOptions<Person>({
+            id: `disabled-find-one-angular`,
+            getKey: (person: Person) => person.id,
+            initialData: initialPersons,
+          }),
+        )
+        const enabled = signal(false)
+        const result = injectLiveQuery({
+          params: () => ({ enabled: enabled() }),
+          query: ({ params, q }) =>
+            params.enabled
+              ? q
+                  .from({ collection })
+                  .where(({ collection: person }) => eq(person.id, `3`))
+                  .findOne()
+              : null,
+        })
+
+        await waitForAngularUpdate()
+        expect(result.status()).toBe(`disabled`)
+        expect(result.data()).toEqual([])
+
+        enabled.set(true)
+        await waitForAngularUpdate()
+        expect(result.data()).toMatchObject({ id: `3` })
+
+        enabled.set(false)
+        await waitForAngularUpdate()
+        expect(result.status()).toBe(`disabled`)
         expect(result.data()).toEqual([])
       })
     })

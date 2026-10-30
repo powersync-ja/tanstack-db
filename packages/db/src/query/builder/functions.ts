@@ -1,48 +1,29 @@
-import { Aggregate, Func } from '../ir'
+import { Aggregate, Func, isBasicOrAggregateExpression } from '../ir'
+import { codedMessage, devBuild } from '../../error-message.js'
+import { grouping } from '../compiler/grouping.js'
 import { isRefProxy, toExpression } from './ref-proxy.js'
+import { registerWrapper } from './wrapper-identity.js'
 import type { BasicExpression } from '../ir'
+import type { IncludesRuntime } from '../live/includes-runtime.js'
 import type { RefProxy } from './ref-proxy.js'
-import type { SingleResult } from '../../types.js'
-import type {
-  Context,
-  GetRawResult,
-  RefLeaf,
-  StringifiableScalar,
-} from './types.js'
-import type { QueryBuilder } from './index.js'
+import type { Context, RefLeaf, StringifiableScalar } from './types.js'
+import type { BaseQueryBuilder, QueryBuilder } from './index.js'
 
 type StringRef =
-  | RefLeaf<string>
-  | RefLeaf<string | null>
-  | RefLeaf<string | undefined>
+  RefLeaf<string> | RefLeaf<string | null> | RefLeaf<string | undefined>
 type StringRefProxy =
-  | RefProxy<string>
-  | RefProxy<string | null>
-  | RefProxy<string | undefined>
+  RefProxy<string> | RefProxy<string | null> | RefProxy<string | undefined>
 type StringBasicExpression =
   | BasicExpression<string>
   | BasicExpression<string | null>
   | BasicExpression<string | undefined>
 type StringLike =
-  | StringRef
-  | StringRefProxy
-  | StringBasicExpression
-  | string
-  | null
-  | undefined
+  StringRef | StringRefProxy | StringBasicExpression | string | null | undefined
 
 type ComparisonOperand<T> =
-  | RefProxy<T>
-  | RefLeaf<T>
-  | T
-  | BasicExpression<T>
-  | undefined
-  | null
+  RefProxy<T> | RefLeaf<T> | T | BasicExpression<T> | undefined | null
 type ComparisonOperandPrimitive<T extends string | number | boolean> =
-  | T
-  | BasicExpression<T>
-  | undefined
-  | null
+  T | BasicExpression<T> | undefined | null
 
 // Helper type for values that can be lowered to expressions.
 type ExpressionLike =
@@ -59,12 +40,13 @@ type ExpressionLike =
   | undefined
   | Array<unknown>
 
-type CaseWhenValue =
+export type CaseWhenValue =
   | ExpressionLike
-  | QueryBuilder<any>
+  | IncludeWrapper<any>
   | ToArrayWrapper<any>
   | ConcatToArrayWrapper<any>
-  | Record<string, any>
+  // A select object. A query builder is not one: wrap it in include().
+  | (Record<string, any> & { _bindCollectionSources?: never })
 
 type ExtractCaseWhenValue<T> =
   T extends CaseWhenWrapper<infer TResult> ? TResult : T
@@ -91,13 +73,35 @@ type ExtractType<T> =
         ? U
         : T
 
-// Helper type to determine aggregate return type based on input nullability
-type AggregateReturnType<T> =
-  ExtractType<T> extends infer U
-    ? U extends number | undefined | null | Date | bigint | string
-      ? Aggregate<U>
-      : Aggregate<number | undefined | null | Date | bigint | string>
-    : Aggregate<number | undefined | null | Date | bigint | string>
+type IsAny<T> = 0 extends 1 & T ? true : false
+
+type AggregateArgument<T, Domain> = T &
+  (IsAny<ExtractType<T>> extends true
+    ? unknown
+    : [Exclude<ExtractType<T>, null | undefined>] extends [never]
+      ? never
+      : [Exclude<ExtractType<T>, null | undefined>] extends [Domain]
+        ? unknown
+        : never)
+
+type OrderableAggregateValue = number | Date | bigint | string
+type AggregateWrapper<T> = RefProxy<T> | RefLeaf<T> | BasicExpression<T>
+
+// Constrained overloads compose through supported generics; these conditional
+// fallbacks validate concrete optional/nullish unions and reject unknown.
+type NumericAggregateWrapperArgument<T> = AggregateArgument<
+  AggregateWrapper<T>,
+  number
+>
+type OrderableAggregateWrapperArgument<T> = AggregateArgument<
+  AggregateWrapper<T>,
+  OrderableAggregateValue
+>
+type NumericAggregateArgument<T> = AggregateArgument<T, number>
+type OrderableAggregateArgument<T> = AggregateArgument<
+  T,
+  OrderableAggregateValue
+>
 
 // Helper type to determine string function return type based on input nullability
 type StringFunctionReturnType<T> =
@@ -125,31 +129,12 @@ type MapToNumber<T> = T extends string | Array<any>
       ? null
       : T
 
-// Helper type for binary numeric operations (combines nullability of both operands)
-type BinaryNumericReturnType<T1, T2> =
-  ExtractType<T1> extends infer U1
-    ? ExtractType<T2> extends infer U2
-      ? U1 extends number
-        ? U2 extends number
-          ? BasicExpression<number>
-          : U2 extends number | undefined
-            ? BasicExpression<number | undefined>
-            : U2 extends number | null
-              ? BasicExpression<number | null>
-              : BasicExpression<number | undefined | null>
-        : U1 extends number | undefined
-          ? U2 extends number
-            ? BasicExpression<number | undefined>
-            : U2 extends number | undefined
-              ? BasicExpression<number | undefined>
-              : BasicExpression<number | undefined | null>
-          : U1 extends number | null
-            ? U2 extends number
-              ? BasicExpression<number | null>
-              : BasicExpression<number | undefined | null>
-            : BasicExpression<number | undefined | null>
-      : BasicExpression<number | undefined | null>
-    : BasicExpression<number | undefined | null>
+// Helper type for binary numeric operations.
+// Runtime coalesces nullish operands to 0 for these operations, so nullable
+// operands don't make the result nullable.
+type BinaryNumericReturnType = BasicExpression<number>
+
+type DivideReturnType = BasicExpression<number | null>
 
 // Operators
 
@@ -331,10 +316,12 @@ export function concat(
   if (toArrayArg) {
     if (args.length !== 1) {
       throw new Error(
-        `concat(toArray(...)) currently supports only a single toArray(...) argument`,
+        devBuild() && process.env.NODE_ENV !== `production`
+          ? `concat(toArray(...)) currently supports only a single toArray(...) argument`
+          : codedMessage(110),
       )
     }
-    return new ConcatToArrayWrapper(toArrayArg.query)
+    return new ConcatToArrayWrapper(toArrayArg.query, toArrayArg.runtime)
   }
 
   return new Func(
@@ -409,9 +396,11 @@ export function coalesce<T extends [ExpressionLike, ...Array<ExpressionLike>]>(
  * ```ts
  * caseWhen(gt(user.age, 18), {
  *   ...user,
- *   posts: q
- *     .from({ post: postsCollection })
- *     .where(({ post }) => eq(post.userId, user.id)),
+ *   posts: include(
+ *     q
+ *       .from({ post: postsCollection })
+ *       .where(({ post }) => eq(post.userId, user.id)),
+ *   ),
  * })
  * ```
  */
@@ -596,14 +585,22 @@ export function caseWhen<
 ): any
 export function caseWhen(...args: Array<CaseWhenValue>): any {
   if (args.length < 2) {
-    throw new Error(`caseWhen() requires at least two arguments`)
+    throw new Error(
+      devBuild() && process.env.NODE_ENV !== `production`
+        ? `caseWhen() requires at least two arguments`
+        : codedMessage(111),
+    )
   }
 
   const pairCount = Math.floor(args.length / 2)
   for (let i = 0; i < pairCount; i++) {
     const condition = args[i * 2]
     if (!isConditionValue(condition)) {
-      throw new Error(`caseWhen() conditions must be expression-like values`)
+      throw new Error(
+        devBuild() && process.env.NODE_ENV !== `production`
+          ? `caseWhen() conditions must be expression-like values`
+          : codedMessage(112),
+      )
     }
   }
 
@@ -620,45 +617,103 @@ export function caseWhen(...args: Array<CaseWhenValue>): any {
 export function add<T1 extends ExpressionLike, T2 extends ExpressionLike>(
   left: T1,
   right: T2,
-): BinaryNumericReturnType<T1, T2> {
+): BinaryNumericReturnType {
   return new Func(`add`, [
     toExpression(left),
     toExpression(right),
-  ]) as BinaryNumericReturnType<T1, T2>
+  ]) as BinaryNumericReturnType
+}
+
+export function subtract<T1 extends ExpressionLike, T2 extends ExpressionLike>(
+  left: T1,
+  right: T2,
+): BinaryNumericReturnType {
+  return new Func(`subtract`, [
+    toExpression(left),
+    toExpression(right),
+  ]) as BinaryNumericReturnType
+}
+
+export function multiply<T1 extends ExpressionLike, T2 extends ExpressionLike>(
+  left: T1,
+  right: T2,
+): BinaryNumericReturnType {
+  return new Func(`multiply`, [
+    toExpression(left),
+    toExpression(right),
+  ]) as BinaryNumericReturnType
+}
+
+export function divide<T1 extends ExpressionLike, T2 extends ExpressionLike>(
+  left: T1,
+  right: T2,
+): DivideReturnType {
+  return new Func(`divide`, [
+    toExpression(left),
+    toExpression(right),
+  ]) as DivideReturnType
 }
 
 // Aggregates
 
 export function count(arg: ExpressionLike): Aggregate<number> {
-  return new Aggregate(`count`, [toExpression(arg)])
+  return new Aggregate(`count`, [toExpression(arg)], grouping)
 }
 
-export function avg<T extends ExpressionLike>(arg: T): AggregateReturnType<T> {
-  return new Aggregate(`avg`, [toExpression(arg)]) as AggregateReturnType<T>
+export function avg<T extends number>(arg: T): Aggregate<number>
+export function avg<T>(
+  arg: NumericAggregateWrapperArgument<T>,
+): Aggregate<number>
+export function avg<T extends ExpressionLike>(
+  arg: NumericAggregateArgument<T>,
+): Aggregate<number>
+export function avg(arg: ExpressionLike): Aggregate<number> {
+  return new Aggregate(`avg`, [toExpression(arg)], grouping)
 }
 
-export function sum<T extends ExpressionLike>(arg: T): AggregateReturnType<T> {
-  return new Aggregate(`sum`, [toExpression(arg)]) as AggregateReturnType<T>
+export function sum<T extends number>(arg: T): Aggregate<number>
+export function sum<T>(
+  arg: NumericAggregateWrapperArgument<T>,
+): Aggregate<number>
+export function sum<T extends ExpressionLike>(
+  arg: NumericAggregateArgument<T>,
+): Aggregate<number>
+export function sum(arg: ExpressionLike): Aggregate<number> {
+  return new Aggregate(`sum`, [toExpression(arg)], grouping)
 }
 
-export function min<T extends ExpressionLike>(arg: T): AggregateReturnType<T> {
-  return new Aggregate(`min`, [toExpression(arg)]) as AggregateReturnType<T>
+export function min<T extends OrderableAggregateValue>(arg: T): Aggregate<T>
+export function min<T>(arg: OrderableAggregateWrapperArgument<T>): Aggregate<T>
+export function min<T extends ExpressionLike>(
+  arg: OrderableAggregateArgument<T>,
+): Aggregate<ExtractType<T>>
+export function min(arg: ExpressionLike): Aggregate {
+  return new Aggregate(`min`, [toExpression(arg)], grouping)
 }
 
-export function max<T extends ExpressionLike>(arg: T): AggregateReturnType<T> {
-  return new Aggregate(`max`, [toExpression(arg)]) as AggregateReturnType<T>
+export function max<T extends OrderableAggregateValue>(arg: T): Aggregate<T>
+export function max<T>(arg: OrderableAggregateWrapperArgument<T>): Aggregate<T>
+export function max<T extends ExpressionLike>(
+  arg: OrderableAggregateArgument<T>,
+): Aggregate<ExtractType<T>>
+export function max(arg: ExpressionLike): Aggregate {
+  return new Aggregate(`max`, [toExpression(arg)], grouping)
 }
 
 /**
  * List of comparison function names that can be used with indexes
  */
-export const comparisonFunctions = [
+export const indexableOperations = [
   `eq`,
   `gt`,
   `gte`,
   `lt`,
   `lte`,
   `in`,
+] as const
+
+export const comparisonFunctions = [
+  ...indexableOperations,
   `like`,
   `ilike`,
 ] as const
@@ -690,6 +745,9 @@ export const operators = [
   `concat`,
   // Numeric functions
   `add`,
+  `subtract`,
+  `multiply`,
+  `divide`,
   // Utility functions
   `coalesce`,
   `caseWhen`,
@@ -707,21 +765,33 @@ export class ToArrayWrapper<_T = unknown> {
   readonly __brand = `ToArrayWrapper` as const
   declare readonly _type: `toArray`
   declare readonly _result: _T
-  constructor(public readonly query: QueryBuilder<any>) {}
+  constructor(
+    public readonly query: QueryBuilder<any>,
+    public readonly runtime: IncludesRuntime,
+  ) {
+    registerWrapper(this, `toArray()`)
+  }
 }
 
 export class ConcatToArrayWrapper<_T = unknown> {
   readonly __brand = `ConcatToArrayWrapper` as const
   declare readonly _type: `concatToArray`
   declare readonly _result: _T
-  constructor(public readonly query: QueryBuilder<any>) {}
+  constructor(
+    public readonly query: QueryBuilder<any>,
+    public readonly runtime: IncludesRuntime,
+  ) {
+    registerWrapper(this, `concat(toArray())`)
+  }
 }
 
 export class CaseWhenWrapper<_T = any> {
   readonly __brand = `CaseWhenWrapper` as const
   declare readonly _type: `caseWhen`
   readonly _result?: _T
-  constructor(public readonly args: Array<CaseWhenValue>) {}
+  constructor(public readonly args: Array<CaseWhenValue>) {
+    registerWrapper(this, `caseWhen()`)
+  }
 }
 
 export class MaterializeWrapper<
@@ -732,13 +802,12 @@ export class MaterializeWrapper<
   declare readonly _type: `materialize`
   declare readonly _result: _T
   declare readonly _isSingle: _IsSingle
-  constructor(public readonly query: QueryBuilder<any>) {}
-}
-
-export function toArray<TContext extends Context>(
-  query: QueryBuilder<TContext>,
-): ToArrayWrapper<GetRawResult<TContext>> {
-  return new ToArrayWrapper(query)
+  constructor(
+    public readonly query: QueryBuilder<any>,
+    public readonly runtime: IncludesRuntime,
+  ) {
+    registerWrapper(this, `materialize()`)
+  }
 }
 
 function caseWhenHasOnlyExpressionValues(args: Array<CaseWhenValue>): boolean {
@@ -764,7 +833,7 @@ function getCaseWhenValueIndexes(argCount: number): Array<number> {
 
 function isExpressionValue(value: CaseWhenValue | undefined): boolean {
   if (isRefProxy(value)) return true
-  if (value instanceof Aggregate || value instanceof Func) return true
+  if (isBasicOrAggregateExpression(value)) return true
   if (value == null) return true
   if (
     typeof value === `string` ||
@@ -775,25 +844,6 @@ function isExpressionValue(value: CaseWhenValue | undefined): boolean {
     return true
   }
   if (value instanceof Date || Array.isArray(value)) return true
-  if (typeof value === `object`) {
-    const candidate = value as {
-      type?: unknown
-      args?: unknown
-      name?: unknown
-      path?: unknown
-      value?: unknown
-    }
-
-    if (
-      (candidate.type === `agg` || candidate.type === `func`) &&
-      typeof candidate.name === `string` &&
-      Array.isArray(candidate.args)
-    ) {
-      return true
-    }
-    if (candidate.type === `ref` && Array.isArray(candidate.path)) return true
-    if (candidate.type === `val` && `value` in candidate) return true
-  }
   return false
 }
 
@@ -801,41 +851,13 @@ function isConditionValue(value: CaseWhenValue | undefined): boolean {
   return isExpressionValue(value) && !Array.isArray(value)
 }
 
-/**
- * Materialize an includes subquery into a plain value on the parent row.
- *
- * - For multi-row subqueries, the parent receives an `Array<T>` snapshot
- *   (equivalent to `toArray()`).
- * - For `findOne()` subqueries, the parent receives a single `T | undefined`
- *   value — `undefined` when no child matches.
- *
- * The snapshot updates reactively: parent rows re-emit when the underlying
- * children change.
- *
- * @example
- * ```ts
- * // Multi-row: produces Array<Issue> on each project
- * select(({ p }) => ({
- *   ...p,
- *   issues: materialize(
- *     q.from({ i: issues }).where(({ i }) => eq(i.projectId, p.id)),
- *   ),
- * }))
- *
- * // Singleton: produces Author | undefined on each post
- * select(({ p }) => ({
- *   ...p,
- *   author: materialize(
- *     q.from({ a: authors }).where(({ a }) => eq(a.id, p.authorId)).findOne(),
- *   ),
- * }))
- * ```
- */
-export function materialize<TContext extends Context>(
-  query: QueryBuilder<TContext>,
-): MaterializeWrapper<
-  GetRawResult<TContext>,
-  TContext extends SingleResult ? true : false
-> {
-  return new MaterializeWrapper(query)
+export class IncludeWrapper<_TContext extends Context = any> {
+  readonly __brand = `IncludeWrapper` as const
+  declare readonly _context: _TContext
+  constructor(
+    public readonly query: BaseQueryBuilder<any>,
+    public readonly runtime: IncludesRuntime,
+  ) {
+    registerWrapper(this, `include()`)
+  }
 }

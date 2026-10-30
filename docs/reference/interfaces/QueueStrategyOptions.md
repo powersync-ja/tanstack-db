@@ -3,9 +3,7 @@ id: QueueStrategyOptions
 title: QueueStrategyOptions
 ---
 
-# Interface: QueueStrategyOptions
-
-Defined in: [packages/db/src/strategies/types.ts:50](https://github.com/TanStack/db/blob/main/packages/db/src/strategies/types.ts#L50)
+Defined in: [packages/db/src/strategies/types.ts:57](https://github.com/TanStack/db/blob/main/packages/db/src/strategies/types.ts#L57)
 
 Options for queue strategy
 Processes all executions in order (FIFO/LIFO)
@@ -18,7 +16,7 @@ Processes all executions in order (FIFO/LIFO)
 optional addItemsTo: "front" | "back";
 ```
 
-Defined in: [packages/db/src/strategies/types.ts:56](https://github.com/TanStack/db/blob/main/packages/db/src/strategies/types.ts#L56)
+Defined in: [packages/db/src/strategies/types.ts:63](https://github.com/TanStack/db/blob/main/packages/db/src/strategies/types.ts#L63)
 
 Where to add new items in the queue
 
@@ -30,7 +28,7 @@ Where to add new items in the queue
 optional getItemsFrom: "front" | "back";
 ```
 
-Defined in: [packages/db/src/strategies/types.ts:58](https://github.com/TanStack/db/blob/main/packages/db/src/strategies/types.ts#L58)
+Defined in: [packages/db/src/strategies/types.ts:65](https://github.com/TanStack/db/blob/main/packages/db/src/strategies/types.ts#L65)
 
 Where to get items from when processing
 
@@ -42,9 +40,9 @@ Where to get items from when processing
 optional maxSize: number;
 ```
 
-Defined in: [packages/db/src/strategies/types.ts:54](https://github.com/TanStack/db/blob/main/packages/db/src/strategies/types.ts#L54)
+Defined in: [packages/db/src/strategies/types.ts:61](https://github.com/TanStack/db/blob/main/packages/db/src/strategies/types.ts#L61)
 
-Maximum queue size (items are dropped if exceeded)
+Maximum waiting items. Overflow rejects its transaction; 0 rejects every mutation.
 
 ***
 
@@ -54,6 +52,6 @@ Maximum queue size (items are dropped if exceeded)
 optional wait: number;
 ```
 
-Defined in: [packages/db/src/strategies/types.ts:52](https://github.com/TanStack/db/blob/main/packages/db/src/strategies/types.ts#L52)
+Defined in: [packages/db/src/strategies/types.ts:59](https://github.com/TanStack/db/blob/main/packages/db/src/strategies/types.ts#L59)
 
 Wait time between processing queue items (milliseconds)

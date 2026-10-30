@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'vitest'
+import { grouping } from '../../src/query/compiler/grouping.js'
 import { optimizeQuery } from '../../src/query/optimizer.js'
 import {
   Aggregate,
@@ -45,11 +46,33 @@ function createOr(...args: Array<any>) {
 }
 
 function createAgg(name: string, ...args: Array<any>) {
-  return new Aggregate(name, args)
+  return new Aggregate(name, args, grouping)
 }
 
 describe(`Query Optimizer`, () => {
   describe(`Basic Optimization`, () => {
+    test(`retains explicit ref qualification while combining predicates`, () => {
+      const department = new PropRef([`u`, `department_id`], `u`)
+      const salary = new PropRef([`u`, `salary`], `u`)
+      const query: QueryIR = {
+        from: new CollectionRef(mockCollection, `u`),
+        where: [
+          createEq(department, createValue(1)),
+          createGt(salary, createValue(50_000)),
+        ],
+      }
+
+      const { optimizedQuery } = optimizeQuery(query)
+      const combined = optimizedQuery.where?.[0] as Func
+
+      expect((combined.args[0] as Func).args[0]).toMatchObject({
+        sourceAlias: `u`,
+      })
+      expect((combined.args[1] as Func).args[0]).toMatchObject({
+        sourceAlias: `u`,
+      })
+    })
+
     test(`should pass through queries without where clauses`, () => {
       const query: QueryIR = {
         from: new CollectionRef(mockCollection, `u`),
@@ -114,8 +137,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [createEq(createPropRef(`u`, `department_id`), createValue(1))],
@@ -143,8 +168,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [
@@ -171,6 +198,32 @@ describe(`Query Optimizer`, () => {
   })
 
   describe(`Join Optimization`, () => {
+    test(`preserves single-result and DISTINCT flags across join optimization`, () => {
+      const distinctSource: QueryIR = {
+        from: new CollectionRef(mockCollection, `p`),
+        select: { id: createPropRef(`p`, `id`) },
+        distinct: true,
+      }
+      const query: QueryIR = {
+        from: new CollectionRef(mockCollection, `u`),
+        join: [
+          {
+            from: new QueryRef(distinctSource, `p`),
+            type: `inner`,
+            on: createEq(createPropRef(`u`, `id`), createPropRef(`p`, `id`)),
+          },
+        ],
+        where: [createEq(createPropRef(`u`, `id`), createValue(1))],
+        singleResult: true,
+      }
+
+      const { optimizedQuery } = optimizeQuery(query)
+      expect(optimizedQuery.singleResult).toBe(true)
+      expect(optimizedQuery.join?.[0]?.from.type).toBe(`queryRef`)
+      const joined = optimizedQuery.join?.[0]?.from as QueryRef
+      expect(joined.query.distinct).toBe(true)
+    })
+
     test(`should lift single-source where clauses into join subqueries`, () => {
       const query: QueryIR = {
         from: new CollectionRef(mockCollection, `u`),
@@ -178,8 +231,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [
@@ -224,8 +279,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [
@@ -261,8 +318,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [
@@ -296,8 +355,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [
@@ -331,8 +392,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [
@@ -372,8 +435,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [createEq(createPropRef(`u`, `department_id`), createValue(1))],
@@ -430,8 +495,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [
@@ -442,8 +509,10 @@ describe(`Query Optimizer`, () => {
 
       const { optimizedQuery: optimized } = optimizeQuery(query)
 
-      // The constant expression should be ignored, single-source clause should be optimized
-      expect(optimized.where).toEqual([])
+      // Source-free clauses still filter the joined result.
+      expect(optimized.where).toEqual([
+        createEq(createValue(1), createValue(1)),
+      ])
       expect(optimized.from.type).toBe(`queryRef`)
       if (optimized.from.type === `queryRef`) {
         expect(optimized.from.query.where).toHaveLength(1)
@@ -460,8 +529,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [
@@ -499,8 +570,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [
@@ -534,8 +607,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [createEq(createPropRef(`u`, `department_id`), createValue(1))],
@@ -577,8 +652,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [createEq(createPropRef(`u`, `department_id`), createValue(1))],
@@ -603,8 +680,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [createEq(emptyPathPropRef, createValue(1))],
@@ -612,8 +691,10 @@ describe(`Query Optimizer`, () => {
 
       const { optimizedQuery: optimized } = optimizeQuery(query)
 
-      // The empty path PropRef should be treated as a constant (no sources)
-      expect(optimized.where).toEqual([])
+      // An unqualified reference cannot be pushed to either source.
+      expect(optimized.where).toEqual([
+        createEq(emptyPathPropRef, createValue(1)),
+      ])
       expect(optimized.from.type).toBe(`collectionRef`)
     })
 
@@ -624,8 +705,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [
@@ -638,10 +721,13 @@ describe(`Query Optimizer`, () => {
 
       const { optimizedQuery: optimized } = optimizeQuery(query)
 
-      // Multi-source clause should remain in main query
+      // Multi-source and source-free clauses should remain in the main query.
       expect(optimized.where).toHaveLength(1)
       expect(optimized.where![0]).toEqual(
-        createEq(createPropRef(`u`, `id`), createPropRef(`p`, `user_id`)),
+        createAnd(
+          createEq(createPropRef(`u`, `id`), createPropRef(`p`, `user_id`)),
+          createEq(createValue(1), createValue(1)),
+        ),
       )
 
       // Single-source clauses should be moved to subqueries
@@ -662,7 +748,7 @@ describe(`Query Optimizer`, () => {
   })
 
   describe(`Error Handling`, () => {
-    test(`should handle malformed expressions gracefully`, () => {
+    test(`does not silently discard a malformed expression`, () => {
       const malformedExpression = {
         type: `unknown`,
         value: `test`,
@@ -674,8 +760,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [malformedExpression],
@@ -683,9 +771,8 @@ describe(`Query Optimizer`, () => {
 
       const { optimizedQuery: optimized } = optimizeQuery(query)
 
-      // Should not crash and should handle the malformed expression gracefully
       expect(optimized).toBeDefined()
-      expect(optimized.where).toEqual([])
+      expect(optimized.where).toEqual([malformedExpression])
     })
 
     test(`should handle PropRef with empty first element`, () => {
@@ -696,8 +783,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [
@@ -708,8 +797,10 @@ describe(`Query Optimizer`, () => {
 
       const { optimizedQuery: optimized } = optimizeQuery(query)
 
-      // PropRef with empty first element should be ignored, other clause should be optimized
-      expect(optimized.where).toEqual([])
+      // Keep the unqualified clause instead of silently removing a filter.
+      expect(optimized.where).toEqual([
+        createEq(propRefWithEmptyFirst, createValue(1)),
+      ])
       expect(optimized.from.type).toBe(`queryRef`)
       if (optimized.from.type === `queryRef`) {
         expect(optimized.from.query.where).toHaveLength(1)
@@ -727,8 +818,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [
@@ -739,8 +832,10 @@ describe(`Query Optimizer`, () => {
 
       const { optimizedQuery: optimized } = optimizeQuery(query)
 
-      // PropRef with undefined first element should be ignored, other clause should be optimized
-      expect(optimized.where).toEqual([])
+      // Keep the unqualified clause instead of silently removing a filter.
+      expect(optimized.where).toEqual([
+        createEq(propRefWithUndefinedFirst, createValue(1)),
+      ])
       expect(optimized.from.type).toBe(`queryRef`)
       if (optimized.from.type === `queryRef`) {
         expect(optimized.from.query.where).toHaveLength(1)
@@ -766,8 +861,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [createEq(createPropRef(`u`, `department_id`), createValue(1))],
@@ -812,8 +909,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [createEq(createPropRef(`u`, `department_id`), createValue(1))],
@@ -843,26 +942,33 @@ describe(`Query Optimizer`, () => {
       }
     })
 
-    test(`should remove redundant subqueries after optimization`, () => {
-      // Create a query with redundant subqueries that become empty after optimization
+    test(`collapses internal wrappers that share the source binding`, () => {
+      // Internal optimizer wrappers retain the source's lexical binding.
+      // User-declared wrappers have separate bindings and are not redundant
+      // when references outside the wrapper still name them.
+      const source = new CollectionRef(mockCollection, `u`)
       const queryWithRedundantSubqueries: QueryIR = {
         from: new QueryRef(
           {
             from: new QueryRef(
               {
-                from: new CollectionRef(mockCollection, `u`),
+                from: source,
               },
               `u`,
+              source.bindingId,
             ),
           },
           `u`,
+          source.bindingId,
         ),
         join: [
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [createEq(createPropRef(`u`, `department_id`), createValue(1))],
@@ -902,8 +1008,10 @@ describe(`Query Optimizer`, () => {
               `p`,
             ),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [
@@ -974,8 +1082,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [createEq(createPropRef(`u`, `department_id`), createValue(1))],
@@ -1005,8 +1115,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [createEq(createPropRef(`u`, `department_id`), createValue(1))],
@@ -1039,8 +1151,7 @@ describe(`Query Optimizer`, () => {
         {
           from: new CollectionRef(mockCollection, `p`),
           type: `inner`,
-          left: createPropRef(`u`, `id`),
-          right: createPropRef(`p`, `user_id`),
+          on: createEq(createPropRef(`u`, `id`), createPropRef(`p`, `user_id`)),
         },
       ]
       deepQuery.where = [
@@ -1066,8 +1177,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`u`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`u`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [
@@ -1120,8 +1233,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new QueryRef(sharedSubquery, `other_users`), // Same subquery object!
             type: `inner`,
-            left: createPropRef(`main_users`, `id`),
-            right: createPropRef(`other_users`, `id`),
+            on: createEq(
+              createPropRef(`main_users`, `id`),
+              createPropRef(`other_users`, `id`),
+            ),
           },
         ],
         where: [
@@ -1145,10 +1260,7 @@ describe(`Query Optimizer`, () => {
       expect(optimized.from.type).toBe(`queryRef`)
       if (optimized.from.type === `queryRef`) {
         expect(optimized.from.query.where).toContainEqual(
-          createEq(
-            createPropRef(`main_users`, `department_id`),
-            createValue(1),
-          ),
+          createEq(createPropRef(`u`, `department_id`), createValue(1)),
         )
       }
 
@@ -1159,10 +1271,7 @@ describe(`Query Optimizer`, () => {
         expect(joinClause.from.type).toBe(`queryRef`)
         if (joinClause.from.type === `queryRef`) {
           expect(joinClause.from.query.where).toContainEqual(
-            createEq(
-              createPropRef(`other_users`, `department_id`),
-              createValue(2),
-            ),
+            createEq(createPropRef(`u`, `department_id`), createValue(2)),
           )
         }
       }
@@ -1184,8 +1293,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`stats`, `department_id`),
-            right: createPropRef(`p`, `department_id`),
+            on: createEq(
+              createPropRef(`stats`, `department_id`),
+              createPropRef(`p`, `department_id`),
+            ),
           },
         ],
         where: [
@@ -1225,8 +1336,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`top_users`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`top_users`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [
@@ -1260,8 +1373,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`filtered_users`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`filtered_users`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [
@@ -1279,10 +1394,7 @@ describe(`Query Optimizer`, () => {
       expect(optimized.from.type).toBe(`queryRef`)
       if (optimized.from.type === `queryRef`) {
         expect(optimized.from.query.where).toContainEqual(
-          createEq(
-            createPropRef(`filtered_users`, `department_id`),
-            createValue(1),
-          ),
+          createEq(createPropRef(`u`, `department_id`), createValue(1)),
         )
       }
     })
@@ -1309,8 +1421,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`dept_stats`, `department_id`),
-            right: createPropRef(`p`, `department_id`),
+            on: createEq(
+              createPropRef(`dept_stats`, `department_id`),
+              createPropRef(`p`, `department_id`),
+            ),
           },
         ],
         where: [
@@ -1342,8 +1456,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`computed_users`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`computed_users`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [
@@ -1388,8 +1504,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`sorted_users`, `id`),
-            right: createPropRef(`p`, `user_id`),
+            on: createEq(
+              createPropRef(`sorted_users`, `id`),
+              createPropRef(`p`, `user_id`),
+            ),
           },
         ],
         where: [
@@ -1407,10 +1525,7 @@ describe(`Query Optimizer`, () => {
       expect(optimized.from.type).toBe(`queryRef`)
       if (optimized.from.type === `queryRef`) {
         expect(optimized.from.query.where).toContainEqual(
-          createEq(
-            createPropRef(`sorted_users`, `department_id`),
-            createValue(1),
-          ),
+          createEq(createPropRef(`u`, `department_id`), createValue(1)),
         )
       }
     })
@@ -1441,8 +1556,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new QueryRef(unsafeSubquery, `dept_stats`),
             type: `inner`,
-            left: createPropRef(`users`, `department_id`),
-            right: createPropRef(`dept_stats`, `department_id`),
+            on: createEq(
+              createPropRef(`users`, `department_id`),
+              createPropRef(`dept_stats`, `department_id`),
+            ),
           },
         ],
         where: [
@@ -1463,7 +1580,7 @@ describe(`Query Optimizer`, () => {
       expect(optimized.from.type).toBe(`queryRef`)
       if (optimized.from.type === `queryRef`) {
         expect(optimized.from.query.where).toContainEqual(
-          createEq(createPropRef(`users`, `department_id`), createValue(1)),
+          createEq(createPropRef(`u`, `department_id`), createValue(1)),
         )
       }
     })
@@ -1486,8 +1603,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`stats`, `department_id`),
-            right: createPropRef(`p`, `department_id`),
+            on: createEq(
+              createPropRef(`stats`, `department_id`),
+              createPropRef(`p`, `department_id`),
+            ),
           },
         ],
         where: [
@@ -1544,8 +1663,10 @@ describe(`Query Optimizer`, () => {
           {
             from: new CollectionRef(mockCollection, `p`),
             type: `inner`,
-            left: createPropRef(`stats`, `department_id`),
-            right: createPropRef(`p`, `department_id`),
+            on: createEq(
+              createPropRef(`stats`, `department_id`),
+              createPropRef(`p`, `department_id`),
+            ),
           },
         ],
         where: [
@@ -1632,8 +1753,10 @@ describe(`Query Optimizer`, () => {
           {
             type: `left`,
             from: new CollectionRef(teamMembersCollection, `teamMember`),
-            left: createPropRef(`team`, `id`),
-            right: createPropRef(`teamMember`, `team_id`),
+            on: createEq(
+              createPropRef(`team`, `id`),
+              createPropRef(`teamMember`, `team_id`),
+            ),
           },
         ],
         where: [
@@ -1675,8 +1798,10 @@ describe(`Query Optimizer`, () => {
           {
             type: `right`,
             from: new CollectionRef(profilesCollection, `profile`),
-            left: createPropRef(`user`, `id`),
-            right: createPropRef(`profile`, `user_id`),
+            on: createEq(
+              createPropRef(`user`, `id`),
+              createPropRef(`profile`, `user_id`),
+            ),
           },
         ],
         where: [
@@ -1723,8 +1848,10 @@ describe(`Query Optimizer`, () => {
           {
             type: `full`,
             from: new CollectionRef(paymentsCollection, `payment`),
-            left: createPropRef(`order`, `id`),
-            right: createPropRef(`payment`, `order_id`),
+            on: createEq(
+              createPropRef(`order`, `id`),
+              createPropRef(`payment`, `order_id`),
+            ),
           },
         ],
         where: [
@@ -1766,8 +1893,10 @@ describe(`Query Optimizer`, () => {
           {
             type: `inner`,
             from: new CollectionRef(departmentsCollection, `dept`),
-            left: createPropRef(`user`, `department_id`),
-            right: createPropRef(`dept`, `id`),
+            on: createEq(
+              createPropRef(`user`, `department_id`),
+              createPropRef(`dept`, `id`),
+            ),
           },
         ],
         where: [

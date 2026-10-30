@@ -1,22 +1,31 @@
 import { D2, output } from '@tanstack/db-ivm'
-import { transactionScopedScheduler } from '../scheduler.js'
-import { getActiveTransaction } from '../transactions.js'
+import { createSourceRecord } from '../utils/source-record.js'
+import { createDeferred } from '../deferred.js'
+import { runAllCallbacks } from '../utils/callbacks.js'
+import { normalizeError } from '../utils/error.js'
+import { deepEquals } from '../utils.js'
+import { codedMessage, devBuild } from '../error-message.js'
+import { buildHealthTree, healthNode } from '../collection/health-tree.js'
+import { isFailedStatus } from '../live-query-primitives.js'
 import { compileQuery } from './compiler/index.js'
-import {
-  normalizeExpressionPaths,
-  normalizeOrderByPaths,
-} from './compiler/expressions.js'
+import { normalizeExpressionPaths } from './compiler/expressions.js'
 import { getCollectionBuilder } from './live/collection-registry.js'
+import { scheduleQueryGraphRun } from './live/graph-scheduler.js'
+import {
+  SubsetDemandController,
+  hasPendingJoinedWork as hasPendingJoinedSourceWork,
+} from './live/subset-demand-controller.js'
+import { OrderedSourceLoader } from './live/ordered-source-loader.js'
 import {
   buildQueryFromConfig,
-  computeOrderedLoadCursor,
   computeSubscriptionOrderByHints,
-  extractCollectionAliases,
+  extractCollectionFromSource,
+  extractCollectionSources,
   extractCollectionsFromQuery,
-  filterDuplicateInserts,
+  reconcileChangesForD2,
   sendChangesToInput,
+  sourcePermitsInitialReadiness,
   splitUpdates,
-  trackBiggestSentValue,
 } from './live/utils.js'
 import type { RootStreamBuilder } from '@tanstack/db-ivm'
 import type { Collection } from '../collection/index.js'
@@ -25,7 +34,19 @@ import type { InitialQueryBuilder, QueryBuilder } from './builder/index.js'
 import type { Context } from './builder/types.js'
 import type { BasicExpression, QueryIR } from './ir.js'
 import type { OrderByOptimizationInfo } from './compiler/order-by.js'
-import type { ChangeMessage, KeyedStream, ResultStream } from '../types.js'
+import type { GraphDependency } from './live/graph-scheduler.js'
+import type {
+  LazyCollectionCallbacks,
+  LazyDemandPlan,
+} from './compiler/joins.js'
+import type {
+  ChangeMessage,
+  CollectionDependent,
+  CollectionStatus,
+  HealthNode,
+  KeyedStream,
+  StringCollationConfig,
+} from '../types.js'
 
 // ---------------------------------------------------------------------------
 // Public Types
@@ -73,8 +94,7 @@ export interface EffectContext {
 
 /** Query input - can be a builder function or a prebuilt query */
 export type EffectQueryInput<TContext extends Context> =
-  | ((q: InitialQueryBuilder) => QueryBuilder<TContext>)
-  | QueryBuilder<TContext>
+  ((q: InitialQueryBuilder) => QueryBuilder<TContext>) | QueryBuilder<TContext>
 
 type EffectEventHandler<
   TRow extends object = Record<string, unknown>,
@@ -116,11 +136,22 @@ export interface EffectConfig<
   onError?: (error: Error, event: DeltaEvent<TRow, TKey>) => void
 
   /**
-   * Called when a source collection enters an error or cleaned-up state.
-   * The effect is automatically disposed after this callback fires.
-   * If not provided, the error is logged to console.error.
+   * Called when a source crashes, fails its first load before the effect's
+   * initial-query readiness, or is cleaned up while the effect reads it, and
+   * when a subset load the effect requests from a source, or its release,
+   * fails, before or after that readiness. A cascade cleanup that ends the
+   * effect does not call it.
+   * The effect is automatically disposed after this callback fires. If not
+   * provided, the error is logged to console.error.
    */
   onSourceError?: (error: Error) => void
+
+  /**
+   * Called after the effect's initial-query readiness whenever its health tree
+   * changes. A sync problem after initial-query readiness does not dispose the
+   * effect; read the health tree to decide what to do.
+   */
+  onHealthChange?: (health: HealthNode) => void
 
   /**
    * Skip deltas during initial collection load.
@@ -132,7 +163,10 @@ export interface EffectConfig<
 
 /** Handle returned by createEffect */
 export interface Effect {
-  /** Dispose the effect. Returns a promise that resolves when in-flight handlers complete. */
+  /**
+   * Dispose the effect and await in-flight handlers. Calls during one cleanup
+   * attempt, including calls from abort/release callbacks, share its outcome.
+   */
   dispose: () => Promise<void>
   /** Whether this effect has been disposed */
   readonly disposed: boolean
@@ -181,6 +215,15 @@ let effectCounter = 0
  * await effect.dispose()
  * ```
  */
+/** The error that ends an Effect whose source crashed or failed its first load. */
+function stoppedSourceError(collectionId: string, status: CollectionStatus) {
+  return new Error(
+    devBuild() && process.env.NODE_ENV !== `production`
+      ? `Source collection '${collectionId}' entered ${status} state`
+      : codedMessage(135, { collectionId, status }),
+  )
+}
+
 export function createEffect<
   TRow extends object = Record<string, unknown>,
   TKey extends string | number = string | number,
@@ -242,27 +285,60 @@ export function createEffect<
 
   // The dispose function is referenced by both the returned Effect object
   // and the onSourceError callback, so we define it first.
-  const dispose = async () => {
-    if (disposed) return
+  let disposalPromise: Promise<void> | undefined
+  const dispose = (): Promise<void> => {
+    if (disposalPromise) return disposalPromise
+    // Abort and source-release callbacks may synchronously call dispose again.
+    // Publish the shared result before entering either user callback boundary.
+    const completion = createDeferred<void>()
+    const attempt = completion.promise
+    disposalPromise = attempt
     disposed = true
 
     // Abort signal for in-flight handlers
     abortController.abort()
 
-    // Tear down the pipeline (unsubscribe from sources, etc.)
-    runner.dispose()
+    void (async () => {
+      // Tear down the pipeline (unsubscribe from sources, etc.)
+      let cleanupFailed = false
+      let cleanupError: unknown
+      try {
+        runner.dispose()
+      } catch (error) {
+        cleanupFailed = true
+        cleanupError = error
+      }
 
-    // Wait for any in-flight async handlers to settle
-    if (inFlightHandlers.size > 0) {
-      await Promise.allSettled([...inFlightHandlers])
-    }
+      // Wait for any in-flight async handlers to settle
+      if (inFlightHandlers.size > 0) {
+        await Promise.allSettled([...inFlightHandlers])
+      }
+
+      if (cleanupFailed) throw cleanupError
+    })().then(completion.resolve, completion.reject)
+    void attempt.then(
+      () => {},
+      () => {
+        if (disposalPromise === attempt) disposalPromise = undefined
+      },
+    )
+    return attempt
+  }
+
+  const effect: Effect = {
+    dispose,
+    get disposed() {
+      return disposed
+    },
   }
 
   // Create and start the pipeline
   const runner = new EffectPipelineRunner<TRow, TKey>({
+    effect,
     query: config.query,
     skipInitial: config.skipInitial ?? false,
     onBatchProcessed,
+    onHealthChange: config.onHealthChange,
     onSourceError: (error: Error) => {
       if (disposed) return
 
@@ -271,26 +347,48 @@ export function createEffect<
           config.onSourceError(error)
         } catch (callbackError) {
           console.error(
-            `[Effect '${id}'] onSourceError callback threw:`,
+            devBuild() && process.env.NODE_ENV !== `production`
+              ? `[Effect '${id}'] onSourceError callback threw:`
+              : codedMessage(220, { id }),
             callbackError,
           )
         }
       } else {
-        console.error(`[Effect '${id}'] ${error.message}. Disposing effect.`)
+        console.error(
+          devBuild() && process.env.NODE_ENV !== `production`
+            ? `[Effect '${id}'] ${error.message}. Disposing effect.`
+            : codedMessage(221, { id, message: error.message }),
+        )
       }
 
       // Auto-dispose — the effect can no longer function
-      dispose()
+      void dispose().catch((cleanupError) => {
+        console.error(
+          devBuild() && process.env.NODE_ENV !== `production`
+            ? `[Effect '${id}'] failed to dispose after a source error:`
+            : codedMessage(222, { id }),
+          cleanupError,
+        )
+      })
     },
   })
-  runner.start()
-
-  return {
-    dispose,
-    get disposed() {
-      return disposed
-    },
+  try {
+    runner.start()
+  } catch (error) {
+    try {
+      runner.dispose()
+    } catch (cleanupError) {
+      console.error(
+        devBuild() && process.env.NODE_ENV !== `production`
+          ? `[Effect '${id}'] failed to dispose after a startup error:`
+          : codedMessage(223, { id }),
+        cleanupError,
+      )
+    }
+    throw error
   }
+
+  return effect
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +404,31 @@ interface EffectPipelineRunnerConfig<
   onBatchProcessed: (events: Array<DeltaEvent<TRow, TKey>>) => void
   /** Called when a source collection enters error or cleaned-up state */
   onSourceError: (error: Error) => void
+  onHealthChange?: (health: HealthNode) => void
+  /** The Effect's handle, so its source subscriptions can name it. */
+  effect: Effect
+}
+
+/**
+ * Report how a held acquisition ends. A truncate replay rejects the
+ * acquisition it supersedes and starts a replacement, which inherits the hold.
+ */
+function followHeldAcquisition(
+  acquisition: Promise<unknown>,
+  replacementAfterFailure: () => Promise<void> | undefined,
+  handlers: {
+    settled: (succeeded: boolean) => void
+    replaced: (replacement: Promise<void>) => void
+  },
+): void {
+  void acquisition.then(
+    () => handlers.settled(true),
+    () => {
+      const replacement = replacementAfterFailure()
+      if (replacement) handlers.replaced(replacement)
+      else handlers.settled(false)
+    },
+  )
 }
 
 /**
@@ -314,60 +437,75 @@ interface EffectPipelineRunnerConfig<
  * Sets up the IVM graph, subscribes to source collections, runs the graph
  * when changes arrive, and classifies output multiplicities into DeltaEvents.
  *
- * Unlike CollectionConfigBuilder, this does NOT:
- * - Create or write to a collection (no materialisation)
- * - Manage ordering, windowing, or lazy loading
+ * Unlike CollectionConfigBuilder, this does not publish results to a
+ * Collection.
  */
 class EffectPipelineRunner<TRow extends object, TKey extends string | number> {
   private readonly query: QueryIR
+  private readonly queryCompareOptions: StringCollationConfig
   private readonly collections: Record<string, Collection<any, any, any>>
-  private readonly collectionByAlias: Record<string, Collection<any, any, any>>
+  private readonly collectionSources: ReturnType<
+    typeof extractCollectionSources
+  >
 
   private graph: D2 | undefined
   private inputs: Record<string, RootStreamBuilder<unknown>> | undefined
-  private pipeline: ResultStream | undefined
   private sourceWhereClauses: Map<string, BasicExpression<boolean>> | undefined
-  private compiledAliasToCollectionId: Record<string, string> = {}
 
   // Mutable objects passed to compileQuery by reference.
   // The join compiler captures these references and reads them later when
   // the graph runs, so they must be populated before the first graph run.
-  private readonly subscriptions: Record<string, CollectionSubscription> = {}
-  private readonly lazySourcesCallbacks: Record<string, any> = {}
+  private readonly subscriptions = createSourceRecord<CollectionSubscription>()
+  private readonly lazySourcesCallbacks =
+    createSourceRecord<LazyCollectionCallbacks>()
   private readonly lazySources = new Set<string>()
+  private readonly demand = new SubsetDemandController()
   // OrderBy optimization info populated by the compiler when limit is present
-  private readonly optimizableOrderByCollections: Record<
-    string,
-    OrderByOptimizationInfo
-  > = {}
+  private readonly optimizableOrderByCollections =
+    createSourceRecord<OrderByOptimizationInfo>()
 
   // Ordered subscription state for cursor-based loading
-  private readonly biggestSentValue = new Map<string, any>()
-  private readonly lastLoadRequestKey = new Map<string, string>()
-  private pendingOrderedLoadPromise: Promise<void> | undefined
+  private readonly orderedLoaders = new Map<string, OrderedSourceLoader>()
+  // An asynchronous authoritative repair may update the private D2 state in
+  // several prefix/tie/refill steps. Keep their net Effect delta private until
+  // the final participant settles, matching live-query Collection publication.
+  private readonly pendingOrderedPublications = new Set<Promise<unknown>>()
+  private readonly pendingInitialLoads = new Set<Promise<unknown>>()
+  private orderedPublicationFailed = false
 
   // Subscription management
   private readonly unsubscribeCallbacks = new Set<() => void>()
-  // Duplicate insert prevention per alias
-  private readonly sentToD2KeysByAlias = new Map<string, Set<string | number>>()
+  // Exact row last contributed to D2 per lexical source key.
+  private readonly sentToD2RowsBySource = new Map<
+    string,
+    Map<string | number, Record<string, unknown>>
+  >()
 
   // Output accumulator
   private pendingChanges: Map<unknown, EffectChanges<TRow>> = new Map()
+  // Callback-visible result. Held repair deltas are classified against this
+  // last coherent membership rather than their net multiplicity alone.
+  private readonly publishedRows = new Map<unknown, TRow>()
 
   // skipInitial state
   private readonly skipInitial: boolean
   private initialLoadComplete = false
+  // The Effect's initial gate: latched when every
+  // initial load has settled, with or without skipInitial. After it,
+  // a sync problem does not dispose the Effect.
+  private reachedReady = false
+  private reportedTree: HealthNode | undefined
+  private readonly onHealthChange: ((health: HealthNode) => void) | undefined
+  // This Effect as its sources' `subscribers` list it.
+  private readonly dependent: CollectionDependent
 
   // Scheduler integration
   private subscribedToAllCollections = false
-  private readonly builderDependencies = new Set<unknown>()
-  private readonly aliasDependencies: Record<string, Array<unknown>> = {}
+  private readonly builderDependencies = new Set<GraphDependency>()
 
   // Reentrance guard
   private isGraphRunning = false
   private disposed = false
-  // When dispose() is called mid-graph-run, defer heavy cleanup until the run completes
-  private deferredCleanup = false
 
   private readonly onBatchProcessed: (
     events: Array<DeltaEvent<TRow, TKey>>,
@@ -378,23 +516,22 @@ class EffectPipelineRunner<TRow extends object, TKey extends string | number> {
     this.skipInitial = config.skipInitial
     this.onBatchProcessed = config.onBatchProcessed
     this.onSourceError = config.onSourceError
+    this.onHealthChange = config.onHealthChange
+    this.dependent = {
+      kind: `effect`,
+      active: true,
+      end: () => config.effect.dispose(),
+    }
 
     // Parse query
     this.query = buildQueryFromConfig({ query: config.query })
+    this.queryCompareOptions = extractCollectionFromSource(
+      this.query,
+    ).compareOptions
 
     // Extract source collections
     this.collections = extractCollectionsFromQuery(this.query)
-    const aliasesById = extractCollectionAliases(this.query)
-
-    // Build alias → collection map
-    this.collectionByAlias = {}
-    for (const [collectionId, aliases] of aliasesById.entries()) {
-      const collection = this.collections[collectionId]
-      if (!collection) continue
-      for (const alias of aliases) {
-        this.collectionByAlias[alias] = collection
-      }
-    }
+    this.collectionSources = extractCollectionSources(this.query)
 
     // Compile the pipeline
     this.compilePipeline()
@@ -403,12 +540,11 @@ class EffectPipelineRunner<TRow extends object, TKey extends string | number> {
   /** Compile the D2 graph and query pipeline */
   private compilePipeline(): void {
     this.graph = new D2()
-    this.inputs = Object.fromEntries(
-      Object.keys(this.collectionByAlias).map((alias) => [
-        alias,
-        this.graph!.newInput<any>(),
-      ]),
-    )
+    const inputs = createSourceRecord<RootStreamBuilder<unknown>>()
+    for (const source of this.collectionSources) {
+      inputs[source.sourceId] = this.graph.newInput<any>()
+    }
+    this.inputs = inputs
 
     const compilation = compileQuery(
       this.query,
@@ -424,12 +560,10 @@ class EffectPipelineRunner<TRow extends object, TKey extends string | number> {
       () => {}, // setWindowFn (no-op — effects don't paginate)
     )
 
-    this.pipeline = compilation.pipeline
     this.sourceWhereClauses = compilation.sourceWhereClauses
-    this.compiledAliasToCollectionId = compilation.aliasToCollectionId
 
     // Attach the output operator that accumulates changes
-    this.pipeline.pipe(
+    compilation.pipeline.pipe(
       output((data) => {
         const messages = data.getInner()
         messages.reduce(accumulateEffectChanges<TRow>, this.pendingChanges)
@@ -439,11 +573,13 @@ class EffectPipelineRunner<TRow extends object, TKey extends string | number> {
     this.graph.finalize()
   }
 
+  private isDisposed(): boolean {
+    return this.disposed
+  }
+
   /** Subscribe to source collections and start processing */
   start(): void {
-    // Use compiled aliases as the source of truth
-    const compiledAliases = Object.entries(this.compiledAliasToCollectionId)
-    if (compiledAliases.length === 0) {
+    if (this.collectionSources.length === 0) {
       // Nothing to subscribe to
       return
     }
@@ -467,113 +603,199 @@ class EffectPipelineRunner<TRow extends object, TKey extends string | number> {
       Array<Array<ChangeMessage<any, string | number>>>
     >()
 
-    for (const [alias, collectionId] of compiledAliases) {
-      const collection =
-        this.collectionByAlias[alias] ?? this.collections[collectionId]!
+    for (const source of this.collectionSources) {
+      if (this.isDisposed()) {
+        return
+      }
 
-      // Initialise per-alias duplicate tracking
-      this.sentToD2KeysByAlias.set(alias, new Set())
+      const { sourceId, alias, collection } = source
+      const collectionId = collection.id
+
+      const handleSourceCleanup = () => {
+        if (this.disposed) return
+        this.onSourceError(
+          new Error(
+            devBuild() && process.env.NODE_ENV !== `production`
+              ? `Source collection '${collectionId}' was cleaned up while effect depends on it`
+              : codedMessage(134, { collectionId }),
+          ),
+        )
+      }
+      // Observe cleanup before subscription admission, which rejects while
+      // cleanup is active. A late Effect still returns its disposed handle.
+      const cleanupStartUnsubscribe =
+        collection._onCleanupStart(handleSourceCleanup)
+      // Registration can dispose the runner before its handle is available.
+      if (this.isDisposed()) {
+        cleanupStartUnsubscribe()
+        return
+      }
+      this.unsubscribeCallbacks.add(cleanupStartUnsubscribe)
+
+      this.sentToD2RowsBySource.set(sourceId, new Map())
 
       // Discover dependencies: if source collection is itself a live query
       // collection, its builder must run first during transaction flushes.
       const dependencyBuilder = getCollectionBuilder(collection)
       if (dependencyBuilder) {
-        this.aliasDependencies[alias] = [dependencyBuilder]
         this.builderDependencies.add(dependencyBuilder)
-      } else {
-        this.aliasDependencies[alias] = []
       }
 
       // Get where clause for this alias (for predicate push-down)
-      const whereClause = this.sourceWhereClauses?.get(alias)
+      const whereClause = this.sourceWhereClauses?.get(sourceId)
       const whereExpression = whereClause
         ? normalizeExpressionPaths(whereClause, alias)
         : undefined
 
       // Initialise buffer for this alias
       const buffer: Array<Array<ChangeMessage<any, string | number>>> = []
-      pendingBuffers.set(alias, buffer)
+      pendingBuffers.set(sourceId, buffer)
 
       // Lazy aliases (marked by the join compiler) should NOT load initial state
       // eagerly — the join tap operator will load exactly the rows it needs on demand.
       // For on-demand collections, eager loading would trigger a full server fetch
       // for data that should be lazily loaded based on join keys.
-      const isLazy = this.lazySources.has(alias)
+      const isLazy = this.lazySources.has(sourceId)
 
       // Check if this alias has orderBy optimization (cursor-based loading)
-      const orderByInfo = this.getOrderByInfoForAlias(alias)
+      const orderByInfo = this.optimizableOrderByCollections[sourceId]
 
-      // Build the change callback — for ordered aliases, split updates into
-      // delete+insert and track the biggest sent value for cursor positioning.
-      const changeCallback = orderByInfo
-        ? (changes: Array<ChangeMessage<any, string | number>>) => {
-            if (pendingBuffers.has(alias)) {
-              pendingBuffers.get(alias)!.push(changes)
-            } else {
-              this.trackSentValues(alias, changes, orderByInfo.comparator)
-              const split = [...splitUpdates(changes)]
-              this.handleSourceChanges(alias, split)
-            }
-          }
-        : (changes: Array<ChangeMessage<any, string | number>>) => {
-            if (pendingBuffers.has(alias)) {
-              pendingBuffers.get(alias)!.push(changes)
-            } else {
-              this.handleSourceChanges(alias, changes)
-            }
-          }
+      const changeCallback = (
+        changes: Array<ChangeMessage<any, string | number>>,
+      ) => {
+        const bufferedChanges = pendingBuffers.get(sourceId)
+        if (bufferedChanges) bufferedChanges.push(changes)
+        else this.handleSourceChanges(sourceId, changes)
+      }
 
-      // Determine subscription options based on ordered vs unordered path
-      const subscriptionOptions = this.buildSubscriptionOptions(
-        alias,
-        isLazy,
-        orderByInfo,
-        whereExpression,
-      )
+      // A source that stopped before this Effect sends no status change. End
+      // the Effect before any subscription or load reaches that source.
+      if (isFailedStatus(collection.status)) {
+        this.onSourceError(stoppedSourceError(collectionId, collection.status))
+        return
+      }
 
       // Subscribe to source changes
-      const subscription = collection.subscribeChanges(
-        changeCallback,
-        subscriptionOptions,
-      )
+      const subscription = collection.subscribeChanges(changeCallback, {
+        ...this.buildSubscriptionOptions(
+          alias,
+          isLazy,
+          orderByInfo,
+          whereExpression,
+        ),
+        owner: this.dependent,
+        onLoadSubsetError: ({ error }) =>
+          this.onSourceError(normalizeError(error)),
+        // subscribeChanges can report a result before it returns the
+        // subscription, so read it from the record when a load fails.
+        onLoadSubsetResult: (result) => {
+          this.trackInitialLoad(
+            result,
+            () => this.subscriptions[sourceId]?.pendingTruncateReplacement,
+          )
+        },
+      })
 
       // Store subscription immediately so the join compiler can find it
-      this.subscriptions[alias] = subscription
+      this.subscriptions[sourceId] = subscription
+
+      const unsubscribe = () => {
+        delete this.subscriptions[sourceId]
+        subscription.unsubscribe()
+      }
+
+      // subscribeChanges can synchronously report a source error and dispose
+      // the runner before returning the subscription.
+      if (this.isDisposed()) {
+        unsubscribe()
+        return
+      }
+
+      // Own the subscription before any ordered snapshot or lazy demand can
+      // throw. A partially started effect has no handle for its caller to
+      // dispose, so start() must be able to release every acquired source.
+      this.unsubscribeCallbacks.add(unsubscribe)
+
+      if (
+        Object.values(this.optimizableOrderByCollections).some(
+          (info) => info.joinedFilterSourceId === sourceId,
+        )
+      ) {
+        this.unsubscribeCallbacks.add(
+          subscription.on(`status:ready`, () => {
+            if (!this.disposed) this.scheduleGraphRun()
+          }),
+        )
+      }
+
+      const lazyCallbacks = this.lazySourcesCallbacks[sourceId]
+      if (lazyCallbacks) {
+        lazyCallbacks.setDemand = (plan: LazyDemandPlan, keys: Set<unknown>) =>
+          this.setDemand(subscription, plan, keys)
+        for (const plan of lazyCallbacks.plans ?? []) {
+          if (plan.initialKeys.size > 0) {
+            lazyCallbacks.setDemand(plan, plan.initialKeys)
+          }
+        }
+      }
 
       // For ordered aliases with an index, trigger the initial limited snapshot.
       // This loads only the top N rows rather than the entire collection.
       if (orderByInfo) {
-        this.requestInitialOrderedSnapshot(alias, orderByInfo, subscription)
+        const loader = new OrderedSourceLoader(
+          orderByInfo,
+          subscription,
+          alias,
+          (result, holdPublication) => {
+            this.trackInitialLoad(
+              result,
+              () => subscription.pendingTruncateReplacement,
+            )
+            const holdsInitialPublication =
+              this.skipInitial && !this.initialLoadComplete
+            if (holdPublication || holdsInitialPublication) {
+              this.trackOrderedPublication(
+                Promise.resolve(result),
+                () => subscription.pendingTruncateReplacement,
+              )
+            }
+          },
+          () => false,
+          undefined,
+          () =>
+            orderByInfo.joinedFilterSourceId !== undefined &&
+            this.hasPendingJoinedWork(orderByInfo.joinedFilterSourceId),
+        )
+        this.orderedLoaders.set(sourceId, loader)
+        loader.start()
+        // The sync adapter reports that served pages may have shifted after
+        // its own refetch. Re-establish the window with a bounded repair.
+        this.unsubscribeCallbacks.add(
+          collection.on(`loadedSubsets:invalidated`, () => {
+            if (this.disposed) return
+            loader.revalidateLoadedCoverage()
+            this.scheduleGraphRun()
+          }),
+        )
       }
 
-      this.unsubscribeCallbacks.add(() => {
-        subscription.unsubscribe()
-        delete this.subscriptions[alias]
-      })
-
       // Listen for status changes on source collections
-      const statusUnsubscribe = collection.on(`status:change`, (event) => {
+      const handleSourceStatus = (status: CollectionStatus) => {
         if (this.disposed) return
 
-        const { status } = event
-
-        // Source entered error state — effect can no longer function
-        if (status === `error`) {
-          this.onSourceError(
-            new Error(
-              `Source collection '${collectionId}' entered error state`,
-            ),
-          )
+        // A crash ends the effect at any time. A failed first load ends it
+        // before its gate; after the gate it is a sync problem in the tree.
+        if (
+          status === `crashed` ||
+          (status === `error` && !this.reachedReady)
+        ) {
+          this.onSourceError(stoppedSourceError(collectionId, status))
           return
         }
 
         // Source was manually cleaned up — effect can no longer function
         if (status === `cleaned-up`) {
-          this.onSourceError(
-            new Error(
-              `Source collection '${collectionId}' was cleaned up while effect depends on it`,
-            ),
-          )
+          handleSourceCleanup()
           return
         }
 
@@ -581,12 +803,20 @@ class EffectPipelineRunner<TRow extends object, TKey extends string | number> {
         if (
           this.skipInitial &&
           !this.initialLoadComplete &&
-          this.checkAllCollectionsReady()
+          this.canCompleteInitialLoad()
         ) {
           this.initialLoadComplete = true
         }
-      })
+        // health:change follows every status change and reports the tree.
+        this.latchReady()
+      }
+      const statusUnsubscribe = collection.on(`status:change`, ({ status }) =>
+        handleSourceStatus(status),
+      )
       this.unsubscribeCallbacks.add(statusUnsubscribe)
+      this.unsubscribeCallbacks.add(
+        collection.on(`health:change`, () => this.reportHealth()),
+      )
     }
 
     // Mark as subscribed so the graph can start running
@@ -600,46 +830,77 @@ class EffectPipelineRunner<TRow extends object, TKey extends string | number> {
     // switches that alias to direct-processing mode. Any new callbacks that
     // fire during the drain (e.g. from requestLimitedSnapshot) will go
     // through handleSourceChanges directly instead of being lost.
-    for (const [alias] of pendingBuffers) {
-      const buffer = pendingBuffers.get(alias)!
-      pendingBuffers.delete(alias)
-
-      const orderByInfo = this.getOrderByInfoForAlias(alias)
+    for (const [sourceId, buffer] of pendingBuffers) {
+      pendingBuffers.delete(sourceId)
 
       // Drain all buffered batches. Since we deleted the alias from
       // pendingBuffers above, any new changes arriving during drain go
       // through handleSourceChanges directly (not back into this buffer).
       for (const changes of buffer) {
-        if (orderByInfo) {
-          this.trackSentValues(alias, changes, orderByInfo.comparator)
-          const split = [...splitUpdates(changes)]
-          this.sendChangesToD2(alias, split)
-        } else {
-          this.sendChangesToD2(alias, changes)
-        }
+        this.handleSourceChanges(sourceId, changes, false)
       }
     }
 
     // Initial graph run to process any synchronously-available data.
     // For skipInitial, this run's output is discarded (initialLoadComplete is still false).
     this.runGraph()
+    this.latchReady()
 
     // After the initial graph run, if all sources are ready,
     // mark initial load as complete so future events are processed.
-    if (this.skipInitial && !this.initialLoadComplete) {
-      if (this.checkAllCollectionsReady()) {
-        this.initialLoadComplete = true
-      }
+    if (
+      this.skipInitial &&
+      !this.initialLoadComplete &&
+      this.canCompleteInitialLoad()
+    ) {
+      this.initialLoadComplete = true
     }
   }
 
   /** Handle incoming changes from a source collection */
   private handleSourceChanges(
-    alias: string,
+    sourceId: string,
     changes: Array<ChangeMessage<any, string | number>>,
+    scheduleGraph = true,
   ): void {
-    this.sendChangesToD2(alias, changes)
-    this.scheduleGraphRun(alias)
+    if (this.optimizableOrderByCollections[sourceId]) {
+      const source = this.collectionSources.find(
+        (candidate) => candidate.sourceId === sourceId,
+      )!
+      this.orderedLoaders
+        .get(sourceId)
+        ?.onSourceChanges(
+          changes,
+          this.sentToD2RowsBySource.get(sourceId),
+          (key) => source.collection._hasOptimisticOverlay(key),
+        )
+      changes = [...splitUpdates(changes)]
+    }
+    this.sendChangesToD2(sourceId, changes)
+    if (scheduleGraph) this.scheduleGraphRun()
+  }
+
+  private setDemand(
+    subscription: CollectionSubscription,
+    plan: LazyDemandPlan,
+    keys: Set<unknown>,
+  ): void {
+    const update = this.demand.setDemand(subscription, plan, keys)
+    if (update.ready instanceof Promise) {
+      this.trackInitialLoad(
+        update.ready,
+        () => subscription.pendingTruncateReplacement,
+      )
+      // Each segment reports its own failure through the subscription. Consume
+      // the aggregate rejection so Promise.all does not create a second,
+      // detached error channel.
+      void update.ready.then(
+        () => {
+          if (!this.disposed) this.scheduleGraphRun()
+        },
+        () => {},
+      )
+    }
   }
 
   /**
@@ -652,70 +913,92 @@ class EffectPipelineRunner<TRow extends object, TKey extends string | number> {
    * Dependencies are discovered from source collections that are themselves
    * live query collections, ensuring parent queries run before effects.
    */
-  private scheduleGraphRun(alias?: string): void {
-    const contextId = getActiveTransaction()?.id
+  private scheduleGraphRun(): void {
+    scheduleQueryGraphRun(this, this.builderDependencies, () => {
+      if (!this.disposed && this.subscribedToAllCollections) this.runGraph()
+    })
+  }
 
-    // Collect dependencies for this schedule call
-    const deps = new Set(this.builderDependencies)
-    if (alias) {
-      const aliasDeps = this.aliasDependencies[alias]
-      if (aliasDeps) {
-        for (const dep of aliasDeps) {
-          deps.add(dep)
-        }
+  /** Keep the Effect's gate, and `skipInitial` suppression, open until a pending initial load settles. */
+  private trackInitialLoad(
+    result: true | Promise<unknown>,
+    replacementAfterFailure: () => Promise<void> | undefined,
+  ): void {
+    if (!(result instanceof Promise) || this.reachedReady || this.disposed)
+      return
+    this.pendingInitialLoads.add(result)
+    const release = () => {
+      if (this.pendingInitialLoads.delete(result) && !this.disposed)
+        this.scheduleGraphRun()
+    }
+    // A load failure disposes the Effect through onLoadSubsetError, so a
+    // rejection releases one microtask later, after that event, as a live
+    // query's tracked rejection does. Any other rejection comes from an
+    // obsolete or aborted acquisition, so the hold fails open: it releases
+    // unless a truncate replacement takes it over.
+    followHeldAcquisition(result, replacementAfterFailure, {
+      settled: (succeeded) =>
+        succeeded ? release() : void Promise.resolve().then(release),
+      replaced: (replacement) => {
+        this.trackInitialLoad(replacement, replacementAfterFailure)
+        release()
+      },
+    })
+  }
+
+  /** Hold Effect callback publication across one authoritative repair chain. */
+  private trackOrderedPublication(
+    promise: Promise<unknown>,
+    replacementAfterFailure: () => Promise<void> | undefined,
+  ): void {
+    if (this.disposed) return
+    if (this.pendingOrderedPublications.size === 0) {
+      this.orderedPublicationFailed = false
+    }
+    this.pendingOrderedPublications.add(promise)
+    const finish = (succeeded: boolean) => {
+      if (!this.pendingOrderedPublications.delete(promise)) return
+      if (!succeeded) this.orderedPublicationFailed = true
+      if (
+        succeeded &&
+        !this.orderedPublicationFailed &&
+        this.pendingOrderedPublications.size === 0 &&
+        !this.disposed
+      ) {
+        // The repair chain already drove its private D2 state to quiescence.
+        // Run once more to publish the accumulated net delta.
+        this.scheduleGraphRun()
       }
     }
-
-    // Ensure dependent builders are scheduled in this context so that
-    // dependency edges always point to a real job.
-    if (contextId) {
-      for (const dep of deps) {
-        if (
-          typeof dep === `object` &&
-          dep !== null &&
-          `scheduleGraphRun` in dep &&
-          typeof (dep as any).scheduleGraphRun === `function`
-        ) {
-          ;(dep as any).scheduleGraphRun(undefined, { contextId })
-        }
-      }
-    }
-
-    transactionScopedScheduler.schedule({
-      contextId,
-      jobId: this,
-      dependencies: deps,
-      run: () => this.executeScheduledGraphRun(),
+    // A failed repair chain fails closed until a fresh chain starts. A
+    // replacement settles after replay rows reach this Effect's private D2
+    // state, so it takes over the same publication hold.
+    followHeldAcquisition(promise, replacementAfterFailure, {
+      settled: finish,
+      replaced: (replacement) => {
+        if (this.pendingOrderedPublications.delete(promise) && !this.disposed)
+          this.trackOrderedPublication(replacement, replacementAfterFailure)
+      },
     })
   }
 
   /**
-   * Called by the scheduler when dependencies are satisfied.
-   * Checks that the effect is still active before running.
-   */
-  private executeScheduledGraphRun(): void {
-    if (this.disposed || !this.subscribedToAllCollections) return
-    this.runGraph()
-  }
-
-  /**
-   * Send changes to the D2 input for the given alias.
+   * Send changes to the D2 input for the given lexical source.
    * Returns the number of multiset entries sent.
    */
   private sendChangesToD2(
-    alias: string,
+    sourceId: string,
     changes: Array<ChangeMessage<any, string | number>>,
   ): number {
     if (this.disposed || !this.inputs || !this.graph) return 0
 
-    const input = this.inputs[alias]
+    const input = this.inputs[sourceId]
     if (!input) return 0
 
-    // Filter duplicates per alias
-    const sentKeys = this.sentToD2KeysByAlias.get(alias)!
-    const filtered = filterDuplicateInserts(changes, sentKeys)
+    const sentRows = this.sentToD2RowsBySource.get(sourceId)!
+    const reconciled = reconcileChangesForD2(changes, sentRows)
 
-    return sendChangesToInput(input, filtered)
+    return sendChangesToInput(input, reconciled)
   }
 
   /**
@@ -730,7 +1013,9 @@ class EffectPipelineRunner<TRow extends object, TKey extends string | number> {
 
     this.isGraphRunning = true
     try {
-      while (this.graph.pendingWork()) {
+      if (!this.graph.pendingWork()) this.loadMoreIfNeeded()
+      // Ordered refill can also dispose the runner between graph steps.
+      while (!this.isDisposed() && this.graph.pendingWork()) {
         this.graph.run()
         // A handler (via onBatchProcessed) or source error callback may have
         // called dispose() during graph.run(). Stop early to avoid operating
@@ -745,15 +1030,16 @@ class EffectPipelineRunner<TRow extends object, TKey extends string | number> {
       }
       // Emit all accumulated events once the graph reaches quiescence
       this.flushPendingChanges()
+      this.latchReady()
+      if (
+        this.skipInitial &&
+        !this.initialLoadComplete &&
+        this.canCompleteInitialLoad()
+      ) {
+        this.initialLoadComplete = true
+      }
     } finally {
       this.isGraphRunning = false
-      // If dispose() was called during this graph run, it deferred the heavy
-      // cleanup (clearing graph/inputs/pipeline) to avoid nulling references
-      // mid-loop. Complete that cleanup now.
-      if (this.deferredCleanup) {
-        this.deferredCleanup = false
-        this.finalCleanup()
-      }
     }
   }
 
@@ -761,18 +1047,34 @@ class EffectPipelineRunner<TRow extends object, TKey extends string | number> {
   private flushPendingChanges(): void {
     if (this.pendingChanges.size === 0) return
 
-    // If skipInitial and initial load isn't complete yet, discard
-    if (this.skipInitial && !this.initialLoadComplete) {
-      this.pendingChanges = new Map()
+    if (
+      this.orderedPublicationFailed ||
+      this.pendingOrderedPublications.size > 0
+    ) {
       return
     }
+
+    if (this.hasPendingJoinedFilterWork()) {
+      return
+    }
+
+    const shouldPublish = !this.skipInitial || this.initialLoadComplete
+    const tracksPublishedRows = this.orderedLoaders.size > 0
 
     const events: Array<DeltaEvent<TRow, TKey>> = []
 
     for (const [key, changes] of this.pendingChanges) {
-      const event = classifyDelta<TRow, TKey>(key as TKey, changes)
+      const event = classifyDelta<TRow, TKey>(
+        key as TKey,
+        changes,
+        tracksPublishedRows ? this.publishedRows : undefined,
+      )
       if (event) {
-        events.push(event)
+        if (tracksPublishedRows) {
+          if (event.type === `exit`) this.publishedRows.delete(key)
+          else this.publishedRows.set(key, event.value)
+        }
+        if (shouldPublish) events.push(event)
       }
     }
 
@@ -783,10 +1085,68 @@ class EffectPipelineRunner<TRow extends object, TKey extends string | number> {
     }
   }
 
-  /** Check if all source collections are in the ready state */
-  private checkAllCollectionsReady(): boolean {
-    return Object.values(this.collections).every((collection) =>
-      collection.isReady(),
+  /** Check the source-readiness part of initial readiness for every source. */
+  private sourcesPermitInitialReadiness(): boolean {
+    return this.collectionSources.every(({ collection }) =>
+      sourcePermitsInitialReadiness(collection),
+    )
+  }
+
+  /** Latch the Effect's initial gate and report whether it has been reached. */
+  private latchReady(): boolean {
+    if (!this.reachedReady && this.canCompleteInitialLoad()) {
+      this.reachedReady = true
+      // A problem the sources already show when the gate opens is the first
+      // change the app hears of. A healthy gate's tree is known without an
+      // announcement, so a health:change for the status change that opened
+      // the gate repeats nothing.
+      const tree = this.healthTree()
+      if (tree.hasErrors) this.reportHealth()
+      else this.reportedTree = tree
+    }
+    return this.reachedReady
+  }
+
+  /** The health tree for this effect's sources, in query order. */
+  private healthTree(): HealthNode {
+    return healthNode(this, undefined, {
+      alias: `root`,
+      collectionId: `effect`,
+      kind: `live-query`,
+      status: this.reachedReady ? `ready` : `loading`,
+      failureReason: null,
+      error: null,
+      reloading: false,
+      sources: this.collectionSources.map(({ sourceId, alias, collection }) =>
+        buildHealthTree(collection, { alias, id: sourceId }, this),
+      ),
+    })
+  }
+
+  private reportHealth(): void {
+    if (this.disposed || !this.reachedReady || !this.onHealthChange) return
+    // An unchanged tree keeps its identity; report each change once.
+    const tree = this.healthTree()
+    if (tree === this.reportedTree) return
+    this.reportedTree = tree
+    this.onHealthChange(tree)
+  }
+
+  private canCompleteInitialLoad(): boolean {
+    return (
+      !this.orderedPublicationFailed &&
+      this.pendingOrderedPublications.size === 0 &&
+      this.pendingInitialLoads.size === 0 &&
+      !this.hasPendingJoinedFilterWork() &&
+      this.sourcesPermitInitialReadiness()
+    )
+  }
+
+  private hasPendingJoinedFilterWork(): boolean {
+    return Object.values(this.optimizableOrderByCollections).some(
+      (info) =>
+        info.joinedFilterSourceId !== undefined &&
+        this.hasPendingJoinedWork(info.joinedFilterSourceId),
     )
   }
 
@@ -805,6 +1165,10 @@ class EffectPipelineRunner<TRow extends object, TKey extends string | number> {
     orderBy?: any
     limit?: number
   } {
+    if (this.query.limit === 0) {
+      return { includeInitialState: false, whereExpression }
+    }
+
     // Ordered aliases explicitly disable initial state — data is loaded
     // via requestLimitedSnapshot/requestSnapshot after subscription setup.
     if (orderByInfo) {
@@ -815,7 +1179,11 @@ class EffectPipelineRunner<TRow extends object, TKey extends string | number> {
 
     // For unordered subscriptions, pass orderBy/limit hints so on-demand
     // collections can optimise server-side fetching.
-    const hints = computeSubscriptionOrderByHints(this.query, alias)
+    const hints = computeSubscriptionOrderByHints(
+      this.query,
+      alias,
+      this.queryCompareOptions,
+    )
 
     return {
       includeInitialState,
@@ -826,133 +1194,32 @@ class EffectPipelineRunner<TRow extends object, TKey extends string | number> {
   }
 
   /**
-   * Request the initial ordered snapshot for an alias.
-   * Uses requestLimitedSnapshot (index-based cursor) or requestSnapshot
-   * (full load with limit) depending on whether an index is available.
-   */
-  private requestInitialOrderedSnapshot(
-    alias: string,
-    orderByInfo: OrderByOptimizationInfo,
-    subscription: CollectionSubscription,
-  ): void {
-    const { orderBy, offset, limit, index } = orderByInfo
-    const normalizedOrderBy = normalizeOrderByPaths(orderBy, alias)
-
-    if (index) {
-      subscription.setOrderByIndex(index)
-      subscription.requestLimitedSnapshot({
-        limit: offset + limit,
-        orderBy: normalizedOrderBy,
-        trackLoadSubsetPromise: false,
-      })
-    } else {
-      subscription.requestSnapshot({
-        orderBy: normalizedOrderBy,
-        limit: offset + limit,
-        trackLoadSubsetPromise: false,
-      })
-    }
-  }
-
-  /**
-   * Get orderBy optimization info for a given alias.
-   * Returns undefined if no optimization exists for this alias.
-   */
-  private getOrderByInfoForAlias(
-    alias: string,
-  ): OrderByOptimizationInfo | undefined {
-    // optimizableOrderByCollections is keyed by collection ID
-    const collectionId = this.compiledAliasToCollectionId[alias]
-    if (!collectionId) return undefined
-
-    const info = this.optimizableOrderByCollections[collectionId]
-    if (info && info.alias === alias) {
-      return info
-    }
-    return undefined
-  }
-
-  /**
    * After each graph run step, check if any ordered query's topK operator
    * needs more data. If so, load more rows via requestLimitedSnapshot.
    */
   private loadMoreIfNeeded(): void {
-    for (const [, orderByInfo] of Object.entries(
-      this.optimizableOrderByCollections,
-    )) {
-      if (!orderByInfo.dataNeeded || !orderByInfo.index) continue
-
-      if (this.pendingOrderedLoadPromise) {
-        // Wait for in-flight loads to complete before requesting more
-        continue
-      }
-
-      const n = orderByInfo.dataNeeded()
-      if (n > 0) {
-        this.loadNextItems(orderByInfo, n)
+    for (const loader of this.orderedLoaders.values()) {
+      try {
+        loader.loadMore()
+      } catch (error) {
+        if (
+          !this.disposed &&
+          !Object.values(this.subscriptions).some((subscription) =>
+            Object.is(subscription.lastError, error),
+          )
+        )
+          throw error
       }
     }
   }
 
-  /**
-   * Load n more items from the source collection, starting from the cursor
-   * position (the biggest value sent so far).
-   */
-  private loadNextItems(orderByInfo: OrderByOptimizationInfo, n: number): void {
-    const { alias } = orderByInfo
-    const subscription = this.subscriptions[alias]
-    if (!subscription) return
-
-    const cursor = computeOrderedLoadCursor(
-      orderByInfo,
-      this.biggestSentValue.get(alias),
-      this.lastLoadRequestKey.get(alias),
-      alias,
-      n,
+  private hasPendingJoinedWork(joinedSourceId: string): boolean {
+    return hasPendingJoinedSourceWork(
+      joinedSourceId,
+      this.lazySourcesCallbacks,
+      this.subscriptions,
+      (planId) => this.demand.hasPendingDemand(planId),
     )
-    if (!cursor) return // Duplicate request — skip
-
-    this.lastLoadRequestKey.set(alias, cursor.loadRequestKey)
-
-    subscription.requestLimitedSnapshot({
-      orderBy: cursor.normalizedOrderBy,
-      limit: n,
-      minValues: cursor.minValues,
-      trackLoadSubsetPromise: false,
-      onLoadSubsetResult: (loadResult: Promise<void> | true) => {
-        // Track in-flight load to prevent redundant concurrent requests
-        if (loadResult instanceof Promise) {
-          this.pendingOrderedLoadPromise = loadResult
-          loadResult.finally(() => {
-            if (this.pendingOrderedLoadPromise === loadResult) {
-              this.pendingOrderedLoadPromise = undefined
-            }
-          })
-        }
-      },
-    })
-  }
-
-  /**
-   * Track the biggest value sent for a given ordered alias.
-   * Used for cursor-based pagination in loadNextItems.
-   */
-  private trackSentValues(
-    alias: string,
-    changes: Array<ChangeMessage<any, string | number>>,
-    comparator: (a: any, b: any) => number,
-  ): void {
-    const sentKeys = this.sentToD2KeysByAlias.get(alias) ?? new Set()
-    const result = trackBiggestSentValue(
-      changes,
-      this.biggestSentValue.get(alias),
-      sentKeys,
-      comparator,
-    )
-    this.biggestSentValue.set(alias, result.biggest)
-    if (result.shouldResetLoadKey) {
-      this.lastLoadRequestKey.delete(alias)
-    }
   }
 
   /** Tear down subscriptions and clear state */
@@ -961,42 +1228,42 @@ class EffectPipelineRunner<TRow extends object, TKey extends string | number> {
     this.disposed = true
     this.subscribedToAllCollections = false
 
-    // Immediately unsubscribe from sources and clear cheap state
-    this.unsubscribeCallbacks.forEach((fn) => fn())
-    this.unsubscribeCallbacks.clear()
-    this.sentToD2KeysByAlias.clear()
+    // Release every source in one pass; the first failure wins after the
+    // peers finish. A reentrant dispose returns at the guard above, so this
+    // call still owns each release exactly once.
+    try {
+      runAllCallbacks(this.unsubscribeCallbacks)
+    } finally {
+      this.unsubscribeCallbacks.clear()
+      this.clearPipelineState()
+    }
+  }
+
+  private clearPipelineState(): void {
+    this.sentToD2RowsBySource.clear()
     this.pendingChanges.clear()
+    this.publishedRows.clear()
+    this.pendingOrderedPublications.clear()
+    this.pendingInitialLoads.clear()
+    this.orderedPublicationFailed = false
     this.lazySources.clear()
+    this.demand.clear()
     this.builderDependencies.clear()
-    this.biggestSentValue.clear()
-    this.lastLoadRequestKey.clear()
-    this.pendingOrderedLoadPromise = undefined
+    for (const loader of this.orderedLoaders.values()) loader.dispose()
+    this.orderedLoaders.clear()
 
     // Clear mutable objects
     for (const key of Object.keys(this.lazySourcesCallbacks)) {
       delete this.lazySourcesCallbacks[key]
     }
-    for (const key of Object.keys(this.aliasDependencies)) {
-      delete this.aliasDependencies[key]
-    }
     for (const key of Object.keys(this.optimizableOrderByCollections)) {
       delete this.optimizableOrderByCollections[key]
     }
 
-    // If the graph is currently running, defer clearing graph/inputs/pipeline
-    // until runGraph() completes — otherwise we'd null references mid-loop.
-    if (this.isGraphRunning) {
-      this.deferredCleanup = true
-    } else {
-      this.finalCleanup()
-    }
-  }
-
-  /** Clear graph references — called after graph run completes or immediately from dispose */
-  private finalCleanup(): void {
+    // graph.run() keeps its own stack reference. The disposed guard prevents
+    // another step or new input; clearing our references does not destroy it.
     this.graph = undefined
     this.inputs = undefined
-    this.pipeline = undefined
     this.sourceWhereClauses = undefined
   }
 }
@@ -1052,35 +1319,47 @@ function accumulateEffectChanges<T>(
   return acc
 }
 
-/** Classify accumulated per-key changes into a DeltaEvent */
+/** Interpret a D2 batch against callback-visible state when a window holds it. */
 function classifyDelta<TRow extends object, TKey extends string | number>(
   key: TKey,
   changes: EffectChanges<TRow>,
+  publishedRows?: ReadonlyMap<unknown, TRow>,
 ): DeltaEvent<TRow, TKey> | undefined {
   const { inserts, deletes, insertValue, deleteValue } = changes
+  const wasPresent = publishedRows ? publishedRows.has(key) : deletes > 0
+  const previousValue = publishedRows?.get(key) ?? deleteValue
+  const isPresent = publishedRows
+    ? Number(wasPresent) + inserts - deletes > 0
+    : inserts > 0
 
-  if (inserts > 0 && deletes === 0) {
+  if (!wasPresent && isPresent) {
     // Row entered the query result
     return { type: `enter`, key, value: insertValue! }
   }
 
-  if (deletes > 0 && inserts === 0) {
+  if (wasPresent && !isPresent) {
     // Row exited the query result — value is the exiting value,
     // previousValue is omitted (it would be identical to value)
-    return { type: `exit`, key, value: deleteValue! }
+    return { type: `exit`, key, value: previousValue ?? deleteValue! }
   }
 
-  if (inserts > 0 && deletes > 0) {
+  if (
+    wasPresent &&
+    isPresent &&
+    insertValue !== undefined &&
+    (!publishedRows || !deepEquals(previousValue, insertValue))
+  ) {
     // Row updated within the query result
     return {
       type: `update`,
       key,
-      value: insertValue!,
-      previousValue: deleteValue!,
+      value: insertValue,
+      previousValue: previousValue!,
     }
   }
 
-  // inserts === 0 && deletes === 0 — no net change (should not happen)
+  // The row was absent both before and after the held delta, or its final
+  // value is equal to the last callback-visible value.
   return undefined
 }
 
@@ -1090,9 +1369,10 @@ function trackPromise(
   inFlightHandlers: Set<Promise<void>>,
 ): void {
   inFlightHandlers.add(promise)
-  promise.finally(() => {
+  const finish = () => {
     inFlightHandlers.delete(promise)
-  })
+  }
+  void promise.then(finish, finish)
 }
 
 /** Report an error to the onError callback or console */
@@ -1101,16 +1381,31 @@ function reportError<TRow extends object, TKey extends string | number>(
   event: DeltaEvent<TRow, TKey>,
   onError?: (error: Error, event: DeltaEvent<TRow, TKey>) => void,
 ): void {
-  const normalised = error instanceof Error ? error : new Error(String(error))
+  const normalised = normalizeError(error)
   if (onError) {
     try {
       onError(normalised, event)
     } catch (onErrorError) {
       // Don't let onError errors propagate
-      console.error(`[Effect] Error in onError handler:`, onErrorError)
-      console.error(`[Effect] Original error:`, normalised)
+      console.error(
+        devBuild() && process.env.NODE_ENV !== `production`
+          ? `[Effect] Error in onError handler:`
+          : codedMessage(224),
+        onErrorError,
+      )
+      console.error(
+        devBuild() && process.env.NODE_ENV !== `production`
+          ? `[Effect] Original error:`
+          : codedMessage(225),
+        normalised,
+      )
     }
   } else {
-    console.error(`[Effect] Unhandled error in handler:`, normalised)
+    console.error(
+      devBuild() && process.env.NODE_ENV !== `production`
+        ? `[Effect] Unhandled error in handler:`
+        : codedMessage(226),
+      normalised,
+    )
   }
 }

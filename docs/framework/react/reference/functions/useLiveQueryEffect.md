@@ -3,13 +3,11 @@ id: useLiveQueryEffect
 title: useLiveQueryEffect
 ---
 
-# Function: useLiveQueryEffect()
-
 ```ts
 function useLiveQueryEffect<TRow, TKey>(config, deps): void;
 ```
 
-Defined in: [useLiveQueryEffect.ts:30](https://github.com/TanStack/db/blob/main/packages/react-db/src/useLiveQueryEffect.ts#L30)
+Defined in: [useLiveQueryEffect.ts:32](https://github.com/TanStack/db/blob/main/packages/react-db/src/useLiveQueryEffect.ts#L32)
 
 React hook for creating a reactive effect that fires handlers when rows
 enter, exit, or update within a query result.

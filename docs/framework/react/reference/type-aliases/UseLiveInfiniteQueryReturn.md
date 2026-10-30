@@ -3,13 +3,11 @@ id: UseLiveInfiniteQueryReturn
 title: UseLiveInfiniteQueryReturn
 ---
 
-# Type Alias: UseLiveInfiniteQueryReturn\<TContext\>
-
 ```ts
 type UseLiveInfiniteQueryReturn<TContext> = Omit<ReturnType<typeof useLiveQuery>, "data"> & object;
 ```
 
-Defined in: [useLiveInfiniteQuery.ts:39](https://github.com/TanStack/db/blob/main/packages/react-db/src/useLiveInfiniteQuery.ts#L39)
+Defined in: [useLiveInfiniteQuery.ts:60](https://github.com/TanStack/db/blob/main/packages/react-db/src/useLiveInfiniteQuery.ts#L60)
 
 ## Type Declaration
 
@@ -22,12 +20,12 @@ data: InferResultType<TContext>;
 ### fetchNextPage()
 
 ```ts
-fetchNextPage: () => void;
+fetchNextPage: () => Promise<void>;
 ```
 
 #### Returns
 
-`void`
+`Promise`\<`void`\>
 
 ### hasNextPage
 

@@ -1,12 +1,18 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { ShapeStream } from '@electric-sql/client'
 import {
-  CollectionImpl,
+  IR,
   createCollection,
+  createLiveQueryCollection,
   createTransaction,
+  gt,
+  withAcceptedReceipt,
 } from '@tanstack/db'
 import { persistedCollectionOptions } from '../../db-sqlite-persistence-core/src'
 import { electricCollectionOptions, isChangeMessage } from '../src/electric'
 import { stripVirtualProps } from '../../db/tests/utils'
+import { createMockStream } from './electric-stream-mock'
+import type { PersistedStorageTarget } from '../../db-sqlite-persistence-core/src'
 import type { ElectricCollectionUtils } from '../src/electric'
 import type {
   Collection,
@@ -15,10 +21,22 @@ import type {
   PendingMutation,
   SyncMetadataApi,
   Transaction,
-  TransactionWithMutations,
 } from '@tanstack/db'
 import type { Message, Row } from '@electric-sql/client'
 import type { StandardSchemaV1 } from '@standard-schema/spec'
+
+const NativeAbortController = globalThis.AbortController
+
+function createDeferred<T>(): {
+  promise: Promise<T>
+  resolve: (value: T | PromiseLike<T>) => void
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
+}
 
 // Mock the ShapeStream module
 const mockSubscribe = vi.fn()
@@ -27,6 +45,7 @@ const mockFetchSnapshot = vi.fn()
 const mockForceDisconnectAndRefresh = vi.fn()
 const mockStream = {
   subscribe: mockSubscribe,
+  unsubscribeAll: vi.fn(),
   requestSnapshot: mockRequestSnapshot,
   fetchSnapshot: mockFetchSnapshot,
   forceDisconnectAndRefresh: mockForceDisconnectAndRefresh,
@@ -39,8 +58,29 @@ vi.mock(`@electric-sql/client`, async () => {
   const actual = await vi.importActual(`@electric-sql/client`)
   return {
     ...actual,
-    ShapeStream: vi.fn(() => mockStream),
+    ShapeStream: vi.fn(function () {
+      return createMockStream(mockStream)
+    }),
   }
+})
+
+describe(`Electric stream mock`, () => {
+  beforeEach(() => vi.clearAllMocks())
+
+  it.each([false, true])(
+    `retires its mock callback when release occurs during subscribe: %s`,
+    (duringSubscribe) => {
+      const stream = createMockStream(mockStream)
+      const release = vi.fn()
+      mockSubscribe.mockImplementationOnce(() => {
+        if (duringSubscribe) stream.unsubscribeAll()
+        return release
+      })
+      stream.subscribe(() => {})
+      if (!duringSubscribe) stream.unsubscribeAll()
+      expect(release).toHaveBeenCalledOnce()
+    },
+  )
 })
 
 describe(`Electric Integration`, () => {
@@ -71,6 +111,7 @@ describe(`Electric Integration`, () => {
     return {
       collectionMetadata,
       api: {
+        persistence: null,
         row: {
           get: () => undefined,
           set: () => {},
@@ -95,16 +136,44 @@ describe(`Electric Integration`, () => {
 
   const createPersistedAdapter = (
     collectionMetadata?: Map<string, unknown>,
+    rows: Map<string | number, Row> = new Map(),
   ) => ({
-    loadSubset: async () => [],
-    loadCollectionMetadata: async () =>
-      Array.from((collectionMetadata ?? new Map()).entries()).map(
-        ([key, value]) => ({
-          key,
-          value,
-        }),
+    loadSubset: () =>
+      Promise.resolve(
+        Array.from(rows.entries()).map(([key, value]) => ({ key, value })),
       ),
-    applyCommittedTx: async (_collectionId: string, tx: any) => {
+    loadResumeSnapshot: (
+      _target: PersistedStorageTarget,
+      options?: { includeRows?: boolean },
+    ) =>
+      Promise.resolve({
+        rows:
+          options?.includeRows === false
+            ? []
+            : Array.from(rows.entries()).map(([key, value]) => ({
+                key,
+                value,
+              })),
+        keySet: { status: `consistent` as const },
+        collectionMetadata: Array.from(
+          (collectionMetadata ?? new Map()).entries(),
+          ([key, value]) => ({ key, value }),
+        ),
+        latestTerm: 0,
+        latestSeq: 0,
+        latestRowVersion: 0,
+        resetEpoch: 0,
+      }),
+    loadCollectionMetadata: () =>
+      Promise.resolve(
+        Array.from((collectionMetadata ?? new Map()).entries()).map(
+          ([key, value]) => ({
+            key,
+            value,
+          }),
+        ),
+      ),
+    applyCommittedTx: (_target: PersistedStorageTarget, tx: any) => {
       for (const mutation of tx.collectionMetadataMutations ?? []) {
         if (mutation.type === `delete`) {
           collectionMetadata?.delete(mutation.key)
@@ -112,8 +181,19 @@ describe(`Electric Integration`, () => {
           collectionMetadata?.set(mutation.key, mutation.value)
         }
       }
+      if (tx.truncate) {
+        rows.clear()
+      }
+      for (const mutation of tx.mutations ?? []) {
+        if (mutation.type === `delete`) {
+          rows.delete(mutation.key)
+        } else {
+          rows.set(mutation.key, mutation.value)
+        }
+      }
+      return Promise.resolve()
     },
-    ensureIndex: async () => {},
+    ensureIndex: () => Promise.resolve(),
   })
 
   beforeEach(() => {
@@ -172,6 +252,520 @@ describe(`Electric Integration`, () => {
     expect(collection.status).toEqual(`ready`)
   })
 
+  // A reload runs `sync` again while the Collection still shows `error`.
+  // The new stream's outcome, not that status, decides the reload.
+  it.each([`up-to-date`, `stream error`] as const)(
+    `settles a reload after a failed first load: new stream %s`,
+    async (outcome) => {
+      const loggedError = vi
+        .spyOn(console, `error`)
+        .mockImplementation(() => {})
+      const lastStreamOptions = () =>
+        vi.mocked(ShapeStream).mock.calls.at(-1)?.[0] as
+          { onError?: (error: unknown) => void } | undefined
+      try {
+        const preload = collection.preload()
+        lastStreamOptions()?.onError?.(new Error(`initial stream failed`))
+        await preload.catch(() => undefined)
+        expect(collection.status).toBe(`error`)
+
+        const reload = collection.reload().then(
+          () => `resolved`,
+          () => `rejected`,
+        )
+        if (outcome === `up-to-date`)
+          subscriber([{ headers: { control: `up-to-date` } }])
+        else lastStreamOptions()?.onError?.(new Error(`reload stream failed`))
+        const settled = await Promise.race([
+          reload,
+          new Promise((resolve) => setTimeout(() => resolve(`pending`), 200)),
+        ])
+        expect(settled).toBe(outcome === `up-to-date` ? `resolved` : `rejected`)
+        expect(collection.status).toBe(
+          outcome === `up-to-date` ? `ready` : `error`,
+        )
+      } finally {
+        loggedError.mockRestore()
+      }
+    },
+  )
+
+  // Receiving witness for the reload law (owner: the source-health oracle).
+  // A reload keeps the rows on screen until it completes and then ends with
+  // the source's current rows. The new run replaces rows only with a
+  // snapshot transaction or its own truncate; every other write applies on
+  // the kept rows, and a run that sends no snapshot completes the reload at
+  // its markReady (maintainer decision F19, /tmp/unify/snapshot-api.md §2–3).
+  //
+  // The fake source is the model: a table and a log of its changes. A stream
+  // that starts from a stored offset and handle gets the log after that
+  // offset, then up-to-date; one that starts without them gets every row,
+  // then up-to-date. A must-refetch makes the stream start over with every
+  // row. Electric stores the offset and handle of its last up-to-date only
+  // when the server sent a handle, so `handle: false` reaches a reload that
+  // cannot resume.
+  describe(`reload of a ready Collection`, () => {
+    type SourceChange = {
+      operation: `insert` | `update` | `delete`
+      value: Row
+    }
+    const initialRows: Array<Row> = [
+      { id: 1, name: `one` },
+      { id: 2, name: `two` },
+      { id: 3, name: `three` },
+    ]
+    const changesDuringReload: Array<SourceChange> = [
+      { operation: `update`, value: { id: 1, name: `one, edited` } },
+      { operation: `delete`, value: { id: 2 } },
+      { operation: `insert`, value: { id: 4, name: `four` } },
+    ]
+
+    it.each([
+      { stream: `resumes with no changes`, handle: true, changes: [] },
+      {
+        stream: `resumes with changes`,
+        handle: true,
+        changes: changesDuringReload,
+      },
+      {
+        stream: `cannot resume and sends every row`,
+        handle: false,
+        changes: changesDuringReload,
+      },
+      {
+        stream: `resumes and gets a must-refetch`,
+        handle: true,
+        changes: changesDuringReload,
+        mustRefetch: true,
+      },
+    ])(
+      `keeps its rows until it completes and ends with the source's rows: the new stream $stream`,
+      async ({ handle, changes, mustRefetch }) => {
+        const table = new Map(initialRows.map((row) => [row.id, row]))
+        const log: Array<SourceChange> = []
+        const changeMessage = ({ operation, value }: SourceChange) => ({
+          key: String(value.id),
+          value,
+          headers: { operation },
+        })
+        const upToDate = () => {
+          mockStream.shapeHandle = handle ? `shape-1` : undefined
+          mockStream.lastOffset = `${log.length}_0`
+          return { headers: { control: `up-to-date` as const } }
+        }
+        const sendEveryRow = () =>
+          subscriber([
+            ...Array.from(table.values(), (value) =>
+              changeMessage({ operation: `insert`, value }),
+            ),
+            upToDate(),
+          ])
+        const rows = () =>
+          new Map(
+            Array.from(collection.state.values(), (row) => [
+              row.id,
+              stripVirtualProps(row),
+            ]),
+          )
+        const streamStart = () =>
+          vi.mocked(ShapeStream).mock.calls.at(-1)![0] as unknown as {
+            offset?: string
+            handle?: string
+          }
+
+        sendEveryRow()
+        expect(collection.status).toBe(`ready`)
+        const shownBeforeReload = rows()
+        expect(shownBeforeReload).toEqual(new Map(table))
+
+        for (const change of changes) {
+          log.push(change)
+          if (change.operation === `delete`) table.delete(change.value.id)
+          else table.set(change.value.id, change.value)
+        }
+
+        const reload = collection.reload().then(
+          () => `resolved`,
+          (error: unknown) => error,
+        )
+        // The reach of this case: the new stream resumes exactly when the
+        // retired one stored a handle.
+        const start = streamStart()
+        expect(start.handle !== undefined).toBe(handle)
+        expect(rows()).toEqual(shownBeforeReload)
+
+        if (mustRefetch) {
+          subscriber([{ headers: { control: `must-refetch` } }])
+          expect(rows()).toEqual(shownBeforeReload)
+          sendEveryRow()
+        } else if (start.offset !== undefined && start.offset !== `-1`) {
+          const after = Number(start.offset.split(`_`)[0])
+          subscriber([...log.slice(after).map(changeMessage), upToDate()])
+        } else {
+          sendEveryRow()
+        }
+
+        const settled = await Promise.race([
+          reload,
+          new Promise((resolve) => setTimeout(() => resolve(`pending`), 200)),
+        ])
+        expect(settled).toBe(`resolved`)
+        expect(collection.status).toBe(`ready`)
+        expect(collection.health.reloading).toBe(false)
+        expect(rows()).toEqual(new Map(table))
+      },
+    )
+  })
+
+  // The same law for an on-demand Collection, whose rows come from subset
+  // snapshots that a subscription's demand requests. The reload's new run
+  // sends no snapshot of the whole shape, so it completes at its
+  // markReady() and keeps the rows; core then replays the demand, and the
+  // replayed subset snapshot's rows apply on the kept rows: Electric writes
+  // an update for a key the Collection holds (snapshot-api §8). The fake
+  // source answers every subset request with its current rows. A resumed
+  // stream delivers its changes after the stored offset; a stream that
+  // cannot resume starts at `now` and delivers none of them. Afterwards a
+  // row the source holds shows its current value, and an untouched row
+  // survives. Core does not sweep after a reload (§8, issue #2269), so a row
+  // the source deleted while no stream listened stays in the history that
+  // cannot resume: no subset snapshot can say a row is gone.
+  it.each([true, false])(
+    `an on-demand reload keeps its rows and ends with the source's rows (resumes: %s)`,
+    async (handle) => {
+      const table = new Map<number, Row>([
+        [1, { id: 1, name: `one` }],
+        [2, { id: 2, name: `two` }],
+        [3, { id: 3, name: `three` }],
+      ])
+      const log: Array<Message<Row>> = []
+      mockRequestSnapshot.mockImplementation(() => {
+        subscriber([
+          ...Array.from(table.values(), (value) => ({
+            key: String(value.id),
+            value,
+            headers: { operation: `insert` as const },
+          })),
+          { headers: { control: `subset-end` } } as Message<Row>,
+        ])
+        return Promise.resolve()
+      })
+      const upToDate = () => {
+        mockStream.shapeHandle = handle ? `shape-1` : undefined
+        mockStream.lastOffset = `${log.length}_0`
+        return { headers: { control: `up-to-date` as const } }
+      }
+      const onDemand = createCollection(
+        electricCollectionOptions({
+          id: `on-demand-reload-of-ready`,
+          shapeOptions: { url: `http://test-url`, params: { table: `t` } },
+          syncMode: `on-demand`,
+          getKey: (item: Row) => item.id as number,
+          startSync: true,
+        }),
+      )
+      const rows = () =>
+        new Map(
+          Array.from(onDemand.state.values(), (row) => [
+            row.id,
+            stripVirtualProps(row),
+          ]),
+        )
+      const subscription = onDemand.subscribeChanges(() => {}, {
+        includeInitialState: true,
+      })
+      try {
+        subscriber([upToDate()])
+        await vi.waitFor(() => expect(rows()).toEqual(new Map(table)))
+        const before = rows()
+
+        const edited = { id: 1, name: `one, edited` }
+        table.set(1, edited)
+        log.push({
+          key: `1`,
+          value: edited,
+          headers: { operation: `update` },
+        })
+        table.delete(2)
+        log.push({
+          key: `2`,
+          value: { id: 2 },
+          headers: { operation: `delete` },
+        })
+
+        const reload = onDemand.reload().then(
+          () => `resolved`,
+          (error: unknown) => error,
+        )
+        expect(rows()).toEqual(before)
+        const start = vi
+          .mocked(ShapeStream)
+          .mock.calls.at(-1)![0] as unknown as {
+          offset?: string
+          handle?: string
+        }
+        // The reach of this case: the new stream resumes exactly when the
+        // retired one stored a handle.
+        expect(start.handle !== undefined).toBe(handle)
+        const resumedChanges = handle
+          ? log.slice(Number(start.offset!.split(`_`)[0]))
+          : []
+        subscriber([...resumedChanges, upToDate()])
+
+        expect(await reload).toBe(`resolved`)
+        const expected = new Map(handle ? table : [...before, ...table])
+        await vi.waitFor(() => expect(rows()).toEqual(expected))
+        expect(onDemand.status).toBe(`ready`)
+      } finally {
+        subscription.unsubscribe()
+        await onDemand.cleanup()
+      }
+    },
+  )
+
+  // An abort ends the load (snapshot-api §8): the adapter must stop and
+  // write no rows for it. Electric serializes subset requests on one stream
+  // cursor, so a load can wait behind another. Here the second load aborts
+  // while it waits. Checkpoints: it rejects with `AbortError`, Electric
+  // never requests its snapshot, and once the first request settles the
+  // Collection holds only the first load's rows. Limit: an abort while a
+  // request is in flight cannot stop the rows the SDK already publishes
+  // through the stream (ShapeStream.requestSnapshot accepts no signal).
+  it(`an aborted load writes no rows and its late result changes nothing`, async () => {
+    const first = createDeferred<void>()
+    mockRequestSnapshot.mockReturnValueOnce(first.promise)
+    const onDemand = createCollection(
+      electricCollectionOptions({
+        id: `on-demand-aborted-load`,
+        shapeOptions: { url: `http://test-url`, params: { table: `t` } },
+        syncMode: `on-demand`,
+        getKey: (item: Row) => item.id as number,
+        startSync: true,
+      }),
+    )
+    try {
+      subscriber([{ headers: { control: `up-to-date` } }])
+      const firstLoad = Promise.resolve(onDemand._sync.loadSubset({ limit: 1 }))
+      const abort = new NativeAbortController()
+      const second = Promise.resolve(
+        onDemand._sync.loadSubset({ limit: 2, signal: abort.signal }),
+      ).then(
+        () => `resolved`,
+        (error: unknown) => error,
+      )
+      await vi.waitFor(() => expect(mockRequestSnapshot).toHaveBeenCalledOnce())
+      abort.abort()
+      expect(await second).toMatchObject({ name: `AbortError` })
+
+      subscriber([
+        { key: `1`, value: { id: 1 }, headers: { operation: `insert` } },
+        { headers: { control: `subset-end` } },
+      ])
+      first.resolve()
+      await firstLoad
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(mockRequestSnapshot).toHaveBeenCalledOnce()
+      expect([...onDemand.keys()]).toEqual([1])
+    } finally {
+      first.resolve()
+      await onDemand.cleanup()
+    }
+  })
+
+  // The same law for a progressive Collection whose reload cannot resume.
+  // Its new stream starts over, so it buffers the full log until its first
+  // up-to-date, and only that atomic swap replaces the kept rows. Before the
+  // swap, a live query's replayed subset load fetches a subset snapshot,
+  // whose rows apply on the kept rows: a kept key takes the source's current
+  // value and no kept row vanishes. After the swap the rows equal the
+  // source's, the reload has settled, and the live query shows them with no
+  // error.
+  it(`a progressive reload that cannot resume keeps its rows through a subset load`, async () => {
+    const table = new Map<number, Row>([
+      [1, { id: 1, name: `one` }],
+      [2, { id: 2, name: `two` }],
+      [3, { id: 3, name: `three` }],
+    ])
+    mockFetchSnapshot.mockImplementation(() =>
+      Promise.resolve({
+        metadata: {},
+        data: Array.from(table.values(), (value) => ({
+          key: String(value.id),
+          value,
+          headers: { operation: `insert` },
+        })),
+      }),
+    )
+    const sendEveryRow = () => {
+      mockStream.shapeHandle = undefined
+      mockStream.lastOffset = `1_0`
+      subscriber([
+        ...Array.from(table.values(), (value) => ({
+          key: String(value.id),
+          value,
+          headers: { operation: `insert` as const },
+        })),
+        { headers: { control: `up-to-date` } },
+      ])
+    }
+    const progressive = createCollection(
+      electricCollectionOptions({
+        id: `progressive-reload-of-ready`,
+        shapeOptions: { url: `http://test-url`, params: { table: `t` } },
+        syncMode: `progressive`,
+        getKey: (item: Row) => item.id as number,
+        startSync: true,
+      }),
+    )
+    const rowsOf = (collection: { values: () => Iterable<Row> }) =>
+      new Map(
+        Array.from(collection.values(), (row) => [
+          row.id as number,
+          stripVirtualProps(row),
+        ]),
+      )
+    const live = createLiveQueryCollection({
+      query: (q) =>
+        q.from({ row: progressive }).where(({ row }) => gt(row.id, 0)),
+    })
+    try {
+      const preload = live.preload()
+      sendEveryRow()
+      await preload
+      expect(rowsOf(progressive)).toEqual(new Map(table))
+      const before = rowsOf(progressive)
+      const fetchesBefore = mockFetchSnapshot.mock.calls.length
+
+      table.set(1, { id: 1, name: `one, edited` })
+      table.delete(2)
+      const reload = progressive.reload().then(
+        () => `resolved`,
+        (error: unknown) => error,
+      )
+      const start = vi.mocked(ShapeStream).mock.calls.at(-1)![0] as unknown as {
+        handle?: string
+      }
+      // The reach of this case: the new stream cannot resume, and the live
+      // query's replayed demand fetches a subset snapshot while it buffers.
+      expect(start.handle).toBeUndefined()
+      await vi.waitFor(() =>
+        expect(mockFetchSnapshot.mock.calls.length).toBeGreaterThan(
+          fetchesBefore,
+        ),
+      )
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      const buffering = rowsOf(progressive)
+      expect(
+        [...before.keys()].filter((key) => !buffering.has(key)),
+        `no kept row vanishes before the swap`,
+      ).toEqual([])
+      expect(live.health.error).toBeNull()
+      expect(buffering.get(1)).toEqual(table.get(1))
+
+      sendEveryRow()
+      expect(await reload).toBe(`resolved`)
+      expect(rowsOf(progressive)).toEqual(new Map(table))
+      await vi.waitFor(() => expect(rowsOf(live)).toEqual(new Map(table)))
+      expect(live.health.error).toBeNull()
+      expect(live.status).toBe(`ready`)
+    } finally {
+      await live.cleanup()
+      await progressive.cleanup()
+    }
+  })
+
+  // A run's markReady() after its fail() does nothing (maintainer decision
+  // F18/F6, /tmp/unify/snapshot-api.md §4). Electric reaches it when the SDK
+  // gives up while a ready run's up-to-date commit waits for acceptance by a
+  // wrapping sync, as persistence accepts after its durable step: the
+  // acceptance then marks the run ready after its fail(). That late ready
+  // must change nothing and must not reject.
+  it(`a ready after the stream gave up changes nothing`, async () => {
+    let giveUpStream!: (error: unknown) => void
+    mockSubscribe.mockImplementation((callback, onError) => {
+      subscriber = callback
+      giveUpStream = onError
+      return () => {}
+    })
+    const acceptance = createDeferred<void>()
+    let holdAcceptance = false
+    const options = electricCollectionOptions({
+      id: `late-ready-after-give-up`,
+      shapeOptions: { url: `http://test-url`, params: { table: `t` } },
+      getKey: (item: Row) => item.id as number,
+    })
+    const held = createCollection({
+      ...options,
+      startSync: true,
+      sync: {
+        ...options.sync,
+        sync: (params: Parameters<typeof options.sync.sync>[0]) =>
+          options.sync.sync({
+            ...params,
+            commit: (signal) => {
+              const applied = params.commit(signal)
+              if (!holdAcceptance) return applied
+              return withAcceptedReceipt(
+                applied === true ? Promise.resolve() : applied,
+                acceptance.promise,
+              )
+            },
+          }),
+      },
+    })
+    const unhandled: Array<unknown> = []
+    const recordUnhandled = (reason: unknown) => unhandled.push(reason)
+    process.on(`unhandledRejection`, recordUnhandled)
+    try {
+      subscriber([
+        { key: `1`, value: { id: 1 }, headers: { operation: `insert` } },
+        { headers: { control: `up-to-date` } },
+      ])
+      expect(held.status).toBe(`ready`)
+
+      holdAcceptance = true
+      subscriber([
+        { key: `3`, value: { id: 3 }, headers: { operation: `insert` } },
+        { headers: { control: `up-to-date` } },
+      ])
+
+      const gaveUp = new Error(`the SDK gave up`)
+      giveUpStream(gaveUp)
+      expect(held.health.error?.cause).toBe(gaveUp)
+      const changes: Array<string> = []
+      held.on(`status:change`, ({ status }) => changes.push(status))
+      held.on(`health:change`, () => changes.push(`health`))
+
+      // The reach of this case: the acceptance arrives after the give-up.
+      acceptance.resolve()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+
+      expect(unhandled).toEqual([])
+      expect(changes).toEqual([])
+      expect(held.status).toBe(`ready`)
+      expect(held.health.error?.cause).toBe(gaveUp)
+    } finally {
+      process.off(`unhandledRejection`, recordUnhandled)
+    }
+  })
+
+  it(`reports an initial stream error instead of publishing an empty ready snapshot`, async () => {
+    const loggedError = vi.spyOn(console, `error`).mockImplementation(() => {})
+    const preload = collection.preload()
+    const streamOptions = vi.mocked(ShapeStream).mock.calls.at(-1)?.[0] as
+      { onError?: (error: unknown) => void } | undefined
+    const initialError = new Error(`initial stream failed`)
+
+    try {
+      streamOptions?.onError?.(initialError)
+
+      expect(collection.status).toBe(`error`)
+      await expect(preload).rejects.toBe(initialError)
+    } finally {
+      loggedError.mockRestore()
+    }
+  })
+
   it(`should handle incoming insert messages and commit on up-to-date`, () => {
     // Simulate incoming insert message
     subscriber([
@@ -192,6 +786,39 @@ describe(`Electric Integration`, () => {
 
     expect(stripCollectionState(collection.state)).toEqual(
       new Map([[1, { id: 1, name: `Test User` }]]),
+    )
+  })
+
+  // Readiness counts accepted rows; they publish when the mutation settles.
+  it(`marks the source ready once its initial rows are accepted`, async () => {
+    const persistence = createDeferred<void>()
+    const transaction = createTransaction({
+      mutationFn: () => persistence.promise,
+    })
+    transaction.mutate(() =>
+      collection.insert({ id: 99, name: `Optimistic user` }),
+    )
+
+    subscriber([
+      {
+        key: `1`,
+        value: { id: 1, name: `Synced user` },
+        headers: { operation: `insert` },
+      },
+      { headers: { control: `up-to-date` } },
+    ])
+    await Promise.resolve()
+
+    expect(collection.status).toBe(`ready`)
+    expect(collection.get(1)).toBeUndefined()
+
+    persistence.resolve()
+    await transaction.when(`settled`)
+    await collection.stateWhenReady()
+
+    expect(collection.status).toBe(`ready`)
+    expect(collection.get(1)).toEqual(
+      expect.objectContaining({ id: 1, name: `Synced user` }),
     )
   })
 
@@ -262,6 +889,76 @@ describe(`Electric Integration`, () => {
     expect(stripCollectionState(collection.state)).toEqual(
       new Map([[1, { id: 1, name: `Updated User` }]]),
     )
+  })
+
+  it(`ignores an update for a key that has never been materialized`, () => {
+    subscriber([
+      {
+        key: `2`,
+        value: { id: 2, name: `Only changed columns` },
+        headers: { operation: `update` },
+      },
+      { headers: { control: `up-to-date` } },
+    ])
+
+    expect(collection.has(2)).toBe(false)
+  })
+
+  it(`accepts an update after an insert for the same key in one batch`, () => {
+    subscriber([
+      {
+        key: `2`,
+        value: { id: 2, name: `Initial value` },
+        headers: { operation: `insert` },
+      },
+      {
+        key: `2`,
+        value: { id: 2, name: `Updated value` },
+        headers: { operation: `update` },
+      },
+      { headers: { control: `up-to-date` } },
+    ])
+
+    expect(collection.get(2)?.name).toBe(`Updated value`)
+  })
+
+  it(`accepts a progressive update after its insert in an earlier callback`, () => {
+    let testSubscriber!: (messages: Array<Message<Row>>) => void
+    mockSubscribe.mockImplementation((callback) => {
+      testSubscriber = callback
+      return () => {}
+    })
+
+    const testCollection = createCollection(
+      electricCollectionOptions({
+        id: `progressive-split-insert-update-test`,
+        shapeOptions: {
+          url: `http://test-url`,
+          params: { table: `test_table` },
+        },
+        syncMode: `progressive`,
+        getKey: (item: Row) => item.id as number,
+        startSync: true,
+      }),
+    )
+
+    testSubscriber([
+      {
+        key: `2`,
+        value: { id: 2, name: `Initial value` },
+        headers: { operation: `insert` },
+      },
+    ])
+    testSubscriber([
+      {
+        key: `2`,
+        value: { id: 2, name: `Updated value` },
+        headers: { operation: `update` },
+      },
+    ])
+    testSubscriber([{ headers: { control: `up-to-date` } }])
+
+    expect(testCollection.get(2)?.name).toBe(`Updated value`)
   })
 
   it(`should handle delete operations`, () => {
@@ -401,6 +1098,39 @@ describe(`Electric Integration`, () => {
       await expect(collection.utils.awaitTxId(testTxid)).resolves.toBe(true)
     })
 
+    it(`uses 15-second defaults for txid and message waits`, async () => {
+      vi.useFakeTimers()
+      let txidError: unknown
+      let matchError: unknown
+
+      try {
+        void collection.utils.awaitTxId(999_999).catch((error: unknown) => {
+          txidError = error
+        })
+        void collection.utils
+          .awaitMatch(() => false)
+          .catch((error: unknown) => {
+            matchError = error
+          })
+
+        await vi.advanceTimersByTimeAsync(14_999)
+        expect(txidError).toBeUndefined()
+        expect(matchError).toBeUndefined()
+
+        await vi.advanceTimersByTimeAsync(1)
+        expect(txidError).toMatchObject({
+          message: expect.stringContaining(`999999`),
+        })
+        expect(matchError).toMatchObject({
+          message: expect.stringContaining(
+            `Timeout waiting for custom match function`,
+          ),
+        })
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
     it(`should track multiple txids`, async () => {
       const txid1 = 100
       const txid2 = 200
@@ -423,6 +1153,101 @@ describe(`Electric Integration`, () => {
       // Both txids should be tracked
       await expect(collection.utils.awaitTxId(txid1)).resolves.not.toThrow()
       await expect(collection.utils.awaitTxId(txid2)).resolves.not.toThrow()
+    })
+
+    it(`exports and imports versioned hydration sync metadata`, async () => {
+      mockStream.shapeHandle = `shape-handle`
+      mockStream.lastOffset = `42_0`
+
+      subscriber([
+        {
+          key: `1`,
+          value: { id: 1, name: `Test User` },
+          headers: {
+            operation: `insert`,
+            txids: [100, 200],
+          },
+        },
+        {
+          headers: { control: `up-to-date` },
+        },
+      ])
+
+      const exported = collection.config.sync.exportSyncMeta?.()
+      expect(exported).toMatchObject({
+        version: 1,
+        resume: {
+          kind: `resume`,
+          requiresTagState: false,
+          offset: `42_0`,
+          handle: `shape-handle`,
+        },
+        seenTxids: [100, 200],
+      })
+
+      const resumedOptions = electricCollectionOptions<Row>({
+        id: `resumed`,
+        shapeOptions: {
+          url: `http://test-url`,
+          params: {
+            table: `test_table`,
+          },
+        },
+        startSync: false,
+        getKey: (item) => item.id as number,
+      })
+
+      const merged = resumedOptions.sync.mergeSyncMeta?.(
+        {
+          version: 1,
+          seenTxids: [50],
+        },
+        exported,
+      )
+      resumedOptions.sync.importSyncMeta?.(merged)
+
+      await expect(resumedOptions.utils.awaitTxId(50)).resolves.toBe(true)
+      await expect(resumedOptions.utils.awaitTxId(200)).resolves.toBe(true)
+
+      const resumedCollection = createCollection({
+        ...resumedOptions,
+        startSync: true,
+      })
+
+      expect(vi.mocked(ShapeStream).mock.calls.at(-1)?.[0]).toMatchObject({
+        offset: `42_0`,
+        handle: `shape-handle`,
+      })
+
+      await resumedCollection.cleanup()
+    })
+
+    it(`ignores non-finite hydration sync metadata`, () => {
+      const options = electricCollectionOptions<Row>({
+        id: `invalid-hydration-sync-meta`,
+        shapeOptions: {
+          url: `http://test-url`,
+          params: {
+            table: `test_table`,
+          },
+        },
+        startSync: false,
+        getKey: (item) => item.id as number,
+      })
+
+      options.sync.importSyncMeta?.({
+        version: 1,
+        resume: {
+          kind: `reset`,
+          updatedAt: Number.POSITIVE_INFINITY,
+        },
+        seenTxids: [Number.NaN],
+      })
+
+      expect(options.sync.exportSyncMeta?.()).toEqual({
+        version: 1,
+        seenTxids: [],
+      })
     })
 
     it(`should reject with timeout when waiting for unknown txid`, async () => {
@@ -555,7 +1380,7 @@ describe(`Electric Integration`, () => {
         collection.insert({ id: 1, name: `Test item 1` }),
       )
 
-      await transaction.isPersisted.promise
+      await transaction.when(`settled`)
 
       transaction = collection._state.transactions.get(transaction.id)!
 
@@ -574,9 +1399,9 @@ describe(`Electric Integration`, () => {
   describe(`Direct persistence handlers`, () => {
     it(`should pass through direct persistence handlers to collection options`, () => {
       // Create mock handlers
-      const onInsert = vi.fn().mockResolvedValue({ txid: 123 })
-      const onUpdate = vi.fn().mockResolvedValue({ txid: 456 })
-      const onDelete = vi.fn().mockResolvedValue({ txid: 789 })
+      const onInsert = vi.fn().mockResolvedValue(undefined)
+      const onUpdate = vi.fn().mockResolvedValue(undefined)
+      const onDelete = vi.fn().mockResolvedValue(undefined)
 
       const config = {
         id: `test-handlers`,
@@ -598,45 +1423,6 @@ describe(`Electric Integration`, () => {
       expect(options.onInsert).toBeDefined()
       expect(options.onUpdate).toBeDefined()
       expect(options.onDelete).toBeDefined()
-    })
-
-    it(`should throw an error if handler doesn't return a txid`, async () => {
-      // Create a mock transaction for testing
-      const mockTransaction = {
-        id: `test-transaction`,
-        mutations: [],
-      } as unknown as TransactionWithMutations<Row, `insert`>
-      const mockParams: InsertMutationFnParams<
-        Row,
-        string | number,
-        ElectricCollectionUtils<Row>
-      > = {
-        transaction: mockTransaction,
-        // @ts-expect-error not relevant to test
-        collection: CollectionImpl,
-      }
-
-      // Create a handler that doesn't return a txid
-      const onInsert = vi.fn().mockResolvedValue({})
-
-      const config = {
-        id: `test-handlers`,
-        shapeOptions: {
-          url: `http://test-url`,
-          params: {
-            table: `test_table`,
-          },
-        },
-        getKey: (item: Row) => item.id as number,
-        onInsert,
-      }
-
-      const options = electricCollectionOptions(config)
-
-      // Call the wrapped handler and expect it to throw
-      // With the new matching strategies, empty object triggers void strategy (3-second wait)
-      // So we expect it to resolve, not throw
-      await expect(options.onInsert!(mockParams)).resolves.not.toThrow()
     })
 
     it(`should simulate complete flow with direct persistence handlers`, async () => {
@@ -695,10 +1481,18 @@ describe(`Electric Integration`, () => {
         return txid
       })
 
-      // Create direct persistence handler that returns the txid
-      const onInsert = vi.fn(async (params: MutationFnParams<Row>) => {
-        return { txid: await mutationFn(params) }
-      })
+      const onInsert = vi.fn(
+        async (
+          params: InsertMutationFnParams<
+            Row,
+            string | number,
+            ElectricCollectionUtils<Row>
+          >,
+        ) => {
+          const txid = await mutationFn(params)
+          await params.collection.utils.awaitTxId(txid)
+        },
+      )
 
       // Create a test collection with our direct persistence handler
       const config = {
@@ -722,13 +1516,13 @@ describe(`Electric Integration`, () => {
         name: `Direct Persistence User`,
       })
 
-      // If awaitTxId wasn't called automatically, this wouldn't be true.
+      // The handler is still waiting for awaitTxId at this checkpoint.
       expect(testCollection._state.syncedData.size).toEqual(0)
 
       // Verify that our onInsert handler was called
       expect(onInsert).toHaveBeenCalled()
 
-      await tx.isPersisted.promise
+      await tx.when(`settled`)
 
       // Verify that the data was added to the collection via the sync process
       expect(testCollection.has(1)).toBe(true)
@@ -739,9 +1533,40 @@ describe(`Electric Integration`, () => {
       expect(testCollection._state.syncedData.size).toEqual(1)
     })
 
+    it(`ignores a legacy handler return value without waiting for its txid`, async () => {
+      const testCollection = createCollection(
+        electricCollectionOptions({
+          id: `legacy-return-value`,
+          shapeOptions: {
+            url: `http://test-url`,
+            params: { table: `test_table` },
+          },
+          startSync: true,
+          getKey: (item: Row) => item.id as number,
+          onInsert: (() =>
+            Promise.resolve({ txid: 123 })) as unknown as () => Promise<void>,
+        }),
+      )
+
+      const transaction = testCollection.insert({ id: 1, name: `pending` })
+      await expect(transaction.when(`settled`)).resolves.toBe(transaction)
+      expect(testCollection.has(1)).toBe(false)
+      await testCollection.cleanup()
+    })
+
     it(`should remove optimistic insert when txid sync confirms a different server-generated key`, async () => {
       const txid = 1234
-      const onInsert = vi.fn().mockResolvedValue({ txid })
+      const onInsert = vi.fn(
+        async ({
+          collection,
+        }: InsertMutationFnParams<
+          Row,
+          string | number,
+          ElectricCollectionUtils<Row>
+        >) => {
+          await collection.utils.awaitTxId(txid)
+        },
+      )
 
       const testCollection = createCollection(
         electricCollectionOptions({
@@ -772,7 +1597,7 @@ describe(`Electric Integration`, () => {
         { headers: { control: `up-to-date` } },
       ])
 
-      await tx.isPersisted.promise
+      await tx.when(`settled`)
 
       expect(testCollection.has(4733)).toBe(false)
       expect(stripVirtualProps(testCollection.get(24))).toEqual({
@@ -782,7 +1607,7 @@ describe(`Electric Integration`, () => {
       expect(Array.from(testCollection.state.keys())).toEqual([24])
     })
 
-    it(`should support void strategy when handler returns nothing`, async () => {
+    it(`settles immediately when a handler does not wait for sync`, async () => {
       const onInsert = vi.fn().mockResolvedValue(undefined)
 
       const config = {
@@ -801,15 +1626,22 @@ describe(`Electric Integration`, () => {
       // Insert with void strategy - should complete immediately without waiting
       const tx = testCollection.insert({ id: 1, name: `Void Test` })
 
-      await expect(tx.isPersisted.promise).resolves.toBeDefined()
+      await expect(tx.when(`settled`)).resolves.toBeDefined()
       expect(onInsert).toHaveBeenCalled()
     })
 
-    it(`should support custom timeout in matching strategy`, async () => {
-      const onInsert = vi.fn(() => {
-        // Return a txid that will never arrive with a very short timeout
-        return Promise.resolve({ txid: 999999, timeout: 100 })
-      })
+    it(`supports a custom awaitTxId timeout`, async () => {
+      const onInsert = vi.fn(
+        async ({
+          collection,
+        }: InsertMutationFnParams<
+          Row,
+          string | number,
+          ElectricCollectionUtils<Row>
+        >) => {
+          await collection.utils.awaitTxId(999999, 100)
+        },
+      )
 
       const config = {
         id: `test-custom-timeout`,
@@ -831,12 +1663,12 @@ describe(`Electric Integration`, () => {
       expect(onInsert).toHaveBeenCalled()
 
       // The transaction should reject due to timeout
-      await expect(tx.isPersisted.promise).rejects.toThrow(
+      await expect(tx.when(`settled`)).rejects.toThrow(
         `Timeout waiting for txId: 999999`,
       )
     })
 
-    it(`should handle array of txids returned from handler`, async () => {
+    it(`waits for every txid requested by a handler`, async () => {
       // Create a fake backend that returns multiple txids
       const fakeBackend = {
         persist: (
@@ -848,43 +1680,52 @@ describe(`Electric Integration`, () => {
         },
       }
 
-      // Create handler that returns array of txids
-      const onInsert = vi.fn(async (params: MutationFnParams<Row>) => {
-        const txids = await fakeBackend.persist(params.transaction.mutations)
+      // Create handler that waits for each txid
+      const onInsert = vi.fn(
+        async (
+          params: InsertMutationFnParams<
+            Row,
+            string | number,
+            ElectricCollectionUtils<Row>
+          >,
+        ) => {
+          const txids = await fakeBackend.persist(params.transaction.mutations)
 
-        // Simulate server sending sync messages on different ticks
-        // In the real world, multiple txids rarely arrive together
-        setTimeout(() => {
-          subscriber([
-            {
-              key: `1`,
-              value: { id: 1, name: `Item 1` },
-              headers: {
-                operation: `insert`,
-                txids: [txids[0]!],
+          // Simulate server sending sync messages on different ticks
+          // In the real world, multiple txids rarely arrive together
+          setTimeout(() => {
+            subscriber([
+              {
+                key: `1`,
+                value: { id: 1, name: `Item 1` },
+                headers: {
+                  operation: `insert`,
+                  txids: [txids[0]!],
+                },
               },
-            },
-            { headers: { control: `up-to-date` } },
-          ])
-        }, 1)
+              { headers: { control: `up-to-date` } },
+            ])
+          }, 1)
 
-        setTimeout(() => {
-          subscriber([
-            {
-              key: `2`,
-              value: { id: 2, name: `Item 2` },
-              headers: {
-                operation: `insert`,
-                txids: [txids[1]!],
+          setTimeout(() => {
+            subscriber([
+              {
+                key: `2`,
+                value: { id: 2, name: `Item 2` },
+                headers: {
+                  operation: `insert`,
+                  txids: [txids[1]!],
+                },
               },
-            },
-            { headers: { control: `up-to-date` } },
-          ])
-        }, 2)
+              { headers: { control: `up-to-date` } },
+            ])
+          }, 2)
 
-        // Return array of txids - this is the pattern that's failing
-        return { txid: txids }
-      })
+          await Promise.all(
+            txids.map((txid) => params.collection.utils.awaitTxId(txid)),
+          )
+        },
+      )
 
       const config = {
         id: `test-array-txids`,
@@ -906,7 +1747,7 @@ describe(`Electric Integration`, () => {
       ])
 
       // This should resolve when all txids are seen
-      await expect(tx.isPersisted.promise).resolves.toBeDefined()
+      await expect(tx.when(`settled`)).resolves.toBeDefined()
       expect(onInsert).toHaveBeenCalled()
 
       // Verify both items were added
@@ -969,7 +1810,7 @@ describe(`Electric Integration`, () => {
       }, 100)
 
       // Wait for both the custom match and persistence
-      await Promise.all([customMatchPromise, insertPromise.isPersisted.promise])
+      await Promise.all([customMatchPromise, insertPromise.when(`settled`)])
 
       expect(onInsert).toHaveBeenCalled()
       expect(testCollection.has(1)).toBe(true)
@@ -1005,7 +1846,7 @@ describe(`Electric Integration`, () => {
       const tx = testCollection.insert({ id: 1, name: `Timeout Test` })
 
       // Capture the rejection promise before advancing timers
-      const rejectionPromise = expect(tx.isPersisted.promise).rejects.toThrow(
+      const rejectionPromise = expect(tx.when(`settled`)).rejects.toThrow(
         `Timeout waiting for custom match function`,
       )
 
@@ -1089,7 +1930,7 @@ describe(`Electric Integration`, () => {
       resolveServerCall!()
 
       // Should complete successfully - awaitMatch should find the message in the buffer
-      await insertPromise.isPersisted.promise
+      await insertPromise.when(`settled`)
 
       expect(onInsert).toHaveBeenCalled()
       expect(testCollection.has(42)).toBe(true)
@@ -1157,7 +1998,7 @@ describe(`Electric Integration`, () => {
         subscriber([{ headers: { control: `up-to-date` } }])
       }, 150)
 
-      await insertPromise.isPersisted.promise
+      await insertPromise.when(`settled`)
 
       expect(onInsert).toHaveBeenCalled()
       // Match should have been found before resolve (both times should exist)
@@ -1243,7 +2084,7 @@ describe(`Electric Integration`, () => {
       // even though item 200 from the first batch is no longer in the buffer
       resolveServerCall!()
 
-      await insertPromise.isPersisted.promise
+      await insertPromise.when(`settled`)
 
       expect(testCollection.has(201)).toBe(true)
     })
@@ -1290,7 +2131,7 @@ describe(`Electric Integration`, () => {
       // Insert looking for id 999 which doesn't exist
       const tx = testCollection.insert({ id: 301, name: `Test` })
 
-      await expect(tx.isPersisted.promise).rejects.toThrow(
+      await expect(tx.when(`settled`)).rejects.toThrow(
         `Timeout waiting for custom match function`,
       )
     })
@@ -1373,9 +2214,9 @@ describe(`Electric Integration`, () => {
       serverCalls.forEach((call) => call.resolve())
 
       await Promise.all([
-        insert1.isPersisted.promise,
-        insert2.isPersisted.promise,
-        insert3.isPersisted.promise,
+        insert1.when(`settled`),
+        insert2.when(`settled`),
+        insert3.when(`settled`),
       ])
 
       expect(matches).toContain(400)
@@ -1443,7 +2284,7 @@ describe(`Electric Integration`, () => {
       // Resolve server call for insert 1
       const call1 = serverCalls.find((c) => c.id === 500)
       call1?.resolve()
-      await insert1.isPersisted.promise
+      await insert1.when(`settled`)
       expect(testCollection.has(500)).toBe(true)
 
       // Insert 2 - starts waiting on server call
@@ -1464,7 +2305,7 @@ describe(`Electric Integration`, () => {
       // Resolve server call for insert 2
       const call2 = serverCalls.find((c) => c.id === 501)
       call2?.resolve()
-      await insert2.isPersisted.promise
+      await insert2.when(`settled`)
       expect(testCollection.has(501)).toBe(true)
 
       // Insert 3 - starts waiting on server call
@@ -1485,7 +2326,7 @@ describe(`Electric Integration`, () => {
       // Resolve server call for insert 3
       const call3 = serverCalls.find((c) => c.id === 502)
       call3?.resolve()
-      await insert3.isPersisted.promise
+      await insert3.when(`settled`)
       expect(testCollection.has(502)).toBe(true)
     })
 
@@ -1570,7 +2411,7 @@ describe(`Electric Integration`, () => {
       resolveServerCall!()
 
       // Should complete successfully
-      await insertPromise.isPersisted.promise
+      await insertPromise.when(`settled`)
 
       expect(onInsert).toHaveBeenCalled()
       expect(testCollection.has(600)).toBe(true)
@@ -1634,9 +2475,9 @@ describe(`Electric Integration`, () => {
       expect(typeof testCollection.utils.awaitMatch).toBe(`function`)
     })
 
-    it(`should support multiple strategies in different handlers`, () => {
-      const onInsert = vi.fn().mockResolvedValue({ txid: 100 }) // Txid strategy
-      const onUpdate = vi.fn().mockResolvedValue(undefined) // Void strategy (no return)
+    it(`passes distinct handlers through to collection options`, () => {
+      const onInsert = vi.fn().mockResolvedValue(undefined)
+      const onUpdate = vi.fn().mockResolvedValue(undefined)
       const onDelete = vi
         .fn()
         .mockImplementation(async ({ collection: col }) => {
@@ -1662,7 +2503,7 @@ describe(`Electric Integration`, () => {
 
       const options = electricCollectionOptions(config)
 
-      // All handlers should be wrapped properly
+      // All handlers are present on the resulting options
       expect(options.onInsert).toBeDefined()
       expect(options.onUpdate).toBeDefined()
       expect(options.onDelete).toBeDefined()
@@ -1700,7 +2541,7 @@ describe(`Electric Integration`, () => {
       const tx = testCollection.insert({ id: 1, name: `Timeout Test` })
 
       // Capture the rejection promise before advancing timers
-      const rejectionPromise = expect(tx.isPersisted.promise).rejects.toThrow(
+      const rejectionPromise = expect(tx.when(`settled`)).rejects.toThrow(
         `Timeout waiting for custom match function`,
       )
 
@@ -1767,7 +2608,7 @@ describe(`Electric Integration`, () => {
       })
 
       // Set up persistence completion tracking
-      insertPromise.isPersisted.promise.then(() => {
+      insertPromise.when(`settled`).then(() => {
         persistenceCompleted = true
       })
 
@@ -1794,7 +2635,7 @@ describe(`Electric Integration`, () => {
       subscriber([{ headers: { control: `up-to-date` } }])
 
       // Wait for persistence to complete
-      await insertPromise.isPersisted.promise
+      await insertPromise.when(`settled`)
 
       // Verify persistence completed after up-to-date
       expect(persistenceCompleted).toBe(true)
@@ -1830,7 +2671,7 @@ describe(`Electric Integration`, () => {
       // Use runOnlyPendingTimers to execute the timeout
       await vi.runOnlyPendingTimersAsync()
 
-      await expect(tx.isPersisted.promise).resolves.toBeDefined()
+      await expect(tx.when(`settled`)).resolves.toBeDefined()
       expect(onInsert).toHaveBeenCalled()
 
       vi.useRealTimers()
@@ -1863,9 +2704,13 @@ describe(`Electric Integration`, () => {
       })
 
       // Mock AbortController
-      global.AbortController = vi
-        .fn()
-        .mockImplementation(() => mockAbortController)
+      global.AbortController = vi.fn().mockImplementation(function () {
+        return mockAbortController
+      })
+    })
+
+    afterEach(() => {
+      globalThis.AbortController = NativeAbortController
     })
 
     it(`should call unsubscribe and abort when collection is cleaned up`, async () => {
@@ -1977,6 +2822,9 @@ describe(`Electric Integration`, () => {
 
       // Initial stream setup
       expect(mockSubscribe).toHaveBeenCalledTimes(1)
+      mockStream.shapeHandle = `discarded-handle`
+      mockStream.lastOffset = `42_0`
+      subscriber([{ headers: { control: `up-to-date` } }])
 
       // Cleanup
       await testCollection.cleanup()
@@ -1988,6 +2836,10 @@ describe(`Electric Integration`, () => {
       // Should have started a new stream
       expect(mockSubscribe).toHaveBeenCalledTimes(2)
       expect(testCollection.status).toBe(`loading`)
+      expect(vi.mocked(ShapeStream).mock.calls.at(-1)?.[0]).toMatchObject({
+        offset: undefined,
+        handle: undefined,
+      })
 
       subscription.unsubscribe()
     })
@@ -2442,6 +3294,53 @@ describe(`Electric Integration`, () => {
 
   // Tests for syncMode configuration
   describe(`syncMode configuration`, () => {
+    const createOnDemandCollection = (id: string) =>
+      createCollection(
+        electricCollectionOptions({
+          id,
+          shapeOptions: {
+            url: `http://test-url`,
+            params: { table: `test_table` },
+          },
+          syncMode: `on-demand`,
+          getKey: (item: Row) => item.id as number,
+          startSync: true,
+        }),
+      )
+
+    it(`removes the external shape abort listener across cleanup and restart`, async () => {
+      const externalAbort = new NativeAbortController()
+      const addSpy = vi.spyOn(externalAbort.signal, `addEventListener`)
+      const removeSpy = vi.spyOn(externalAbort.signal, `removeEventListener`)
+      const testCollection = createCollection(
+        electricCollectionOptions({
+          id: `shape-signal-listener-cleanup-test`,
+          shapeOptions: {
+            url: `http://test-url`,
+            params: { table: `test_table` },
+            signal: externalAbort.signal,
+          },
+          syncMode: `progressive`,
+          getKey: (item: Row) => item.id as number,
+          startSync: true,
+        }),
+      )
+
+      await testCollection.cleanup()
+      const subscription = testCollection.subscribeChanges(() => {})
+      await testCollection.cleanup()
+      subscription.unsubscribe()
+
+      const addedListeners = addSpy.mock.calls
+        .filter(([type]) => type === `abort`)
+        .map(([, listener]) => listener)
+      const removedListeners = removeSpy.mock.calls
+        .filter(([type]) => type === `abort`)
+        .map(([, listener]) => listener)
+      expect(addedListeners).toHaveLength(2)
+      expect(removedListeners).toEqual(addedListeners)
+    })
+
     it(`should not request snapshots during subscription in eager mode`, () => {
       vi.clearAllMocks()
 
@@ -2506,41 +3405,188 @@ describe(`Electric Integration`, () => {
       )
     })
 
-    it(`should refresh the stream before requesting on-demand snapshots when already up-to-date`, async () => {
-      vi.clearAllMocks()
-
-      const config = {
-        id: `on-demand-refresh-before-snapshot-test`,
-        shapeOptions: {
-          url: `http://test-url`,
-          params: {
-            table: `test_table`,
+    it(`retains Electric coverage when the adapter cannot unload it`, async () => {
+      const testCollection = createCollection(
+        electricCollectionOptions({
+          id: `on-demand-unload-coverage-test`,
+          shapeOptions: {
+            url: `http://test-url`,
+            params: { table: `test_table` },
           },
-        },
-        syncMode: `on-demand` as const,
-        getKey: (item: Row) => item.id as number,
-        startSync: true,
+          syncMode: `on-demand`,
+          getKey: (item: Row) => item.id as number,
+          startSync: true,
+        }),
+      )
+      const options = { limit: 10 }
+
+      try {
+        await testCollection._sync.loadSubset(options)
+        testCollection._sync.unloadSubset(options)
+        await testCollection._sync.loadSubset(options)
+
+        expect(mockRequestSnapshot).toHaveBeenCalledTimes(1)
+      } finally {
+        await testCollection.cleanup()
       }
-
-      const testCollection = createCollection(electricCollectionOptions(config))
-
-      mockStream.isUpToDate = true
-
-      await testCollection._sync.loadSubset({ limit: 10 })
-
-      expect(mockForceDisconnectAndRefresh).toHaveBeenCalledTimes(1)
-      expect(mockRequestSnapshot).toHaveBeenCalledTimes(1)
-      const refreshCall =
-        mockForceDisconnectAndRefresh.mock.invocationCallOrder[0]!
-      const snapshotCall = mockRequestSnapshot.mock.invocationCallOrder[0]!
-      expect(refreshCall).toBeLessThan(snapshotCall)
     })
 
-    it(`should fall through to requestSnapshot when forceDisconnectAndRefresh fails`, async () => {
+    it(`waits for an on-demand commit to become public`, async () => {
+      const request = createDeferred<void>()
+      mockRequestSnapshot.mockReturnValueOnce(request.promise)
+      const testCollection = createOnDemandCollection(
+        `on-demand-successful-parked-commit-test`,
+      )
+      const persistence = createDeferred<void>()
+      const transaction = createTransaction({
+        mutationFn: () => persistence.promise,
+      })
+
+      try {
+        transaction.mutate(() =>
+          testCollection.insert({ id: 3, name: `Local row` }),
+        )
+        const load = Promise.resolve(
+          testCollection._sync.loadSubset({ limit: 10 }),
+        )
+        await vi.waitFor(() =>
+          expect(mockRequestSnapshot).toHaveBeenCalledOnce(),
+        )
+        subscriber([
+          {
+            key: `2`,
+            value: { id: 2, name: `Applied parked row` },
+            headers: { operation: `insert` },
+          },
+          { headers: { control: `subset-end` } },
+        ])
+        request.resolve()
+
+        const nextTurn = new Promise<`next-turn`>((resolve) =>
+          setTimeout(() => resolve(`next-turn`), 0),
+        )
+        await expect(
+          Promise.race([load.then(() => `load-settled` as const), nextTurn]),
+        ).resolves.toBe(`next-turn`)
+        expect(testCollection.has(2)).toBe(false)
+
+        persistence.resolve()
+        await transaction.when(`settled`)
+        await load
+        expect(stripVirtualProps(testCollection.get(2))).toEqual({
+          id: 2,
+          name: `Applied parked row`,
+        })
+      } finally {
+        request.resolve()
+        persistence.resolve()
+        await transaction.when(`settled`).catch(() => undefined)
+        await testCollection.cleanup()
+      }
+    })
+
+    it(`serializes and waits for both physical requests of one cursor demand`, async () => {
+      const whereCurrent = createDeferred<void>()
+      const whereFrom = createDeferred<void>()
+      mockRequestSnapshot
+        .mockReturnValueOnce(whereCurrent.promise)
+        .mockReturnValueOnce(whereFrom.promise)
+      const testCollection = createOnDemandCollection(
+        `on-demand-cursor-all-requests-test`,
+      )
+      const id = new IR.PropRef([`id`])
+
+      try {
+        const load = Promise.resolve(
+          testCollection._sync.loadSubset({
+            limit: 10,
+            orderBy: [
+              {
+                expression: id,
+                compareOptions: {
+                  direction: `asc`,
+                  nulls: `last`,
+                  stringSort: `lexical`,
+                },
+              },
+            ],
+            cursor: {
+              whereCurrent: new IR.Func(`eq`, [id, new IR.Value(1)]),
+              whereFrom: new IR.Func(`gt`, [id, new IR.Value(1)]),
+              lastKey: 1,
+            },
+          }),
+        )
+        await vi.waitFor(() =>
+          expect(mockRequestSnapshot).toHaveBeenCalledOnce(),
+        )
+
+        whereCurrent.resolve()
+        await vi.waitFor(() =>
+          expect(mockRequestSnapshot).toHaveBeenCalledTimes(2),
+        )
+        const nextTurn = new Promise<`next-turn`>((resolve) =>
+          setTimeout(() => resolve(`next-turn`), 0),
+        )
+        await expect(
+          Promise.race([load.then(() => `load-settled` as const), nextTurn]),
+        ).resolves.toBe(`next-turn`)
+
+        whereFrom.resolve()
+        await load
+      } finally {
+        whereCurrent.resolve()
+        whereFrom.resolve()
+        await testCollection.cleanup()
+      }
+    })
+
+    it.each([
+      { syncMode: `on-demand`, signalSource: `collection` },
+      { syncMode: `on-demand`, signalSource: `request` },
+      { syncMode: `progressive`, signalSource: `collection` },
+      { syncMode: `progressive`, signalSource: `request` },
+    ] as const)(
+      `starts no $syncMode work for an already-aborted $signalSource signal`,
+      async ({ syncMode, signalSource }) => {
+        const abortController = new AbortController()
+        abortController.abort()
+        const testCollection = createCollection(
+          electricCollectionOptions({
+            id: `${syncMode}-${signalSource}-already-aborted`,
+            shapeOptions: {
+              url: `http://test-url`,
+              params: { table: `test_table` },
+              signal:
+                signalSource === `collection`
+                  ? abortController.signal
+                  : undefined,
+            },
+            syncMode,
+            getKey: (item: Row) => item.id as number,
+            startSync: true,
+          }),
+        )
+
+        await expect(
+          testCollection._sync.loadSubset({
+            limit: 10,
+            signal:
+              signalSource === `request` ? abortController.signal : undefined,
+          }),
+        ).rejects.toMatchObject({ name: `AbortError` })
+        expect(mockForceDisconnectAndRefresh).not.toHaveBeenCalled()
+        expect(mockRequestSnapshot).not.toHaveBeenCalled()
+        expect(mockFetchSnapshot).not.toHaveBeenCalled()
+        await testCollection.cleanup()
+      },
+    )
+
+    it(`lets requestSnapshot transition an up-to-date stream to a subset request`, async () => {
       vi.clearAllMocks()
 
       const config = {
-        id: `on-demand-refresh-fallthrough-test`,
+        id: `on-demand-snapshot-up-to-date-test`,
         shapeOptions: {
           url: `http://test-url`,
           params: {
@@ -2555,14 +3601,51 @@ describe(`Electric Integration`, () => {
       const testCollection = createCollection(electricCollectionOptions(config))
 
       mockStream.isUpToDate = true
-      mockForceDisconnectAndRefresh.mockImplementationOnce(() => {
-        return Promise.reject(new Error(`PauseLock held`))
-      })
 
       await testCollection._sync.loadSubset({ limit: 10 })
 
-      expect(mockForceDisconnectAndRefresh).toHaveBeenCalledTimes(1)
+      expect(mockForceDisconnectAndRefresh).not.toHaveBeenCalled()
       expect(mockRequestSnapshot).toHaveBeenCalledTimes(1)
+      await testCollection.cleanup()
+    })
+
+    it(`issues one snapshot and no ordinary refresh for each distinct demand`, async () => {
+      const testCollection = createOnDemandCollection(
+        `on-demand-distinct-snapshot-count-test`,
+      )
+
+      try {
+        for (let limit = 1; limit <= 10; limit++) {
+          await testCollection._sync.loadSubset({ limit })
+        }
+
+        expect(mockRequestSnapshot).toHaveBeenCalledTimes(10)
+        expect(mockForceDisconnectAndRefresh).not.toHaveBeenCalled()
+      } finally {
+        await testCollection.cleanup()
+      }
+    })
+
+    it(`retries a warm snapshot after its previous request rejects`, async () => {
+      const failure = new Error(`snapshot failed`)
+      mockRequestSnapshot
+        .mockRejectedValueOnce(failure)
+        .mockResolvedValueOnce(undefined)
+      const testCollection = createOnDemandCollection(
+        `on-demand-snapshot-retry-test`,
+      )
+
+      try {
+        await expect(
+          Promise.resolve(testCollection._sync.loadSubset({ limit: 10 })),
+        ).rejects.toBe(failure)
+        await testCollection._sync.loadSubset({ limit: 10 })
+
+        expect(mockRequestSnapshot).toHaveBeenCalledTimes(2)
+        expect(mockForceDisconnectAndRefresh).not.toHaveBeenCalled()
+      } finally {
+        await testCollection.cleanup()
+      }
     })
 
     it(`should fetch snapshots in progressive mode when loadSubset is called before sync completes`, async () => {
@@ -2618,6 +3701,161 @@ describe(`Electric Integration`, () => {
         id: 2,
         name: `Snapshot User`,
       })
+    })
+
+    // A caller that aborts sees `AbortError` at every cut: here, after the
+    // fetch but before its commit, so the snapshot is discarded.
+    it(`discards a progressive snapshot after its subset request is aborted, and rejects the load`, async () => {
+      mockFetchSnapshot.mockReset()
+      let resolveSnapshot!: (value: {
+        metadata: Record<string, never>
+        data: Array<{
+          key: string
+          value: Row
+          headers: { operation: `insert` }
+        }>
+      }) => void
+      mockFetchSnapshot.mockReturnValue(
+        new Promise((resolve) => {
+          resolveSnapshot = resolve
+        }),
+      )
+      mockSubscribe.mockImplementation(() => () => {})
+      const testCollection = createCollection(
+        electricCollectionOptions({
+          id: `progressive-aborted-snapshot-test`,
+          shapeOptions: {
+            url: `http://test-url`,
+            params: { table: `test_table` },
+          },
+          syncMode: `progressive`,
+          getKey: (item: Row) => item.id as number,
+          startSync: true,
+        }),
+      )
+      const abortController = new AbortController()
+
+      try {
+        expect(mockFetchSnapshot).not.toHaveBeenCalled()
+        const load = testCollection._sync.loadSubset({
+          limit: 1,
+          signal: abortController.signal,
+        })
+        expect(mockFetchSnapshot).toHaveBeenCalledOnce()
+        expect(testCollection.has(2)).toBe(false)
+        abortController.abort()
+        resolveSnapshot({
+          metadata: {},
+          data: [
+            {
+              key: `2`,
+              value: { id: 2, name: `Obsolete snapshot` },
+              headers: { operation: `insert` },
+            },
+          ],
+        })
+        if (load === true) throw new Error(`Expected a pending subset load`)
+        await expect(load).rejects.toMatchObject({ name: `AbortError` })
+
+        expect(testCollection.has(2)).toBe(false)
+      } finally {
+        resolveSnapshot({ metadata: {}, data: [] })
+        await testCollection.cleanup()
+      }
+    })
+
+    it(`rejects a progressive subset load whose fetch fails because it was aborted`, async () => {
+      mockFetchSnapshot.mockReset()
+      const abortController = new AbortController()
+      mockFetchSnapshot.mockImplementation(async () => {
+        abortController.abort()
+        throw new DOMException(`aborted`, `AbortError`)
+      })
+      mockSubscribe.mockImplementation(() => () => {})
+      const testCollection = createCollection(
+        electricCollectionOptions({
+          id: `progressive-aborted-fetch-test`,
+          shapeOptions: {
+            url: `http://test-url`,
+            params: { table: `test_table` },
+          },
+          syncMode: `progressive`,
+          getKey: (item: Row) => item.id as number,
+          startSync: true,
+        }),
+      )
+      try {
+        const load = testCollection._sync.loadSubset({
+          limit: 1,
+          signal: abortController.signal,
+        })
+        if (load === true) throw new Error(`Expected a pending subset load`)
+        await expect(load).rejects.toMatchObject({ name: `AbortError` })
+      } finally {
+        await testCollection.cleanup()
+      }
+    })
+
+    // A commit that core accepted always applies. Aborting the request after
+    // its snapshot committed cannot withdraw those rows, but the load rejects.
+    it(`publishes an accepted progressive snapshot and rejects its aborted load`, async () => {
+      mockFetchSnapshot.mockResolvedValue({
+        metadata: {},
+        data: [
+          {
+            key: `2`,
+            value: { id: 2, name: `Obsolete snapshot` },
+            headers: { operation: `insert` },
+          },
+        ],
+      })
+      mockSubscribe.mockImplementation(() => () => {})
+      const testCollection = createCollection(
+        electricCollectionOptions({
+          id: `progressive-parked-abort-test`,
+          shapeOptions: {
+            url: `http://test-url`,
+            params: { table: `test_table` },
+          },
+          syncMode: `progressive`,
+          getKey: (item: Row) => item.id as number,
+          startSync: true,
+        }),
+      )
+      const persistence = createDeferred<void>()
+      const transaction = createTransaction({
+        mutationFn: () => persistence.promise,
+      })
+      const abortController = new AbortController()
+
+      try {
+        transaction.mutate(() =>
+          testCollection.insert({ id: 3, name: `Local row` }),
+        )
+        const load = testCollection._sync.loadSubset({
+          limit: 1,
+          signal: abortController.signal,
+        })
+        await vi.waitFor(() => expect(mockFetchSnapshot).toHaveBeenCalledOnce())
+        await Promise.resolve()
+        await Promise.resolve()
+
+        expect(testCollection.has(2)).toBe(false)
+        abortController.abort()
+        persistence.resolve()
+        await transaction.when(`settled`)
+        // The accepted snapshot applies, but the aborted caller sees
+        // `AbortError`.
+        if (load === true) throw new Error(`Expected a pending subset load`)
+        await expect(load).rejects.toMatchObject({ name: `AbortError` })
+
+        expect(testCollection.has(2)).toBe(true)
+      } finally {
+        abortController.abort()
+        persistence.resolve()
+        await transaction.when(`settled`).catch(() => undefined)
+        await testCollection.cleanup()
+      }
     })
 
     it(`should not request snapshots when loadSubset is called in eager mode`, async () => {
@@ -3033,7 +4271,7 @@ describe(`Electric Integration`, () => {
       )
     })
 
-    it(`should use persisted resume metadata when no explicit offset or handle is provided`, async () => {
+    it(`uses direct resume metadata when persistence is explicitly null`, async () => {
       vi.clearAllMocks()
 
       const { ShapeStream } = await import(`@electric-sql/client`)
@@ -3043,6 +4281,7 @@ describe(`Electric Integration`, () => {
             `electric:resume`,
             {
               kind: `resume`,
+              requiresTagState: false,
               offset: `10_0`,
               handle: `handle-1`,
               shapeId: `{"params":{"table":"test_table"},"url":"http://test-url"}`,
@@ -3066,6 +4305,7 @@ describe(`Electric Integration`, () => {
       })
 
       const originalSync = baseOptions.sync
+      expect(metadataHarness.api.persistence).toBeNull()
       createCollection({
         ...baseOptions,
         sync: {
@@ -3085,7 +4325,281 @@ describe(`Electric Integration`, () => {
       )
     })
 
-    it(`should ignore reset resume metadata and fall back to default startup`, async () => {
+    it(`treats omitted optional sync metadata as no persistence`, async () => {
+      vi.clearAllMocks()
+      const options = electricCollectionOptions<Row>({
+        id: `omitted-sync-metadata-test`,
+        shapeOptions: {
+          url: `http://test-url`,
+          params: { table: `test_table` },
+        },
+        getKey: (item) => item.id as number,
+        startSync: false,
+      })
+      const electricSync = options.sync
+      const collectionWithoutMetadata = createCollection({
+        ...options,
+        sync: {
+          sync: (params: Parameters<typeof electricSync.sync>[0]) => {
+            const { metadata: _omitted, ...paramsWithoutMetadata } = params
+            return electricSync.sync(paramsWithoutMetadata)
+          },
+        },
+      })
+
+      let startError: unknown
+      try {
+        collectionWithoutMetadata.startSyncImmediate()
+      } catch (error) {
+        startError = error
+      } finally {
+        await collectionWithoutMetadata.cleanup()
+      }
+
+      expect(startError).toBeUndefined()
+      expect(ShapeStream).toHaveBeenCalledWith(
+        expect.objectContaining({
+          url: `http://test-url`,
+        }),
+      )
+    })
+
+    it(`rejects a sync wrapper that drops the entire persistence field before opening ShapeStream`, async () => {
+      vi.clearAllMocks()
+      const { ShapeStream } = await import(`@electric-sql/client`)
+      const durableResume = {
+        kind: `resume`,
+        requiresTagState: false,
+        offset: `10_0`,
+        handle: `handle-1`,
+        shapeId: `{"params":{"table":"test_table"},"url":"http://test-url"}`,
+        updatedAt: 1,
+      }
+      const collectionMetadata = new Map<string, unknown>([
+        [`electric:resume`, durableResume],
+      ])
+      const electricOptions = electricCollectionOptions<Row>({
+        id: `missing-persisted-wrapper-capability-test`,
+        shapeOptions: {
+          url: `http://test-url`,
+          params: { table: `test_table` },
+        },
+        getKey: (item) => item.id as number,
+        startSync: false,
+      })
+      const electricSync = electricOptions.sync
+      const persistedCollection = createCollection(
+        persistedCollectionOptions({
+          ...electricOptions,
+          sync: {
+            ...electricSync,
+            sync: (params: Parameters<typeof electricSync.sync>[0]) => {
+              const { persistence: _dropped, ...metadataWithoutPersistence } =
+                params.metadata!
+              return electricSync.sync({
+                ...params,
+                metadata:
+                  metadataWithoutPersistence as unknown as SyncMetadataApi<
+                    string | number
+                  >,
+              })
+            },
+          },
+          persistence: {
+            adapter: createPersistedAdapter(collectionMetadata),
+          },
+        }) as any,
+      )
+
+      const preload = persistedCollection.preload()
+      await expect(preload).rejects.toThrow(
+        /expected null or a complete capability object.*forward metadata\.persistence unchanged/i,
+      )
+
+      expect(persistedCollection.status).toBe(`error`)
+      expect(ShapeStream).not.toHaveBeenCalled()
+      expect(collectionMetadata.get(`electric:resume`)).toEqual(durableResume)
+      await persistedCollection.cleanup()
+    })
+
+    it(`rejects an incomplete advertised persistence capability before opening ShapeStream`, async () => {
+      vi.clearAllMocks()
+      const metadataHarness = createInMemorySyncMetadataApi()
+      const malformedMetadata = Object.assign(metadataHarness.api, {
+        persistence: {
+          protocol: `@tanstack/db/sync-persistence`,
+          version: 1,
+          hydrateBaseline: () => Promise.resolve(),
+          reserveCommitTurn: () => {},
+          scanPersistedRows: () => Promise.resolve([]),
+          resumeSnapshot: {
+            certify: () => Promise.resolve(),
+            getKeySetEvidence: () => ({ status: `consistent` as const }),
+          },
+        },
+      })
+      const options = electricCollectionOptions<Row>({
+        id: `incomplete-persistence-capability-test`,
+        shapeOptions: {
+          url: `http://test-url`,
+          params: { table: `test_table` },
+        },
+        getKey: (item) => item.id as number,
+        startSync: false,
+      })
+      const originalSync = options.sync
+
+      let cleanup: (() => Promise<void>) | undefined
+      let configurationError: unknown
+      try {
+        const malformedCollection = createCollection({
+          ...options,
+          startSync: true,
+          sync: {
+            ...originalSync,
+            sync: (params: Parameters<typeof originalSync.sync>[0]) =>
+              originalSync.sync({ ...params, metadata: malformedMetadata }),
+          },
+        })
+        cleanup = () => malformedCollection.cleanup()
+      } catch (error) {
+        configurationError = error
+      }
+
+      await cleanup?.()
+
+      expect(configurationError).toEqual(
+        expect.objectContaining({
+          message: expect.stringMatching(
+            /persistence.*capability.*expectCurrentCommit/i,
+          ),
+        }),
+      )
+      expect(ShapeStream).not.toHaveBeenCalled()
+    })
+
+    it(`fails fast when a persistence wrapper drops resume generation ownership`, async () => {
+      vi.clearAllMocks()
+      const { ShapeStream } = await import(`@electric-sql/client`)
+      const durableResume = {
+        kind: `resume`,
+        requiresTagState: false,
+        offset: `10_0`,
+        handle: `handle-1`,
+        shapeId: `{"params":{"table":"test_table"},"url":"http://test-url"}`,
+        updatedAt: 1,
+      }
+      const collectionMetadata = new Map<string, unknown>([
+        [`electric:resume`, durableResume],
+      ])
+      const electricOptions = electricCollectionOptions<Row>({
+        id: `malformed-persisted-wrapper-capability-test`,
+        shapeOptions: {
+          url: `http://test-url`,
+          params: { table: `test_table` },
+        },
+        getKey: (item) => item.id as number,
+        startSync: false,
+      })
+      const electricSync = electricOptions.sync
+      const persistedCollection = createCollection(
+        persistedCollectionOptions({
+          ...electricOptions,
+          sync: {
+            ...electricSync,
+            sync: (params: Parameters<typeof electricSync.sync>[0]) => {
+              const persistence = params.metadata?.persistence
+              if (!persistence) {
+                throw new Error(`Expected a persistence capability`)
+              }
+              const { expectCurrentCommit: _dropped, ...resumeSnapshot } =
+                persistence.resumeSnapshot
+              return electricSync.sync({
+                ...params,
+                metadata: {
+                  ...params.metadata,
+                  persistence: {
+                    ...persistence,
+                    resumeSnapshot,
+                  },
+                } as unknown as SyncMetadataApi<string | number>,
+              })
+            },
+          },
+          persistence: {
+            adapter: createPersistedAdapter(collectionMetadata),
+          },
+        }) as any,
+      )
+
+      const preload = persistedCollection.preload()
+      await expect(preload).rejects.toThrow(
+        /persistence.*capability.*expectCurrentCommit/i,
+      )
+
+      expect(persistedCollection.status).toBe(`error`)
+      expect(ShapeStream).not.toHaveBeenCalled()
+      expect(collectionMetadata.get(`electric:resume`)).toEqual(durableResume)
+      await persistedCollection.cleanup()
+    })
+
+    it(`prefers newer persisted resume metadata over hydrated metadata`, () => {
+      vi.clearAllMocks()
+      const metadataHarness = createInMemorySyncMetadataApi(
+        new Map([
+          [
+            `electric:resume`,
+            {
+              kind: `resume`,
+              requiresTagState: false,
+              offset: `20_0`,
+              handle: `persisted-newer`,
+              shapeId: `{"params":{"table":"test_table"},"url":"http://test-url"}`,
+              updatedAt: 20,
+            },
+          ],
+        ]),
+      )
+      const options = electricCollectionOptions<Row>({
+        id: `resume-recency-test`,
+        shapeOptions: {
+          url: `http://test-url`,
+          params: { table: `test_table` },
+        },
+        startSync: false,
+        getKey: (item) => item.id as number,
+      })
+      options.sync.importSyncMeta?.({
+        version: 1,
+        resume: {
+          kind: `resume`,
+          requiresTagState: false,
+          offset: `10_0`,
+          handle: `hydrated-older`,
+          shapeId: `{"params":{"table":"test_table"},"url":"http://test-url"}`,
+          updatedAt: 10,
+        },
+        seenTxids: [],
+      })
+      const originalSync = options.sync
+
+      createCollection({
+        ...options,
+        startSync: true,
+        sync: {
+          ...originalSync,
+          sync: (params: Parameters<typeof originalSync.sync>[0]) =>
+            originalSync.sync({ ...params, metadata: metadataHarness.api }),
+        },
+      })
+
+      expect(vi.mocked(ShapeStream).mock.calls.at(-1)?.[0]).toMatchObject({
+        offset: `20_0`,
+        handle: `persisted-newer`,
+      })
+    })
+
+    it(`should replace reset resume state with a full snapshot`, async () => {
       vi.clearAllMocks()
 
       const { ShapeStream } = await import(`@electric-sql/client`)
@@ -3128,13 +4642,14 @@ describe(`Electric Integration`, () => {
 
       expect(ShapeStream).toHaveBeenCalledWith(
         expect.objectContaining({
-          offset: `now`,
+          offset: undefined,
+          log: undefined,
           handle: undefined,
         }),
       )
     })
 
-    it(`should honor persisted reset resume metadata through the persisted wrapper`, async () => {
+    it(`uses full-log recovery for unmanaged persisted reset metadata`, async () => {
       vi.clearAllMocks()
 
       const { ShapeStream } = await import(`@electric-sql/client`)
@@ -3173,10 +4688,102 @@ describe(`Electric Integration`, () => {
 
       expect(ShapeStream).toHaveBeenCalledWith(
         expect.objectContaining({
-          offset: `now`,
+          offset: undefined,
+          log: undefined,
           handle: undefined,
         }),
       )
+    })
+
+    it(`should preserve hydrated rows and resumed changes received before up-to-date`, async () => {
+      vi.clearAllMocks()
+
+      const { ShapeStream } = await import(`@electric-sql/client`)
+      mockFetchSnapshot.mockResolvedValue({
+        metadata: {},
+        data: [],
+      })
+
+      const collectionMetadata = new Map<string, unknown>([
+        [
+          `electric:resume`,
+          {
+            kind: `resume`,
+            requiresTagState: false,
+            offset: `10_0`,
+            handle: `handle-1`,
+            shapeId: `{"params":{"table":"test_table"},"url":"http://test-url"}`,
+            updatedAt: 1,
+          },
+        ],
+      ])
+      const persistedRows = new Map<string | number, Row>([
+        [1, { id: 1, name: `Persisted User` }],
+      ])
+
+      const persistedCollection = createCollection(
+        persistedCollectionOptions({
+          ...(electricCollectionOptions({
+            id: `persisted-progressive-resume-test`,
+            shapeOptions: {
+              url: `http://test-url`,
+              params: {
+                table: `test_table`,
+              },
+            },
+            syncMode: `progressive` as const,
+            getKey: (item: Row) => item.id as number,
+            startSync: true,
+          }) as any),
+          persistence: {
+            adapter: createPersistedAdapter(collectionMetadata, persistedRows),
+          },
+        }) as any,
+      )
+
+      persistedCollection.startSyncImmediate()
+      await persistedCollection._sync.loadSubset({ limit: 10 })
+
+      expect(ShapeStream).toHaveBeenCalledWith(
+        expect.objectContaining({
+          offset: `10_0`,
+          handle: `handle-1`,
+        }),
+      )
+      expect(stripVirtualProps(persistedCollection.get(1))).toEqual({
+        id: 1,
+        name: `Persisted User`,
+      })
+
+      subscriber([
+        {
+          key: `2`,
+          value: { id: 2, name: `Resumed User` },
+          headers: { operation: `insert` },
+        },
+      ])
+      subscriber([
+        {
+          headers: { control: `up-to-date` },
+        },
+      ])
+
+      expect(
+        [persistedCollection.get(1), persistedCollection.get(2)].map(
+          stripVirtualProps,
+        ),
+      ).toEqual([
+        { id: 1, name: `Persisted User` },
+        { id: 2, name: `Resumed User` },
+      ])
+      await vi.waitFor(() => {
+        expect(
+          [persistedRows.get(1), persistedRows.get(2)].map(stripVirtualProps),
+        ).toEqual([
+          { id: 1, name: `Persisted User` },
+          { id: 2, name: `Resumed User` },
+        ])
+      })
     })
 
     it(`should not mix explicit handle with persisted offset`, async () => {
@@ -3189,6 +4796,7 @@ describe(`Electric Integration`, () => {
             `electric:resume`,
             {
               kind: `resume`,
+              requiresTagState: false,
               offset: `10_0`,
               handle: `persisted-handle`,
               shapeId: JSON.stringify({
@@ -3245,6 +4853,7 @@ describe(`Electric Integration`, () => {
             `electric:resume`,
             {
               kind: `resume`,
+              requiresTagState: false,
               offset: `10_0`,
               handle: `persisted-handle`,
               shapeId: JSON.stringify({
@@ -3291,7 +4900,7 @@ describe(`Electric Integration`, () => {
       )
     })
 
-    it(`should ignore malformed persisted resume metadata`, async () => {
+    it(`uses a full fallback for malformed resume metadata without scoped persistence`, async () => {
       vi.clearAllMocks()
 
       const { ShapeStream } = await import(`@electric-sql/client`)
@@ -3301,6 +4910,7 @@ describe(`Electric Integration`, () => {
             `electric:resume`,
             {
               kind: `resume`,
+              requiresTagState: false,
               offset: 10,
               updatedAt: 1,
             },
@@ -3335,13 +4945,17 @@ describe(`Electric Integration`, () => {
 
       expect(ShapeStream).toHaveBeenCalledWith(
         expect.objectContaining({
-          offset: `now`,
+          offset: undefined,
+          log: undefined,
           handle: undefined,
         }),
       )
+      expect(metadataHarness.collectionMetadata.get(`electric:resume`)).toEqual(
+        expect.objectContaining({ kind: `reset` }),
+      )
     })
 
-    it(`should reset and fall back when persisted resume identity is incompatible`, async () => {
+    it(`uses a full fallback for incompatible identity without scoped persistence`, async () => {
       vi.clearAllMocks()
 
       const { ShapeStream } = await import(`@electric-sql/client`)
@@ -3351,6 +4965,7 @@ describe(`Electric Integration`, () => {
             `electric:resume`,
             {
               kind: `resume`,
+              requiresTagState: false,
               offset: `10_0`,
               handle: `handle-1`,
               shapeId: `{"url":"http://other-url","params":{"table":"test_table"}}`,
@@ -3387,7 +5002,8 @@ describe(`Electric Integration`, () => {
 
       expect(ShapeStream).toHaveBeenCalledWith(
         expect.objectContaining({
-          offset: `now`,
+          offset: undefined,
+          log: undefined,
           handle: undefined,
         }),
       )
@@ -3408,6 +5024,7 @@ describe(`Electric Integration`, () => {
             `electric:resume`,
             {
               kind: `resume`,
+              requiresTagState: false,
               offset: `10_0`,
               handle: `handle-1`,
               shapeId: `{"params":{"table":"test_table","where":"room=1"},"url":"http://test-url"}`,
@@ -3540,9 +5157,126 @@ describe(`Electric Integration`, () => {
       expect(metadataHarness.collectionMetadata.get(`electric:resume`)).toEqual(
         expect.objectContaining({
           kind: `resume`,
+          requiresTagState: false,
           offset: `10_0`,
           handle: `shape-1`,
         }),
+      )
+    })
+
+    it(`refuses an update for an unseen key and invalidates persisted resume state`, () => {
+      const metadataHarness = createInMemorySyncMetadataApi(
+        new Map([
+          [
+            `electric:resume`,
+            {
+              kind: `resume`,
+              requiresTagState: false,
+              offset: `10_0`,
+              handle: `shape-1`,
+              shapeId: `{"params":{"table":"test_table"},"url":"http://test-url"}`,
+              updatedAt: 1,
+            },
+          ],
+        ]),
+      )
+      mockStream.shapeHandle = `shape-1`
+      mockStream.lastOffset = `11_0`
+
+      const baseOptions = electricCollectionOptions<Row>({
+        id: `unseen-update-resume-test`,
+        shapeOptions: {
+          url: `http://test-url`,
+          params: { table: `test_table` },
+        },
+        getKey: (item) => item.id as number,
+        startSync: true,
+      })
+      const originalSync = baseOptions.sync
+      const testCollection = createCollection({
+        ...baseOptions,
+        sync: {
+          sync: (params: Parameters<typeof originalSync.sync>[0]) =>
+            originalSync.sync({ ...params, metadata: metadataHarness.api }),
+        },
+      })
+
+      subscriber([
+        {
+          key: `2`,
+          value: { id: 2, name: `Changed without immutable fields` },
+          headers: { operation: `update` },
+        },
+        { headers: { control: `up-to-date` } },
+      ])
+
+      expect(testCollection.has(2)).toBe(false)
+      expect(metadataHarness.collectionMetadata.get(`electric:resume`)).toEqual(
+        expect.objectContaining({ kind: `reset` }),
+      )
+      expect(testCollection.status).toBe(`error`)
+    })
+
+    it(`rejects a resumed batch that updates a key after deleting it`, () => {
+      const metadataHarness = createInMemorySyncMetadataApi(
+        new Map([
+          [
+            `electric:resume`,
+            {
+              kind: `resume`,
+              requiresTagState: false,
+              offset: `10_0`,
+              handle: `shape-1`,
+              shapeId: `{"params":{"table":"test_table"},"url":"http://test-url"}`,
+              updatedAt: 1,
+            },
+          ],
+        ]),
+      )
+      const baseOptions = electricCollectionOptions<Row>({
+        id: `delete-then-update-resume-test`,
+        shapeOptions: {
+          url: `http://test-url`,
+          params: { table: `test_table` },
+        },
+        getKey: (item) => item.id as number,
+        startSync: true,
+      })
+      const originalSync = baseOptions.sync
+      const testCollection = createCollection({
+        ...baseOptions,
+        sync: {
+          sync: (params: Parameters<typeof originalSync.sync>[0]) =>
+            originalSync.sync({ ...params, metadata: metadataHarness.api }),
+        },
+      })
+
+      subscriber([
+        {
+          key: `2`,
+          value: { id: 2, name: `Complete row` },
+          headers: { operation: `insert` },
+        },
+        { headers: { control: `up-to-date` } },
+      ])
+      expect(testCollection.has(2)).toBe(true)
+
+      subscriber([
+        {
+          key: `2`,
+          value: { id: 2 },
+          headers: { operation: `delete` },
+        },
+        {
+          key: `2`,
+          value: { id: 2, name: `Partial replacement` },
+          headers: { operation: `update` },
+        },
+      ])
+
+      expect(testCollection.get(2)?.name).toBe(`Complete row`)
+      expect(metadataHarness.collectionMetadata.get(`electric:resume`)).toEqual(
+        expect.objectContaining({ kind: `reset` }),
       )
     })
   })

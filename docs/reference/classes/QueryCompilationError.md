@@ -3,9 +3,7 @@ id: QueryCompilationError
 title: QueryCompilationError
 ---
 
-# Class: QueryCompilationError
-
-Defined in: [packages/db/src/errors.ts:423](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L423)
+Defined in: [packages/db/src/errors.ts:717](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L717)
 
 ## Extends
 
@@ -13,8 +11,11 @@ Defined in: [packages/db/src/errors.ts:423](https://github.com/TanStack/db/blob/
 
 ## Extended by
 
+- [`UnsafeAliasPathError`](UnsafeAliasPathError.md)
 - [`DistinctRequiresSelectError`](DistinctRequiresSelectError.md)
 - [`FnSelectWithGroupByError`](FnSelectWithGroupByError.md)
+- [`GroupingOperatorRequiredError`](GroupingOperatorRequiredError.md)
+- [`UnsupportedFnSelectResultError`](UnsupportedFnSelectResultError.md)
 - [`UnsupportedRootScalarSelectError`](UnsupportedRootScalarSelectError.md)
 - [`HavingRequiresGroupByError`](HavingRequiresGroupByError.md)
 - [`LimitOffsetRequireOrderByError`](LimitOffsetRequireOrderByError.md)
@@ -25,10 +26,9 @@ Defined in: [packages/db/src/errors.ts:423](https://github.com/TanStack/db/blob/
 - [`EmptyReferencePathError`](EmptyReferencePathError.md)
 - [`UnknownFunctionError`](UnknownFunctionError.md)
 - [`JoinCollectionNotFoundError`](JoinCollectionNotFoundError.md)
-- [`SubscriptionNotFoundError`](SubscriptionNotFoundError.md)
-- [`AggregateNotSupportedError`](AggregateNotSupportedError.md)
 - [`MissingAliasInputsError`](MissingAliasInputsError.md)
 - [`SetWindowRequiresOrderByError`](SetWindowRequiresOrderByError.md)
+- [`SetWindowFindOneLimitError`](SetWindowFindOneLimitError.md)
 
 ## Constructors
 
@@ -38,7 +38,7 @@ Defined in: [packages/db/src/errors.ts:423](https://github.com/TanStack/db/blob/
 new QueryCompilationError(message): QueryCompilationError;
 ```
 
-Defined in: [packages/db/src/errors.ts:424](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L424)
+Defined in: [packages/db/src/errors.ts:718](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L718)
 
 #### Parameters
 

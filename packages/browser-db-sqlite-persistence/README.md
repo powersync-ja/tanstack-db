@@ -1,14 +1,25 @@
 # @tanstack/browser-db-sqlite-persistence
 
-Thin browser SQLite persistence for TanStack DB using `wa-sqlite` + OPFS.
+Browser SQLite persistence for TanStack DB using `wa-sqlite` + OPFS.
+
+Start with the [SQLite Persistence guide](../../docs/guides/sqlite-persistence.md) for Collection setup and lifecycle behavior.
+
+Supports both single-tab (default) and multi-tab usage. Multi-tab coordination
+is opt-in by passing a `BrowserCollectionCoordinator`.
 
 ## Public API
 
 - `createBrowserWASQLitePersistence(...)`
 - `openBrowserWASQLiteOPFSDatabase(...)`
+- `BrowserCollectionCoordinator`
 - `persistedCollectionOptions(...)` (re-exported from core)
 
-## Quick start
+## Quick start (single-tab)
+
+By default, `createBrowserWASQLitePersistence` uses `SingleProcessCoordinator`
+semantics — no leader election, no `BroadcastChannel`, no Web Locks. This is
+the right choice when your app is only ever open in one tab at a time, or when
+each tab uses its own database.
 
 ```ts
 import { createCollection } from '@tanstack/db'
@@ -42,13 +53,181 @@ export const todosCollection = createCollection(
 )
 ```
 
+## Multi-tab usage
+
+To safely share a single OPFS database across multiple tabs of the same
+origin, pass a `BrowserCollectionCoordinator` via the `coordinator` option.
+The coordinator uses the Web Locks API to elect a leader tab, and
+`BroadcastChannel` to fan out committed transactions to follower tabs.
+Follower tabs forward writes to the leader via RPC over the channel.
+
+```ts
+import { createCollection } from '@tanstack/db'
+import {
+  BrowserCollectionCoordinator,
+  createBrowserWASQLitePersistence,
+  openBrowserWASQLiteOPFSDatabase,
+  persistedCollectionOptions,
+} from '@tanstack/browser-db-sqlite-persistence'
+
+const database = await openBrowserWASQLiteOPFSDatabase({
+  databaseName: `tanstack-db.sqlite`,
+})
+
+const coordinator = new BrowserCollectionCoordinator({
+  dbName: `tanstack-db`,
+})
+
+const persistence = createBrowserWASQLitePersistence({
+  database,
+  coordinator,
+})
+
+export const todosCollection = createCollection(
+  persistedCollectionOptions<Todo, string>({
+    id: `todos`,
+    getKey: (todo) => todo.id,
+    persistence,
+    schemaVersion: 1,
+  }),
+)
+
+// On teardown:
+// coordinator.dispose()
+// await database.close?.()
+```
+
+See [`examples/react/offline-transactions`](../../examples/react/offline-transactions/src/db/persisted-todos.ts)
+for a full multi-tab example.
+
+### Committed transaction ownership
+
+The persisted sync wrapper sends every source transaction with durable effects
+through the coordinator's required
+`requestApplyCommittedTx(collectionId, tx)` method.
+`BrowserCollectionCoordinator` routes the complete transaction to the current
+leader for that collection. The leader applies it with the adapter registered
+for the same collection id, including that collection's resolved mode and
+`schemaVersion`.
+
+The route preserves truncation, row changes, row metadata, collection metadata,
+and stream position as one `PersistedTx`. It does not feature-detect a partial
+route or fall back to row-only mutation RPC. A custom coordinator that omits
+`requestApplyCommittedTx` is rejected while the collection is configured,
+before its sync source can publish rows. An effect-free source commit neither
+publishes nor consumes a coordinator sequence.
+
+Single-tab mode uses the same complete transaction contract. Its
+`SingleProcessCoordinator` skips election and channel traffic but still routes
+the transaction to the resolved adapter for that collection.
+
+If a mutating RPC loses its response, Browser coordination replays it only
+while the requester still knows the same non-null leader id and term. An
+unknown initial route or any leader/term change rejects with
+`IndeterminateCommitError`. The coordinator does not retry that mutation
+against an unknown or replacement leader. Direct mutation callers must
+reconcile the outcome.
+
+For a source sync transaction, the persisted wrapper keeps its applied receipt
+pending while the replacement leader checks the exact transaction ID in SQLite
+under the writer lock. If the ID is present, the receipt fulfills and peers
+reload any committed rows they missed. If the ID is absent and the durable row
+version and reset epoch still match the pre-send snapshot, the replacement
+applies that transaction once and the receipt fulfills. The Collection and its
+dependent live queries stay in the same sync run. If another write, reset, or
+pruning makes the outcome unsafe to certify, the receipt rejects with the
+original `IndeterminateCommitError` and the source run enters error. This
+reconciliation applies only when both the coordinator and adapter provide the
+exact-ID operation; it does not change direct RPC behavior. Tabs running an
+older protocol version do not participate in this same-run recovery contract.
+
+### Remote subset requests
+
+`BrowserCollectionCoordinator.requestEnsureRemoteSubset(...)` validates and
+projects the request before it chooses the local leader or `BroadcastChannel`
+route. Registered owners receive the exported
+`TransportedLoadSubsetOptions` type. It contains the supported
+structured-clone wire data and excludes live `signal` and `subscription`
+fields. Unsupported nested values fail immediately with
+`RemoteSubsetWireValueError` and the exact value path; no owner callback or
+channel post occurs. See the core package's remote subset wire contract for the
+complete supported domain.
+
+Each accepted request is an explicit lease. Retries of the same request object
+reuse its acquisition identity, while distinct equal request objects remain
+independent. Release is routed to the elected collection owner and unloads the
+exact acquired options once. Leadership loss unloads the retiring owner's live
+leases, and requesters replay still-live acquisitions against the next leader.
+Registering a second owner for one collection throws
+`DuplicateRemoteSubsetOwnerError`; no adapter fallback replaces the owner.
+Remote follower transport/admission failures reject and retain demand for its
+normal retry without entering the follower's local owner lifecycle. Terminal
+release identities expire after the existing RPC dedupe horizon while delayed
+duplicates inside that horizon remain idempotent.
+
 ## Notes
 
-- This package is Phase 7 single-tab browser wiring: it uses
-  `SingleProcessCoordinator` semantics by default.
 - `openBrowserWASQLiteOPFSDatabase(...)` starts a dedicated Web Worker and
   routes SQL operations through it. OPFS sync access handle APIs are used in
-  that worker context.
-- Single-tab mode does not require BroadcastChannel or Web Locks for
-  correctness.
+  that worker context. The package includes the worker and a separate
+  `wa-sqlite.wasm` asset. Vite, webpack 5, and Next.js with Turbopack or
+  webpack include both automatically, with no asset copying or WASM URL
+  configuration required.
+- In Vite development, a pre-bundled copy of this package asks the dev server
+  for its assets by package name, from the app root. Production builds drop
+  this lookup:
+  - If the app reaches the package only through another library or through an
+    npm alias, the root cannot resolve that name. The open rejects with
+    `PersistenceUnavailableError`.
+  - If more than one copy is installed, the pre-bundled copy loads the assets
+    of the copy that the root resolves. When that copy is another version, its
+    worker refuses the opener and the open rejects with
+    `PersistenceUnavailableError`.
+  - The copy finds the dev server through the page's Vite client script. If
+    the database opens inside a worker, or the page loads the Vite client
+    without a script `src`, the copy cannot find its assets and the open
+    rejects with `PersistenceUnavailableError`.
+
+  In those cases, exclude the package from pre-bundling so Vite serves it
+  beside its own assets. List the name that the importing code uses, which is
+  the alias name for an npm alias:
+
+  ```ts
+  // vite.config.ts
+  export default defineConfig({
+    optimizeDeps: {
+      exclude: [`@tanstack/browser-db-sqlite-persistence`],
+    },
+  })
+  ```
+
+- Opening has a 30-second deadline by default. `timeoutMs` changes it; `0`
+  explicitly disables the deadline. A timed-out open rejects with
+  `TimeoutError` and terminates its pending worker, so it cannot acquire the
+  database later. Pass an `AbortSignal` to cancel earlier; the signal applies
+  only while opening, not to the established connection.
+- On `pagehide`, the connection terminates its worker synchronously and rejects
+  pending initialization, queries, and close operations with `AbortError`. This
+  also applies when the document enters the back/forward cache. Applications
+  restored through
+  `pageshow` with `event.persisted` must create fresh database connections and
+  persistence/collection instances (or reload the application).
+- `database.close()` stops accepting requests when it starts; later calls to
+  `execute` reject with `SQLiteConnectionClosedError`, and concurrent `close()` calls share one outcome. The
+  worker finishes queries submitted before close, in order, and then closes,
+  so those queries keep their results. Close can therefore wait while another
+  tab holds the database's OPFS access handle. If `pagehide` or a worker
+  failure ends the connection first, queries still pending reject.
+- Flush application writes and await `database.close()` before navigating when
+  possible. The `pagehide` cleanup releases resources; it cannot await pending
+  writes or serve as a durability guarantee.
+- Single-tab mode does not require `BroadcastChannel` or Web Locks for
+  election, but committed transactions still go through the collection's
+  registered persistence owner.
+- Multi-tab mode requires `BroadcastChannel` and the Web Locks API; both are
+  available in all modern browsers.
 - OPFS capability failures are surfaced as `PersistenceUnavailableError`.
+- SQLite open failures include the underlying VFS error name and message when
+  wa-sqlite exposes them. Some failures, including native access-handle
+  contention, are not currently exposed by wa-sqlite and retain SQLite's
+  generic open error.

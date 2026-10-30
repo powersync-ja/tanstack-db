@@ -7,6 +7,7 @@ import {
   rxStorageWriteErrorToRxError,
 } from 'rxdb/plugins/core'
 import DebugModule from 'debug'
+import { withCollectionConfigFactory } from '@tanstack/db'
 import { stripRxdbFields } from './helper'
 import type {
   FilledMangoQuery,
@@ -101,12 +102,13 @@ export function rxdbCollectionOptions<T extends object>(
   schema?: never // no schema in the result
 }
 
-export function rxdbCollectionOptions(config: RxDBCollectionConfig<any, any>) {
+export function rxdbCollectionOptions(
+  config: RxDBCollectionConfig<any, any>,
+): CollectionConfig<any, string, any> {
   type Row = Record<string, unknown>
   type Key = string // because RxDB primary keys must be strings
 
-  const { ...restConfig } = config
-  const rxCollection = config.rxCollection
+  const { rxCollection, syncBatchSize: _syncBatchSize, ...restConfig } = config
 
   // "getKey"
   const primaryPath = rxCollection.schema.primaryPath
@@ -124,9 +126,9 @@ export function rxdbCollectionOptions(config: RxDBCollectionConfig<any, any>) {
   type SyncParams = Parameters<SyncConfig<Row, string>[`sync`]>[0]
   const sync: SyncConfig<Row, Key> = {
     sync: (params: SyncParams) => {
-      const { begin, write, commit, markReady } = params
+      const { begin, write, commit, markReady, fail, collection } = params
 
-      let ready = false
+      let initialFetchComplete = false
       async function initialFetch() {
         /**
          * RxDB stores a last-write-time
@@ -135,9 +137,14 @@ export function rxdbCollectionOptions(config: RxDBCollectionConfig<any, any>) {
          */
         let cursor: RxDocumentData<Row> | undefined = undefined
         const syncBatchSize = config.syncBatchSize ? config.syncBatchSize : 1000
-        begin()
+        // The initial fetch reads every document. When the Collection holds
+        // rows, such as a reload's kept rows, it is a snapshot that replaces
+        // them, so a row RxDB no longer has goes.
+        begin({
+          snapshot: !collection._state.acceptedSyncedEntries().next().done,
+        })
 
-        while (!ready) {
+        while (!initialFetchComplete) {
           let query: FilledMangoQuery<Row>
           if (cursor) {
             query = {
@@ -181,7 +188,7 @@ export function rxdbCollectionOptions(config: RxDBCollectionConfig<any, any>) {
 
           cursor = lastOfArray(docs)
           if (docs.length === 0) {
-            ready = true
+            initialFetchComplete = true
             break
           }
 
@@ -192,13 +199,14 @@ export function rxdbCollectionOptions(config: RxDBCollectionConfig<any, any>) {
             })
           })
         }
-        commit()
+        await commit()
       }
 
       type WriteMessage = Parameters<typeof write>[0]
       const buffer: Array<WriteMessage> = []
+      let buffering = true
       const queue = (msg: WriteMessage) => {
-        if (!ready) {
+        if (buffering) {
           buffer.push(msg)
           return
         }
@@ -207,22 +215,38 @@ export function rxdbCollectionOptions(config: RxDBCollectionConfig<any, any>) {
         commit()
       }
 
-      let sub: Subscription
+      let sub: Subscription | undefined
+      function stopOngoingFetch() {
+        buffer.length = 0
+        if (!sub) return
+        getFromMapOrCreate(
+          OPEN_RXDB_SUBSCRIPTIONS,
+          rxCollection,
+          () => new Set(),
+        ).delete(sub)
+        sub.unsubscribe()
+        sub = undefined
+      }
+
       function startOngoingFetch() {
         // Subscribe early and buffer live changes during initial load and ongoing
-        sub = rxCollection.$.subscribe((ev) => {
-          const cur: Row = stripRxdbFields(clone(ev.documentData as Row))
-          switch (ev.operation) {
-            case `INSERT`:
-              queue({ type: `insert`, value: cur })
-              break
-            case `UPDATE`:
-              queue({ type: `update`, value: cur })
-              break
-            case `DELETE`:
-              queue({ type: `delete`, value: cur })
-              break
-          }
+        sub = rxCollection.$.subscribe({
+          next: (ev) => {
+            const cur: Row = stripRxdbFields(clone(ev.documentData as Row))
+            switch (ev.operation) {
+              case `INSERT`:
+                queue({ type: `insert`, value: cur })
+                break
+              case `UPDATE`:
+                queue({ type: `update`, value: cur })
+                break
+              case `DELETE`:
+                queue({ type: `delete`, value: cur })
+                break
+            }
+          },
+          // An errored stream ends, so later writes would never arrive.
+          error: stop,
         })
 
         const subs = getFromMapOrCreate(
@@ -234,30 +258,41 @@ export function rxdbCollectionOptions(config: RxDBCollectionConfig<any, any>) {
       }
 
       async function start() {
+        const isCleanedUp = () => collection.status === `cleaned-up`
+
         startOngoingFetch()
         await initialFetch()
-
-        if (buffer.length) {
-          begin()
-          for (const msg of buffer) write(msg)
-          commit()
-          buffer.length = 0
+        if (isCleanedUp()) {
+          return
         }
 
+        // Take one finite snapshot of changes observed during the initial
+        // fetch, then route newer events through the normal live path. The
+        // core transaction queue preserves their order without letting a
+        // continuous event stream postpone readiness forever.
+        const pending = buffer.splice(0)
+        buffering = false
+        if (pending.length > 0) {
+          begin()
+          for (const msg of pending) write(msg)
+          await commit()
+          if (isCleanedUp()) {
+            return
+          }
+        }
+
+        // After this run's fail(), markReady() does nothing.
         markReady()
       }
 
-      start()
-
-      return () => {
-        const subs = getFromMapOrCreate(
-          OPEN_RXDB_SUBSCRIPTIONS,
-          rxCollection,
-          () => new Set(),
-        )
-        subs.delete(sub)
-        sub.unsubscribe()
+      // Core ignores a later fail() in the same run.
+      function stop(error: unknown) {
+        stopOngoingFetch()
+        fail(error)
       }
+      void start().catch(stop)
+
+      return stopOngoingFetch
     },
     // Expose the getSyncMetadata function
     getSyncMetadata: undefined,
@@ -270,12 +305,10 @@ export function rxdbCollectionOptions(config: RxDBCollectionConfig<any, any>) {
     onInsert: async (params) => {
       debug(`insert`, params)
       const newItems = params.transaction.mutations.map((m) => m.modified)
-      return rxCollection.bulkUpsert(newItems).then((result) => {
-        if (result.error.length > 0) {
-          throw rxStorageWriteErrorToRxError(ensureNotFalsy(result.error[0]))
-        }
-        return result.success
-      })
+      const result = await rxCollection.bulkUpsert(newItems)
+      if (result.error.length > 0) {
+        throw rxStorageWriteErrorToRxError(ensureNotFalsy(result.error[0]))
+      }
     },
     onUpdate: async (params) => {
       debug(`update`, params)
@@ -301,13 +334,13 @@ export function rxdbCollectionOptions(config: RxDBCollectionConfig<any, any>) {
         (m) => m.type === `delete`,
       )
       const ids = mutations.map((mutation) => getKey(mutation.original))
-      return rxCollection.bulkRemove(ids).then((result) => {
-        if (result.error.length > 0) {
-          throw result.error
-        }
-        return result.success
-      })
+      const result = await rxCollection.bulkRemove(ids)
+      if (result.error.length > 0) {
+        throw result.error
+      }
     },
   }
-  return collectionConfig
+  return withCollectionConfigFactory(collectionConfig, () =>
+    rxdbCollectionOptions(config),
+  )
 }

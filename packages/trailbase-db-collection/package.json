@@ -1,6 +1,6 @@
 {
   "name": "@tanstack/trailbase-db-collection",
-  "version": "0.1.86",
+  "version": "1.0.0-rc.1",
   "description": "TrailBase collection for TanStack DB",
   "author": "Sebastian Jeltsch",
   "license": "MIT",
@@ -21,6 +21,7 @@
     "dev": "vite build --watch",
     "lint": "eslint . --fix",
     "test": "vitest --run",
+    "test:oracles": "vitest run tests/lifecycle-oracle.property.test.ts",
     "test:e2e": "vitest --run --config vitest.e2e.config.ts"
   },
   "type": "module",
@@ -57,7 +58,6 @@
   },
   "devDependencies": {
     "@types/debug": "^4.1.12",
-    "@vitest/coverage-istanbul": "^3.2.4",
-    "uuid": "^13.0.0"
+    "@vitest/coverage-istanbul": "^4.1.12"
   }
 }

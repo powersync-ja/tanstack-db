@@ -20,6 +20,7 @@ const mockRequestSnapshot = vi.fn()
 const mockFetchSnapshot = vi.fn()
 const mockStream = {
   subscribe: mockSubscribe,
+  unsubscribeAll: vi.fn(),
   requestSnapshot: mockRequestSnapshot,
   fetchSnapshot: mockFetchSnapshot,
 }
@@ -28,7 +29,9 @@ vi.mock(`@electric-sql/client`, async () => {
   const actual = await vi.importActual(`@electric-sql/client`)
   return {
     ...actual,
-    ShapeStream: vi.fn(() => mockStream),
+    ShapeStream: vi.fn(function () {
+      return mockStream
+    }),
   }
 })
 
@@ -686,6 +689,42 @@ describe(`Electric Tag Tracking and GC`, () => {
     expect(collection.state.size).toBe(1)
     expect(collection.state.has(3)).toBe(true)
     expect(collection.state.get(3)).toEqual({ id: 3, name: `User 3` })
+  })
+
+  it(`does not accept a partial update after move-out deletes a row`, () => {
+    subscriber([
+      {
+        key: `1`,
+        value: { id: 1, name: `complete`, stable: `preserved` },
+        headers: {
+          operation: `insert`,
+          tags: [`hash1/hash2/hash3`],
+        },
+      },
+      { headers: { control: `up-to-date` } },
+    ])
+
+    subscriber([
+      {
+        headers: {
+          event: `move-out`,
+          patterns: [{ pos: 0, value: `hash1` }],
+        },
+      },
+      { headers: { control: `up-to-date` } },
+    ])
+    expect(collection.has(1)).toBe(false)
+
+    subscriber([
+      {
+        key: `1`,
+        value: { id: 1, name: `partial` },
+        headers: { operation: `update` },
+      },
+      { headers: { control: `up-to-date` } },
+    ])
+
+    expect(collection.has(1)).toBe(false)
   })
 
   it(`should remove shared tags from all rows when move-out pattern matches`, () => {

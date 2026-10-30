@@ -2,8 +2,6 @@
 title: Electric Collection
 ---
 
-# Electric Collection
-
 Electric collections provide seamless integration between TanStack DB and ElectricSQL, enabling real-time data synchronization with your Postgres database through Electric's sync engine.
 
 ## Overview
@@ -30,7 +28,7 @@ const todosCollection = createCollection(
     shapeOptions: {
       url: '/api/todos',
     },
-    getKey: (item) => item.id,
+    getKey: (item: { id: string }) => item.id,
   })
 )
 ```
@@ -60,7 +58,7 @@ Handlers are called before mutations to persist changes to your backend:
 - `onUpdate`: Handler called before update operations
 - `onDelete`: Handler called before delete operations
 
-Each handler should return `{ txid }` to wait for synchronization. For cases where your API can not return txids, use the `awaitMatch` utility function.
+Each handler should call `await collection.utils.awaitTxId(txid)` to wait for synchronization. For cases where your API cannot return txids, use the `awaitMatch` utility function.
 
 ## Persistence Handlers & Synchronization
 
@@ -81,22 +79,23 @@ const todosCollection = createCollection(
       params: { table: 'todos' },
     },
 
-    onInsert: async ({ transaction }) => {
+    onInsert: async ({ transaction, collection }) => {
       const newItem = transaction.mutations[0].modified
       const response = await api.todos.create(newItem)
 
-      // Return txid to wait for sync
-      return { txid: response.txid }
+      // Wait for txid to sync
+      await collection.utils.awaitTxId(response.txid)
     },
 
-    onUpdate: async ({ transaction }) => {
+    onUpdate: async ({ transaction, collection }) => {
       const { original, changes } = transaction.mutations[0]
       const response = await api.todos.update({
         where: { id: original.id },
         data: changes
       })
 
-      return { txid: response.txid }
+      // Wait for txid to sync
+      await collection.utils.awaitTxId(response.txid)
     }
   })
 )
@@ -129,7 +128,7 @@ const todosCollection = createCollection(
                  message.headers.operation === 'insert' &&
                  message.value.text === newItem.text
         },
-        5000 // timeout in ms (optional, defaults to 3000)
+        5000 // timeout in ms (optional, defaults to 15000)
       )
     }
   })
@@ -144,7 +143,7 @@ For quick prototyping or when you're confident about timing, you can use a simpl
 const todosCollection = createCollection(
   electricCollectionOptions({
     id: 'todos',
-    getKey: (item) => item.id,
+    getKey: (item: { id: string }) => item.id,
     shapeOptions: {
       url: '/api/todos',
       params: { table: 'todos' },
@@ -305,21 +304,26 @@ The collection provides these utility methods via `collection.utils`:
 
 ### `awaitTxId(txid, timeout?)`
 
-Manually wait for a specific transaction ID to be synchronized:
+Wait for a specific transaction ID to be synchronized:
 
 ```typescript
 // Wait for specific txid
 await todosCollection.utils.awaitTxId(12345)
 
-// With custom timeout (default is 5 seconds)
+// With custom timeout (default is 15 seconds)
 await todosCollection.utils.awaitTxId(12345, 10000)
 ```
 
 This is useful when you need to ensure a mutation has been synchronized before proceeding with other operations.
 
+For a collection wrapped with SQLite persistence, `awaitTxId` observes the
+transaction in the Electric stream. It can resolve before the local SQLite
+write completes. Do not use it as a local durability acknowledgment: if the
+page closes in that gap, reopening may need Electric to recover the row.
+
 ### `awaitMatch(matchFn, timeout?)`
 
-Manually wait for a custom match function to find a matching message:
+Wait for a custom match function to find a matching message:
 
 ```typescript
 import { isChangeMessage } from '@tanstack/electric-db-collection'
@@ -334,6 +338,119 @@ await todosCollection.utils.awaitMatch(
   5000 // timeout in ms
 )
 ```
+
+### Cleanup and resume safety
+
+Transaction evidence and pending `awaitTxId`/`awaitMatch` calls belong to one
+collection lifecycle. Explicit cleanup and automatic garbage collection reject
+pending waits with `StreamAbortedError`; callbacks from the retired stream cannot
+settle waits in a restarted collection. Observe these promises even when the
+component or collection may be disposed before they settle.
+
+An on-demand Collection with managed SQLite persistence can also replace its
+Electric provider session within the same Collection sync run when its cached
+resume evidence becomes invalid or its cache claim expires. This replacement
+rejects pending `awaitTxId` and `awaitMatch` waits with `StreamAbortedError`.
+A mutation handler waiting on one of them rejects; a later handler can wait for
+evidence from the replacement session. The replacement reloads demanded
+subsets and does not treat acknowledgements from the retired session as current.
+
+Before constructing a replacement `ShapeStream`, Electric releases the
+adapter-owned resources of the retired provider session, including its
+subscriptions and host lifecycle listeners. The replacement starts after cache
+rotation completes. An HTTP request that ignores cancellation may still finish
+later; its response cannot publish rows or settle waits for the replacement
+session.
+
+Persisted resumes wait for the cached row baseline to finish hydrating. If the
+persistence wrapper cannot verify hydration completion, Electric starts a fresh
+snapshot instead of using the saved offset and handle. It warns once per options
+descriptor; update the persistence adapter alongside Electric to enable safe resume.
+Fresh eager snapshots wait for hydration, then replace the cached rows at the
+snapshot's commit boundary. Rows omitted from that snapshot do not survive in
+the collection or its persisted cache, even when the fresh snapshot is empty.
+
+Tag membership is kept in memory, not restored from cached row headers. A cold
+restart cannot use a saved cursor that needs tags or comes from an older version
+that did not record whether tags were used. A changed shape, malformed saved
+state, or incomplete key-set evidence also invalidates the saved cursor.
+Untagged shapes with complete resume evidence can still resume from their saved
+offset.
+
+An eager persisted resume also needs compatible source progress when its adapter
+supplies that capability. Missing or incompatible progress requires a fresh
+snapshot, even with an explicit offset or handle. Those options do not certify
+the cached rows.
+An interrupted eager recovery keeps its durable reset marker. The next start
+also requires a fresh snapshot, even with an explicit offset or handle.
+
+Eager and progressive recovery fetch a full snapshot. Cached rows remain visible
+until that replacement completes; a partial batch or subset completion cannot
+publish it early. An on-demand collection with the current SQLite persistence
+wrapper instead retires the persisted cache generation and clears the source
+Collection's uncertified rows. A run with a valid claim can continue using the
+retired generation; new runs claim an empty generation. That local clear does
+not mark the Collection ready. Electric source evidence supplies readiness. It
+starts a changes-only stream at the current position and
+requests snapshots for active subset demands. Each demand completes after its
+snapshot rows apply, including an empty snapshot. Later demands cannot rehydrate
+old cache rows without a fresh source snapshot. With no active demand, recovery
+does not read all cached rows or download the full shape. The durable reset marker
+remains until a complete baseline can justify a global resume cursor. A cache
+generation created after claim expiry can lack that marker; its incompatible
+key-set evidence also requires scoped recovery on the next cold start, even
+when the caller supplies an explicit Electric offset or handle. Those source
+cursor options do not certify cached rows. A wrapper
+without scoped recovery support continues to use full-shape recovery. An
+interrupted recovery keeps the reset marker for the next start.
+Until a complete baseline is certified, each later cold start repeats scoped
+recovery. Uncertified cached rows from earlier starts are not shown offline.
+Retired new-format storage is reclaimed by the next cache-claim collection
+operation after its claims release or expire; clock passage alone does not
+run SQLite work. A paused run whose claim expires must reload its demanded
+subsets from the source when it resumes. Pre-upgrade on-demand storage is
+isolated but needs a separate cross-version cleanup policy while older tabs
+may still use it. Scoped recovery
+does not certify the new generation for offline reuse.
+
+With `initialRender: { strategy: 'network-first' }`, an on-demand or
+progressive Collection can render a demand offline from SQLite after that exact
+demand settled online in an earlier session. Each demand keeps its own
+coverage in the current persisted cache generation. Scoped recovery, cache-claim
+expiry, and a must-refetch end it, so after any of them a demand waits for the
+network again. A demand that loads during the rest of a scoped-recovery sync
+run records no coverage. See [On-demand Collections offline](../guides/sqlite-persistence.md#on-demand-collections-offline).
+
+During scoped recovery, coordinator notifications about SQLite changes do not
+hydrate, truncate, or replace public source rows. The Electric change stream
+and demanded source snapshots own those rows until the sync run ends. A change
+made in another tab may therefore become public when Electric delivers it,
+rather than when its durable-cache notification arrives. Outside scoped
+recovery, coordinator invalidation retains its normal behavior.
+
+An eager or progressive resume cannot apply a partial update to an unknown row.
+The adapter rejects that batch, stops the stream, and records a reset so the
+next sync starts from a full snapshot. Before the Collection is ready, this
+fails the first load (`status: 'error'`); after it, the rows stay and the
+source node shows an `error` in `collection.health` and in each live query's
+`health` tree. This does not silently retry the failed stream;
+`collection.reload()` refetches.
+
+While the Electric stream retries a failed request, the Collection reports
+nothing: it stays `loading` before its first up-to-date, and keeps its health tree
+unchanged afterward. When the stream gives up, it calls `fail()`: a failed first load
+before readiness, or the source node's `error` after it. Complete updates from an explicit `replica: 'full'` stream remain valid.
+On-demand streams can observe updates outside their loaded subsets; unknown
+partial rows are ignored, while transaction acknowledgement evidence is retained.
+Outside scoped recovery, complete rows published by persistence reloads or
+another tab are valid baselines for subsequent partial updates. Uncertified
+cached rows in scoped recovery are not. Pending deletions and resets still take
+precedence over an older row that remains publicly visible.
+
+Reusing Electric collection options, including a spread of those options, does
+not share transaction waiters or tag visibility between collections. Tag state
+survives a compatible resume of the same collection and clears on a fresh
+snapshot or `must-refetch`.
 
 ### Helper Functions
 
@@ -358,7 +475,7 @@ const matchFn = (message) => {
 
 ### Common Issue: awaitTxId Stalls or Times Out
 
-A frequent issue developers encounter is that `awaitTxId` (or the transaction's `isPersisted.promise`) stalls indefinitely, eventually timing out with no error messages. The data persists correctly to the database, but the optimistic mutation never resolves.
+A frequent issue developers encounter is that `awaitTxId` (or the transaction's `when('settled')`) stalls indefinitely, eventually timing out with no error messages. The data persists correctly to the database, but the optimistic mutation never resolves.
 
 **Root Cause:** This happens when the transaction ID (txid) returned from your API doesn't match the actual transaction ID of the mutation in Postgres. This mismatch occurs when you query `pg_current_xact_id()` **outside** the same transaction that performs the mutation.
 

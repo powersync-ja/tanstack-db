@@ -1,5 +1,9 @@
-import { expect } from 'vitest'
+import { expect, vi } from 'vitest'
+import { createCollection } from '../src/collection/index.js'
 import { BTreeIndex } from '../src/indexes/btree-index'
+import { withCollectionConfigFactory } from '../src/client'
+import { normalizeValue } from '../src/utils/comparison.js'
+import { CleanupQueue } from '../src/collection/cleanup-queue.js'
 import type {
   CollectionConfig,
   MutationFnParams,
@@ -8,18 +12,64 @@ import type {
 } from '../src/index.js'
 import type { IndexConstructor } from '../src/indexes/base-index'
 import type { WithVirtualProps } from '../src/virtual-props.js'
+import type { Transaction } from '../src/transactions.js'
+import type { Collection } from '../src/collection/index.js'
 
 export type OutputWithVirtual<
   T extends object,
   TKey extends string | number = string | number,
 > = WithVirtualProps<T, TKey>
+/**
+ * Runs an oracle check, then every cleanup step in order. A cleanup failure
+ * never replaces the check's own failure: the check failure is thrown alone or
+ * as the `cause` of an `AggregateError` that also holds each cleanup failure.
+ */
+export async function withOracleCleanup(
+  check: () => Promise<void> | void,
+  cleanups: ReadonlyArray<() => unknown>,
+): Promise<void> {
+  const failures: Array<unknown> = []
+  let checkFailed = false
+  try {
+    await check()
+  } catch (error) {
+    checkFailed = true
+    failures.push(error)
+  }
+  for (const cleanup of cleanups) {
+    try {
+      await cleanup()
+    } catch (error) {
+      failures.push(error)
+    }
+  }
+  if (failures.length === 1) throw failures[0]
+  if (failures.length > 1) {
+    throw new AggregateError(
+      failures,
+      checkFailed ? `Oracle check and cleanup failed` : `Oracle cleanup failed`,
+      { cause: failures[0] },
+    )
+  }
+}
+
+// Keep sync startup, writes, readiness, and load outcomes in the test itself.
+export function createOnDemandCollection<T extends { id: string | number }>(
+  config: Omit<CollectionConfig<T>, `getKey` | `syncMode`>,
+) {
+  return createCollection<T>({
+    ...config,
+    getKey: ({ id }) => id,
+    syncMode: `on-demand`,
+  })
+}
 
 export const stripVirtualProps = <T extends Record<string, any> | undefined>(
   value: T,
 ) => {
   if (!value || typeof value !== `object`) return value
   const {
-    $synced: _synced,
+    $hasPendingWrites: _hasPendingWrites,
     $origin: _origin,
     $key: _key,
     $collectionId: _collectionId,
@@ -30,9 +80,9 @@ export const stripVirtualProps = <T extends Record<string, any> | undefined>(
 
 export const omitVirtualProps = <T extends Record<string, any>>(
   value: T,
-): Omit<T, '$synced' | '$origin' | '$key' | '$collectionId'> => {
+): Omit<T, '$hasPendingWrites' | '$origin' | '$key' | '$collectionId'> => {
   const {
-    $synced: _synced,
+    $hasPendingWrites: _hasPendingWrites,
     $origin: _origin,
     $key: _key,
     $collectionId: _collectionId,
@@ -65,32 +115,38 @@ export function createIndexUsageTracker(collection: any): {
     queriesExecuted: [],
   }
 
-  // Track index method calls by patching all existing indexes
+  // Track index method calls. Indexes are patched when first read through the
+  // collection, so indexes created after tracking starts (such as auto-indexes
+  // added by a live query) are tracked too.
   const originalMethods = new Map()
-
-  for (const [indexId, index] of collection.indexes) {
+  // A range lookup delegates to rangeQuery; record it once, as the lookup.
+  let lookupDepth = 0
+  const patchIndex = (indexId: unknown, index: any) => {
+    if (originalMethods.has(indexId)) return
     // Track lookup calls (new unified method)
     const originalLookup = index.lookup.bind(index)
     index.lookup = function (operation: any, value: any) {
-      // Only track non-range operations to avoid double counting
-      // Range operations (gt, gte, lt, lte) are handled by rangeQuery tracking
-      if (![`gt`, `gte`, `lt`, `lte`].includes(operation)) {
-        stats.rangeQueryCalls++
-        stats.indexesUsed.push(String(indexId))
-        stats.queriesExecuted.push({
-          type: `index`,
-          operation,
-          field: index.expression?.path?.join(`.`),
-          value,
-        })
+      stats.rangeQueryCalls++
+      stats.indexesUsed.push(String(indexId))
+      stats.queriesExecuted.push({
+        type: `index`,
+        operation,
+        field: index.expression?.path?.join(`.`),
+        value,
+      })
+      lookupDepth++
+      try {
+        return originalLookup(operation, value)
+      } finally {
+        lookupDepth--
       }
-      return originalLookup(operation, value)
     }
 
     // Track rangeQuery calls (for compound range queries)
-    if (index.rangeQuery) {
-      const originalRangeQuery = index.rangeQuery.bind(index)
+    const originalRangeQuery = index.rangeQuery?.bind(index)
+    if (originalRangeQuery) {
       index.rangeQuery = function (options: any) {
+        if (lookupDepth > 0) return originalRangeQuery(options)
         stats.rangeQueryCalls++
         stats.indexesUsed.push(String(indexId))
 
@@ -114,14 +170,30 @@ export function createIndexUsageTracker(collection: any): {
     }
 
     originalMethods.set(indexId, {
+      index,
       lookup: originalLookup,
-      rangeQuery: index.rangeQuery ? index.rangeQuery.bind(index) : undefined,
+      rangeQuery: originalRangeQuery,
     })
   }
+  const originalIndexesGetter = Object.getOwnPropertyDescriptor(
+    Object.getPrototypeOf(collection),
+    `indexes`,
+  )?.get
+  const readIndexes = (): Map<unknown, any> =>
+    originalIndexesGetter?.call(collection) ?? new Map()
+  for (const [indexId, index] of readIndexes()) patchIndex(indexId, index)
+  Object.defineProperty(collection, `indexes`, {
+    get: () => {
+      const indexes = readIndexes()
+      for (const [indexId, index] of indexes) patchIndex(indexId, index)
+      return indexes
+    },
+    configurable: true,
+  })
 
-  // Track full scan calls (entries() iteration)
-  const originalEntries = collection.entries
-  collection.entries = function* () {
+  // Track full scan calls: filtered iteration through either the public
+  // entries() or the stored-row scan used by a prefiltered snapshot.
+  const recordFullScan = () => {
     // Only count as full scan if we're in a filtering context
     // Check the call stack to see if we're inside createFilterFunction
     const stack = new Error().stack || ``
@@ -134,21 +206,29 @@ export function createIndexUsageTracker(collection: any): {
         type: `fullScan`,
       })
     }
+  }
+  const originalEntries = collection.entries
+  collection.entries = function* () {
+    recordFullScan()
     yield* originalEntries.call(this)
+  }
+  // The unindexed snapshot scan reads stored rows through the state.
+  const state = collection._state
+  const originalEntriesPassing = state.entriesPassing
+  state.entriesPassing = function* (prefilter: (row: object) => boolean) {
+    recordFullScan()
+    yield* originalEntriesPassing.call(this, prefilter)
   }
 
   const restore = () => {
-    // Restore original index methods
-    for (const [indexId, index] of collection.indexes) {
-      const original = originalMethods.get(indexId)
-      if (original) {
-        index.lookup = original.lookup
-        if (original.rangeQuery) {
-          index.rangeQuery = original.rangeQuery
-        }
-      }
+    // Remove the instance getter so the prototype getter applies again
+    delete collection.indexes
+    for (const { index, lookup, rangeQuery } of originalMethods.values()) {
+      index.lookup = lookup
+      if (rangeQuery) index.rangeQuery = rangeQuery
     }
     collection.entries = originalEntries
+    state.entriesPassing = originalEntriesPassing
   }
 
   return { stats, restore }
@@ -217,11 +297,32 @@ type MockSyncCollectionConfig<T extends object = Record<string, unknown>> = {
   syncMode?: `eager` | `on-demand`
   defaultStringCollation?: StringCollationConfig
   defaultIndexType?: IndexConstructor
+  gcTime?: number
+}
+
+/**
+ * Both mock sync helpers retain legacy mutation-gate names: `resolveSync`
+ * fulfills the shared promise awaited by the optimistic mutation handlers,
+ * and `rejectSync` rejects it. `awaitSync` and the `syncPending*` locals own
+ * that gate. They do not end a sync run, acknowledge source rows, or settle a
+ * sync transaction's applied receipt. Source writes and Collection readiness
+ * use the separate sync callbacks.
+ */
+type MockSyncCollectionUtils<T extends object> = {
+  begin: () => void
+  write: Parameters<SyncConfig<T>[`sync`]>[0][`write`]
+  commit: () => void
+  resolveSync: () => void
+  rejectSync: (error: Error) => void
 }
 
 export function mockSyncCollectionOptions<
   T extends object = Record<string, unknown>,
->(config: MockSyncCollectionConfig<T>) {
+>(
+  config: MockSyncCollectionConfig<T>,
+): CollectionConfig<T, string | number, never> & {
+  utils: MockSyncCollectionUtils<T>
+} {
   let begin: () => void
   let write: Parameters<SyncConfig<T>[`sync`]>[0][`write`]
   let commit: () => void
@@ -238,12 +339,14 @@ export function mockSyncCollectionOptions<
       syncPendingResolve = resolve
       syncPendingReject = reject
     })
-    syncPendingPromise.then(() => {
-      syncPendingPromise = undefined
-      syncPendingResolve = undefined
-      syncPendingReject = undefined
-    })
+    void syncPendingPromise.finally(clearPendingSync)
     return syncPendingPromise
+  }
+
+  const clearPendingSync = () => {
+    syncPendingPromise = undefined
+    syncPendingResolve = undefined
+    syncPendingReject = undefined
   }
 
   const utils = {
@@ -277,6 +380,9 @@ export function mockSyncCollectionOptions<
     },
   }
 
+  // Destructure to avoid passing test-only properties (like initialData) to createCollection
+  const { initialData: _initialData, ...collectionConfig } = config
+
   const options: CollectionConfig<T, string | number, never> & {
     utils: typeof utils
   } = {
@@ -296,7 +402,7 @@ export function mockSyncCollectionOptions<
       await awaitSync()
     },
     utils,
-    ...config,
+    ...collectionConfig,
     autoIndex: config.autoIndex,
     // When autoIndex is 'eager', we need a defaultIndexType
     defaultIndexType:
@@ -304,7 +410,9 @@ export function mockSyncCollectionOptions<
       (config.autoIndex === `eager` ? BTreeIndex : undefined),
   }
 
-  return options
+  return withCollectionConfigFactory(options, () =>
+    mockSyncCollectionOptions(config),
+  )
 }
 
 type MockSyncCollectionConfigNoInitialState<T> = {
@@ -315,6 +423,7 @@ type MockSyncCollectionConfigNoInitialState<T> = {
   defaultIndexType?: IndexConstructor
 }
 
+/** Uses the same legacy mutation-gate mapping as MockSyncCollectionUtils. */
 export function mockSyncCollectionOptionsNoInitialState<
   T extends object = Record<string, unknown>,
 >(config: MockSyncCollectionConfigNoInitialState<T>) {
@@ -336,12 +445,14 @@ export function mockSyncCollectionOptionsNoInitialState<
       syncPendingResolve = resolve
       syncPendingReject = reject
     })
-    syncPendingPromise.then(() => {
-      syncPendingPromise = undefined
-      syncPendingResolve = undefined
-      syncPendingReject = undefined
-    })
+    void syncPendingPromise.finally(clearPendingSync)
     return syncPendingPromise
+  }
+
+  const clearPendingSync = () => {
+    syncPendingPromise = undefined
+    syncPendingResolve = undefined
+    syncPendingReject = undefined
   }
 
   const utils = {
@@ -396,6 +507,30 @@ export function mockSyncCollectionOptionsNoInitialState<
 }
 
 // Utility to flush microtasks and promises
+/**
+ * Capture errors rethrown from microtasks, as the ordered loader reports an
+ * adapter's failing lease release. Callbacks still run in their turn.
+ */
+export function captureMicrotaskErrors(): {
+  errors: Array<unknown>
+  restore: () => void
+} {
+  const queue = globalThis.queueMicrotask.bind(globalThis)
+  const errors: Array<unknown> = []
+  const spy = vi
+    .spyOn(globalThis, `queueMicrotask`)
+    .mockImplementation((callback) =>
+      queue(() => {
+        try {
+          callback()
+        } catch (error) {
+          errors.push(error)
+        }
+      }),
+    )
+  return { errors, restore: () => spy.mockRestore() }
+}
+
 export const flushPromises = () =>
   new Promise((resolve) => setTimeout(resolve, 0))
 
@@ -429,7 +564,9 @@ export function withExpectedRejection<T>(
   expectedMessage: string,
   testFn: () => T | Promise<T>,
 ): Promise<T> {
-  return new Promise((resolve, reject) => {
+  // The returned promise owns cleanup even if testFn throws before its chain exists.
+  let restoreListeners: () => void = () => undefined
+  return new Promise<T>((resolve, reject) => {
     // Find and temporarily remove the vitest unhandled rejection handler
     const originalUnhandledRejection = process
       .listeners(`unhandledRejection`)
@@ -443,6 +580,13 @@ export function withExpectedRejection<T>(
       }
       // Re-throw other rejections
       reject(reason)
+    }
+
+    restoreListeners = () => {
+      process.removeListener(`unhandledRejection`, handleRejection)
+      if (originalUnhandledRejection) {
+        process.addListener(`unhandledRejection`, originalUnhandledRejection)
+      }
     }
 
     if (originalUnhandledRejection) {
@@ -470,12 +614,132 @@ export function withExpectedRejection<T>(
       .catch((error) => {
         reject(error)
       })
-      .finally(() => {
-        // Clean up the error handler
-        process.removeListener(`unhandledRejection`, handleRejection)
-        if (originalUnhandledRejection) {
-          process.addListener(`unhandledRejection`, originalUnhandledRejection)
+  }).finally(() => restoreListeners())
+}
+
+type IndexInternals<TKey> = { indexedKeys: Set<TKey> } & (
+  | { sortedValues: Array<unknown>; valueMap: Map<unknown, Set<TKey>> }
+  | {
+      valueMap: Map<
+        unknown,
+        {
+          keys: Map<TKey, unknown>
+          buckets?: Map<unknown, Set<TKey>>
         }
+      >
+      orderedEntries: {
+        size: number
+        minKey: () => { value: unknown }
+        maxKey: () => { value: unknown }
+        forRange: (
+          low: unknown,
+          high: unknown,
+          includeHigh: boolean,
+          onFound: (
+            key: { value: unknown },
+            group: { keys: Map<TKey, unknown> },
+          ) => void,
+        ) => void
+      }
+    }
+)
+
+function indexInternals<TKey>(index: object): [IndexInternals<TKey>, boolean] {
+  let reversed = false
+  let current = index as { originalIndex?: object }
+  while (current.originalIndex) {
+    reversed = !reversed
+    current = current.originalIndex as { originalIndex?: object }
+  }
+  return [current as IndexInternals<TKey>, reversed]
+}
+
+/** Test inspection of an index's tracked keys. */
+export function indexedKeysSet<TKey>(index: object): Set<TKey> {
+  return indexInternals<TKey>(index)[0].indexedKeys
+}
+
+/** Test inspection of an index's value buckets keyed by indexed value. */
+export function valueMapData<TKey>(
+  index: object,
+): Map<unknown, Pick<Set<TKey>, 'size' | 'has'>> {
+  const [internals] = indexInternals<TKey>(index)
+  if (`sortedValues` in internals) return internals.valueMap
+  const result = new Map<unknown, Pick<Set<TKey>, 'size' | 'has'>>()
+  for (const [key, group] of internals.valueMap) {
+    result.set(key, group.buckets?.get(key) ?? group.keys)
+  }
+  return result
+}
+
+/** Test inspection of an index's ordered [value, keys] entries. */
+export function orderedEntriesArray<TKey>(
+  index: object,
+): Array<[unknown, Set<TKey>]> {
+  const [internals, reversed] = indexInternals<TKey>(index)
+  let entries: Array<[unknown, Set<TKey>]>
+  if (`sortedValues` in internals) {
+    entries = internals.sortedValues.map((value) => [
+      value,
+      internals.valueMap.get(normalizeValue(value)) ?? new Set(),
+    ])
+  } else {
+    const tree = internals.orderedEntries
+    entries = []
+    if (tree.size > 0) {
+      tree.forRange(tree.minKey(), tree.maxKey(), true, (key, group) => {
+        entries.push([key.value, new Set(group.keys.keys())])
       })
-  })
+    }
+  }
+  return reversed ? entries.reverse() : entries
+}
+
+export function orderedEntriesArrayReversed<TKey>(
+  index: object,
+): Array<[unknown, Set<TKey>]> {
+  return orderedEntriesArray<TKey>(index).reverse()
+}
+
+/** Reset the CleanupQueue singleton between tests. */
+export function resetCleanupQueue(): void {
+  const holder = CleanupQueue as unknown as {
+    instance: { timeoutId: ReturnType<typeof setTimeout> | null } | null
+  }
+  if (holder.instance?.timeoutId != null)
+    clearTimeout(holder.instance.timeoutId)
+  holder.instance = null
+}
+
+/**
+ * Record each transaction a Collection's mutations manager creates, such as
+ * the one a direct write makes for itself, which the call may not return when
+ * it throws. Call `restore` when done.
+ */
+export function captureCreatedTransactions(
+  collection: Collection<any, any, any>,
+): {
+  created: Array<Transaction<any>>
+  restore: () => void
+} {
+  const manager = (
+    collection as unknown as {
+      _mutations: {
+        createTransaction: (...args: Array<unknown>) => Transaction<any>
+      }
+    }
+  )._mutations
+  const createTransaction = manager.createTransaction
+  const created: Array<Transaction<any>> = []
+  manager.createTransaction = (...args) => {
+    const transaction = createTransaction.apply(manager, args)
+    created.push(transaction)
+    return transaction
+  }
+  return {
+    created,
+    restore: () => {
+      manager.createTransaction = createTransaction
+    },
+  }
 }

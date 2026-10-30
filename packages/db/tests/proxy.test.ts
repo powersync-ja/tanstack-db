@@ -1,4 +1,10 @@
-import { describe, expect, it } from 'vitest'
+/**
+ * Ordinary draft-behavior tests for the proxy: hand-written expectations for
+ * reads, writes, reverts, frozen and sealed drafts, and array methods. The
+ * native-comparison laws (array callbacks, stored functions, property
+ * definitions, frozen history rows) are owned by proxy-oracle.test.ts.
+ */
+import { describe, expect, it, vi } from 'vitest'
 import { Temporal } from 'temporal-polyfill'
 import {
   createArrayChangeProxy,
@@ -6,6 +12,36 @@ import {
   withArrayChangeTracking,
   withChangeTracking,
 } from '../src/proxy'
+import { makeFrozenRow, makeStoredRow } from './proxy-native-rows'
+import type { FrozenRow, StoredRow } from './proxy-native-rows'
+
+describe(`Proxy Library`, () => {
+  it.each([null, `true`])(
+    `tracks reads, writes and reverts without consulting DEBUG=%s`,
+    (debug) => {
+      const getItem = vi.fn(() => debug)
+      const log = vi.spyOn(console, `log`).mockImplementation(() => {})
+      vi.stubGlobal(`localStorage`, { getItem })
+      try {
+        const original = { value: 1, nested: { value: 2 } }
+        const { proxy, getChanges } = createChangeProxy(original)
+        expect(proxy.value).toBe(1)
+        proxy.value = 3
+        proxy.nested.value = 4
+        expect(getChanges()).toEqual({ value: 3, nested: { value: 4 } })
+        proxy.value = 1
+        proxy.nested.value = 2
+        expect(getChanges()).toEqual({})
+        expect(original).toEqual({ value: 1, nested: { value: 2 } })
+        expect(getItem).not.toHaveBeenCalled()
+        expect(log).not.toHaveBeenCalled()
+      } finally {
+        vi.unstubAllGlobals()
+        log.mockRestore()
+      }
+    },
+  )
+})
 
 describe(`Proxy Library`, () => {
   describe(`createChangeProxy`, () => {
@@ -111,7 +147,7 @@ describe(`Proxy Library`, () => {
 
       delete proxy.role
 
-      expect(getChanges()).toEqual({
+      expect(getChanges()).toStrictEqual({
         role: undefined,
       })
       expect(obj).toEqual({
@@ -301,21 +337,6 @@ describe(`Proxy Library`, () => {
       expect(obj.name).toBe(`John`)
     })
 
-    // TODO worth it to make this work?
-    // it(`should handle symbolic properties`, () => {
-    //   const symbolKey = Symbol(`test`)
-    //   const obj = {
-    //     [symbolKey]: `value`,
-    //   }
-    //
-    //   const { proxy, getChanges } = createChangeProxy(obj)
-    //   proxy[symbolKey] = `new value`
-    //
-    //   const changes = getChanges()
-    //   expect(changes[symbolKey]).toBe(`new value`)
-    //   expect(obj[symbolKey]).toBe(`new value`)
-    // })
-
     it(`should handle non-enumerable properties`, () => {
       const obj = {}
       Object.defineProperty(obj, `hidden`, {
@@ -335,31 +356,10 @@ describe(`Proxy Library`, () => {
       // @ts-expect-error ignore for test
       expect(obj.hidden).toBe(`original`)
     })
-
-    // it(`should prevent prototype pollution`, () => {
-    //   const obj = { constructor: { prototype: {} } }
-    //   const { proxy } = createChangeProxy(obj)
-    //
-    //   // Attempt to modify Object.prototype through the proxy
-    //   // @ts-expect-error ignore for test
-    //   proxy.__proto__ = { malicious: true }
-    //   // @ts-expect-error ignore for test
-    //   proxy.constructor.prototype.malicious = true
-    //
-    //   // Verify that Object.prototype wasn't polluted
-    //   // @ts-expect-error ignore for test
-    //   expect({}.malicious).toBeUndefined()
-    //   // @ts-expect-error ignore for test
-    //   expect(Object.prototype.malicious).toBeUndefined()
-    //
-    //   // The changes should only affect the proxy's own prototype chain
-    //   // @ts-expect-error ignore for test
-    //   expect(proxy.__proto__.malicious).toBe(true)
-    //   // @ts-expect-error ignore for test
-    //   expect(proxy.constructor.prototype.malicious).toBe(true)
-    // })
   })
+})
 
+describe(`Proxy Library`, () => {
   describe(`Frozen object handling`, () => {
     it(`should handle creating a proxy for an already-frozen object`, () => {
       const obj = { name: `John`, age: 30 }
@@ -531,7 +531,9 @@ describe(`Proxy Library`, () => {
       expect(changes[1]).toEqual({ status: `in-progress` })
     })
   })
+})
 
+describe(`Proxy Library`, () => {
   describe(`Object.seal and Object.preventExtensions handling`, () => {
     it(`should handle Object.seal correctly`, () => {
       const obj = { name: `John`, age: 30 }
@@ -641,7 +643,9 @@ describe(`Proxy Library`, () => {
       })
     })
   })
+})
 
+describe(`Proxy Library`, () => {
   describe(`Enhanced Iterator Method Tracking`, () => {
     it(`should track changes when Map values are modified via iterator`, () => {
       const map = new Map([
@@ -709,6 +713,17 @@ describe(`Proxy Library`, () => {
           { id: 2, value: `two` },
         ]),
       )
+      expect(changes).toEqual({
+        mySet: new Set([
+          { id: 1, value: `modified` },
+          { id: 2, value: `two` },
+        ]),
+      })
+      expect(changes.mySet.size).toBe(2)
+      expect([...set]).toEqual([
+        { id: 1, value: `one` },
+        { id: 2, value: `two` },
+      ])
     })
 
     it(`should track changes when Map values are modified via forEach`, () => {
@@ -777,6 +792,17 @@ describe(`Proxy Library`, () => {
           { id: 2, value: `modified two` },
         ]),
       )
+      expect(changes).toEqual({
+        mySet: new Set([
+          { id: 1, value: `one` },
+          { id: 2, value: `modified two` },
+        ]),
+      })
+      expect(changes.mySet.size).toBe(2)
+      expect([...set]).toEqual([
+        { id: 1, value: `one` },
+        { id: 2, value: `two` },
+      ])
     })
 
     it(`should handle multiple modifications to the same object via different iterators`, () => {
@@ -862,6 +888,16 @@ describe(`Proxy Library`, () => {
         ]),
       )
       expect(obj1.value).toBe(`one`) // Original unchanged
+      expect(changes).toEqual({
+        mySet: new Set([
+          { id: 1, value: `modified` },
+          { id: 2, value: `two` },
+        ]),
+      })
+      expect([...set]).toEqual([
+        { id: 1, value: `one` },
+        { id: 2, value: `two` },
+      ])
     })
 
     it(`should handle reverting changes made via iterators`, () => {
@@ -928,7 +964,9 @@ describe(`Proxy Library`, () => {
       )
     })
   })
+})
 
+describe(`Proxy Library`, () => {
   describe(`Map and Set Operations`, () => {
     it(`should track Map clear operations`, () => {
       const map = new Map([
@@ -1011,7 +1049,9 @@ describe(`Proxy Library`, () => {
       expect(map.get(`key2`)).toBe(`value2`)
     })
   })
+})
 
+describe(`Proxy Library`, () => {
   describe(`createArrayChangeProxy`, () => {
     it(`should track changes to an array of objects`, () => {
       const objs = [
@@ -1348,7 +1388,9 @@ describe(`Proxy Library`, () => {
       }
     })
   })
+})
 
+describe(`Proxy Library`, () => {
   describe(`withChangeTracking`, () => {
     it(`should track changes made in the callback`, () => {
       const obj = { name: `John`, age: 30 }
@@ -1371,7 +1413,9 @@ describe(`Proxy Library`, () => {
       })
     })
   })
+})
 
+describe(`Proxy Library`, () => {
   describe(`withArrayChangeTracking`, () => {
     it(`should track changes made to multiple objects in the callback`, () => {
       const objs = [
@@ -1416,7 +1460,9 @@ describe(`Proxy Library`, () => {
       ])
     })
   })
+})
 
+describe(`Proxy Library`, () => {
   describe(`Proxy revocation and cleanup`, () => {
     it(`should handle accessing proxies after tracking function completes`, () => {
       const obj = { name: `John`, age: 30 }
@@ -1440,7 +1486,9 @@ describe(`Proxy Library`, () => {
       expect(obj.user.name).toBe(`John`)
     })
   })
+})
 
+describe(`Proxy Library`, () => {
   describe(`Advanced Proxy Change Detection`, () => {
     describe(`Structural Sharing and Equality Detection`, () => {
       it(`should return the original object when changes are reverted`, () => {
@@ -1490,7 +1538,9 @@ describe(`Proxy Library`, () => {
       })
     })
   })
+})
 
+describe(`Proxy Library`, () => {
   describe(`Deep Nested Reverts`, () => {
     it(`should correctly detect when a deeply nested property is reverted to original value`, () => {
       const obj = { nested: { count: 10 } }
@@ -1559,11 +1609,29 @@ describe(`Proxy Library`, () => {
 
       // Should still show other changes
       expect(Object.keys(getChanges()).length).toBeGreaterThan(0)
+      expect(getChanges()).toEqual({
+        user: {
+          profile: {
+            name: `John`,
+            settings: { theme: `light`, notifications: true },
+          },
+          stats: { visits: 15 },
+        },
+      })
 
       proxy.user.profile.settings.theme = `dark`
 
       // Should still show other changes
       expect(Object.keys(getChanges()).length).toBeGreaterThan(0)
+      expect(getChanges()).toEqual({
+        user: {
+          profile: {
+            name: `John`,
+            settings: { theme: `dark`, notifications: true },
+          },
+          stats: { visits: 15 },
+        },
+      })
 
       // Revert final change
       proxy.user.stats.visits = 10
@@ -1572,21 +1640,10 @@ describe(`Proxy Library`, () => {
       expect(getChanges()).toEqual({})
     })
   })
+})
 
+describe(`Proxy Library`, () => {
   describe(`Array Edge Cases`, () => {
-    // it(`should track array length changes through truncation`, () => {
-    //   const arr = [1, 2, 3, 4, 5]
-    //   const { proxy, getChanges } = createChangeProxy({ arr })
-    //
-    //   proxy.arr.length = 3
-    //
-    //   expect(getChanges()).toEqual({
-    //     arr: [1, 2, 3],
-    //   })
-    //   expect(arr.length).toBe(3)
-    //   expect(arr).toEqual([1, 2, 3, 4, 5])
-    // })
-
     it(`should handle sparse arrays`, () => {
       const arr = [1, 2, 3, 4, 5]
       const { proxy, getChanges } = createChangeProxy({ arr })
@@ -1594,7 +1651,7 @@ describe(`Proxy Library`, () => {
       delete proxy.arr[2]
 
       expect(getChanges()).toEqual({
-        // eslint-disable-next-line
+        // eslint-disable-next-line no-sparse-arrays -- the deleted index is a hole
         arr: [1, 2, , 4, 5],
       })
       expect(2 in arr).toBe(true)
@@ -1613,7 +1670,9 @@ describe(`Proxy Library`, () => {
       expect(arr.length).toBe(3)
     })
   })
+})
 
+describe(`Proxy Library`, () => {
   describe(`Object.defineProperty and Meta Operations`, () => {
     it(`should track changes made through Object.defineProperty`, () => {
       const obj: { name: string; age?: number } = { name: `John` }
@@ -1631,31 +1690,10 @@ describe(`Proxy Library`, () => {
       })
       expect(obj.age).toBeUndefined()
     })
-
-    // it.only(`should prevent prototype pollution`, () => {
-    //   const obj = { constructor: { prototype: {} } }
-    //   const { proxy } = createChangeProxy(obj)
-    //
-    //   // Attempt to modify Object.prototype through the proxy
-    //   // @ts-expect-error ignore for test
-    //   proxy.__proto__ = { malicious: true }
-    //   // @ts-expect-error ignore for test
-    //   proxy.constructor.prototype.malicious = true
-    //
-    //   // Verify that Object.prototype wasn't polluted
-    //   // @ts-expect-error ignore for test
-    //   expect({}.malicious).toBeUndefined()
-    //   // @ts-expect-error ignore for test
-    //   expect(Object.prototype.malicious).toBeUndefined()
-    //
-    //   // The changes should only affect the proxy's own prototype chain
-    //   // @ts-expect-error ignore for test
-    //   expect(proxy.__proto__.malicious).toBe(true)
-    //   // @ts-expect-error ignore for test
-    //   expect(proxy.constructor.prototype.malicious).toBe(true)
-    // })
   })
+})
 
+describe(`Proxy Library`, () => {
   describe(`Optimization Cases`, () => {
     it(`should not track changes when setting to the same value`, () => {
       const obj = { name: `John`, age: 30, scores: [1, 2, 3] }
@@ -1705,7 +1743,9 @@ describe(`Proxy Library`, () => {
       expect(getChanges()).toEqual({ count: 9999 })
     })
   })
+})
 
+describe(`Proxy Library`, () => {
   describe(`TypedArray Support`, () => {
     it(`should track changes to TypedArrays`, () => {
       const obj = {
@@ -1758,7 +1798,9 @@ describe(`Proxy Library`, () => {
       expect(getChanges()).toEqual({})
     })
   })
+})
 
+describe(`Proxy Library`, () => {
   describe(`Shallow Copy Handling`, () => {
     it(`should properly handle Array shallow copies`, () => {
       const obj = { items: [1, 2, 3] }
@@ -1815,7 +1857,11 @@ describe(`Proxy Library`, () => {
       })
       expect(obj.date).toEqual(originalDate)
     })
+  })
+})
 
+describe(`Proxy Library`, () => {
+  describe(`Shallow Copy Handling`, () => {
     describe(`array iteration methods`, () => {
       it(`should track changes when modifying array items retrieved via find()`, () => {
         const obj = {
@@ -1837,6 +1883,22 @@ describe(`Proxy Library`, () => {
         const changes = getChanges()
         expect(Object.keys(changes).length).toBeGreaterThan(0)
         expect(changes.job?.orders?.[0]?.orderBinInt).toBe(99)
+        expect(changes).toEqual({
+          job: {
+            orders: [
+              { orderId: `order-1`, orderBinInt: 99 },
+              { orderId: `order-2`, orderBinInt: 2 },
+            ],
+          },
+        })
+        expect(obj).toEqual({
+          job: {
+            orders: [
+              { orderId: `order-1`, orderBinInt: 1 },
+              { orderId: `order-2`, orderBinInt: 2 },
+            ],
+          },
+        })
       })
 
       it(`should track changes when modifying array items via forEach`, () => {
@@ -1848,12 +1910,28 @@ describe(`Proxy Library`, () => {
         }
         const { proxy, getChanges } = createChangeProxy(obj)
 
-        proxy.items.forEach((item) => {
+        const visits: Array<number> = []
+        const result = proxy.items.forEach((item) => {
+          visits.push(item.id)
           item.value = item.value * 2
         })
 
         const changes = getChanges()
         expect(Object.keys(changes).length).toBeGreaterThan(0)
+        expect(result).toBeUndefined()
+        expect(visits).toEqual([1, 2])
+        expect(changes).toEqual({
+          items: [
+            { id: 1, value: 20 },
+            { id: 2, value: 40 },
+          ],
+        })
+        expect(obj).toEqual({
+          items: [
+            { id: 1, value: 10 },
+            { id: 2, value: 20 },
+          ],
+        })
       })
 
       it(`should track changes when modifying array items via for...of`, () => {
@@ -1871,6 +1949,18 @@ describe(`Proxy Library`, () => {
 
         const changes = getChanges()
         expect(Object.keys(changes).length).toBeGreaterThan(0)
+        expect(changes).toEqual({
+          items: [
+            { id: 1, value: 20 },
+            { id: 2, value: 40 },
+          ],
+        })
+        expect(obj).toEqual({
+          items: [
+            { id: 1, value: 10 },
+            { id: 2, value: 20 },
+          ],
+        })
       })
 
       it(`should track changes when modifying array items via index access`, () => {
@@ -1890,6 +1980,18 @@ describe(`Proxy Library`, () => {
 
         const changes = getChanges()
         expect(Object.keys(changes).length).toBeGreaterThan(0)
+        expect(changes).toEqual({
+          items: [
+            { id: 1, value: 100 },
+            { id: 2, value: 20 },
+          ],
+        })
+        expect(obj).toEqual({
+          items: [
+            { id: 1, value: 10 },
+            { id: 2, value: 20 },
+          ],
+        })
       })
 
       it(`should track changes when modifying items from filter() result`, () => {
@@ -1909,6 +2011,19 @@ describe(`Proxy Library`, () => {
 
         const changes = getChanges()
         expect(changes.items?.[0]?.value).toBe(42)
+        expect(filtered.map((item) => item.id)).toEqual([1])
+        expect(changes).toEqual({
+          items: [
+            { id: 1, value: 42 },
+            { id: 2, value: 20 },
+          ],
+        })
+        expect(obj).toEqual({
+          items: [
+            { id: 1, value: 10 },
+            { id: 2, value: 20 },
+          ],
+        })
       })
 
       it(`should track changes when modifying array items retrieved via findLast()`, () => {
@@ -1934,6 +2049,22 @@ describe(`Proxy Library`, () => {
 
         const changes = getChanges()
         expect(changes.job?.orders?.[1]?.orderBinInt).toBe(123)
+        expect(changes).toEqual({
+          job: {
+            orders: [
+              { orderId: `order-1`, orderBinInt: 1 },
+              { orderId: `order-2`, orderBinInt: 123 },
+            ],
+          },
+        })
+        expect(obj).toEqual({
+          job: {
+            orders: [
+              { orderId: `order-1`, orderBinInt: 1 },
+              { orderId: `order-2`, orderBinInt: 2 },
+            ],
+          },
+        })
       })
 
       it(`should track changes when modifying array items inside some() callback`, () => {
@@ -1945,7 +2076,9 @@ describe(`Proxy Library`, () => {
         }
         const { proxy, getChanges } = createChangeProxy(obj)
 
-        proxy.items.some((item) => {
+        const visits: Array<number> = []
+        const result = proxy.items.some((item) => {
+          visits.push(item.id)
           item.value = item.value * 2
           return false
         })
@@ -1953,6 +2086,20 @@ describe(`Proxy Library`, () => {
         const changes = getChanges()
         expect(changes.items?.[0]?.value).toBe(20)
         expect(changes.items?.[1]?.value).toBe(40)
+        expect(result).toBe(false)
+        expect(visits).toEqual([1, 2])
+        expect(changes).toEqual({
+          items: [
+            { id: 1, value: 20 },
+            { id: 2, value: 40 },
+          ],
+        })
+        expect(obj).toEqual({
+          items: [
+            { id: 1, value: 10 },
+            { id: 2, value: 20 },
+          ],
+        })
       })
 
       it(`should track changes when modifying array items inside reduce() callback`, () => {
@@ -1964,7 +2111,9 @@ describe(`Proxy Library`, () => {
         }
         const { proxy, getChanges } = createChangeProxy(obj)
 
-        proxy.items.reduce((acc, item) => {
+        const visits: Array<number> = []
+        const result = proxy.items.reduce((acc, item) => {
+          visits.push(item.id)
           item.value = item.value + 1
           return acc + item.value
         }, 0)
@@ -1972,7 +2121,89 @@ describe(`Proxy Library`, () => {
         const changes = getChanges()
         expect(changes.items?.[0]?.value).toBe(11)
         expect(changes.items?.[1]?.value).toBe(21)
+        expect(result).toBe(32)
+        expect(visits).toEqual([1, 2])
+        expect(changes).toEqual({
+          items: [
+            { id: 1, value: 11 },
+            { id: 2, value: 21 },
+          ],
+        })
+        expect(obj).toEqual({
+          items: [
+            { id: 1, value: 10 },
+            { id: 2, value: 20 },
+          ],
+        })
       })
     })
+  })
+})
+
+describe(`stored functions behave like native values`, () => {
+  type Row = StoredRow
+  const make = makeStoredRow
+  it(`tracks writes a stored method makes through this`, () => {
+    const native = make(
+      () => 1,
+      () => 2,
+    )
+    native.obj.bump()
+    const { proxy, getChanges } = createChangeProxy(
+      make(
+        () => 1,
+        () => 2,
+      ),
+    )
+    proxy.obj.bump()
+    expect(proxy.obj.count).toBe(native.obj.count)
+    const changes = getChanges() as Partial<Row>
+    expect(Object.keys(changes)).toEqual([`obj`])
+    expect(changes.obj?.count).toBe(1)
+  })
+})
+
+describe(`frozen and sealed drafts keep nested writes`, () => {
+  type Row = FrozenRow
+  const make = makeFrozenRow
+  it(`does not count a primitive read under a frozen key`, () => {
+    const { proxy, getChanges } = createChangeProxy(make())
+    void Object.freeze(proxy).m
+    expect(getChanges()).toEqual({})
+  })
+
+  it.each([
+    [`sealed`, (row: Row) => Object.seal(row)],
+    [
+      `read-only but configurable`,
+      (row: Row) =>
+        Object.defineProperty(row, `n`, {
+          writable: false,
+          configurable: true,
+        }),
+    ],
+  ])(`does not count an object read under a %s key`, (_name, fix) => {
+    const { proxy, getChanges } = createChangeProxy(make())
+    fix(proxy)
+    void proxy.n.x
+    expect(getChanges()).toEqual({})
+  })
+
+  it(`does not count writing back the row's own class instance`, () => {
+    class Point {
+      constructor(public x: number) {}
+    }
+    const row = { p: new Point(1) }
+    expect(
+      withChangeTracking(row, (draft) => {
+        draft.p = row.p
+      }),
+    ).toEqual({})
+    expect(
+      withChangeTracking(row, (draft) => {
+        draft.p = new Point(2)
+        draft.p = row.p
+      }),
+    ).toEqual({})
   })
 })

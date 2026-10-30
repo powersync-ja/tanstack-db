@@ -162,13 +162,13 @@ export default function App() {
           title: `Persisted from Expo runtime`,
           score: 7,
         })
-        await insertTx.isPersisted.promise
+        await insertTx.when(`settled`)
         await collection.cleanup()
         collection.startSyncImmediate()
         await collection.stateWhenReady()
 
         const reloadedRows = await persistence.adapter.loadSubset(
-          collectionId,
+          { kind: `eager`, collectionId },
           {},
         )
         return {

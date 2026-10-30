@@ -1,4 +1,5 @@
 import type { D2, RootStreamBuilder } from '@tanstack/db-ivm'
+import type { PooledLiveQueries } from '../pooled-live-query.js'
 import type {
   CollectionConfig,
   ResultStream,
@@ -16,6 +17,12 @@ export type Changes<T> = {
   inserts: number
   value: T
   orderByIndex: string | undefined
+  // Captured from the retract side of a change so the flush can detect an
+  // "order-only move": a row whose projected value is unchanged but whose
+  // `orderByIndex` moved. Such a move is swallowed by the collection's
+  // value-diff, so it needs an explicit layout notification.
+  previousValue?: T
+  previousOrderByIndex?: string | undefined
 }
 
 export type SyncState = {
@@ -113,4 +120,17 @@ export interface LiveQueryCollectionConfig<
    * If provided, these will be used instead of inheriting from the FROM collection.
    */
   defaultStringCollation?: StringCollationConfig
+}
+
+/**
+ * A live query config that a framework hook accepts. Pass `pooledLiveQueries`
+ * as `pool` to serve the query from a shared equality partition when its
+ * shape allows. A config with any option other than `query`, `gcTime`, and
+ * `pool` compiles its own Collection.
+ */
+export type LiveQueryHookConfig<
+  TContext extends Context,
+  TResult extends object = RootQueryResult<TContext>,
+> = LiveQueryCollectionConfig<TContext, TResult> & {
+  pool?: PooledLiveQueries
 }

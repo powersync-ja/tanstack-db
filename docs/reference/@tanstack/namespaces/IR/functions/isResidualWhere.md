@@ -3,13 +3,11 @@ id: isResidualWhere
 title: isResidualWhere
 ---
 
-# Function: isResidualWhere()
-
 ```ts
 function isResidualWhere(where): boolean;
 ```
 
-Defined in: [packages/db/src/query/ir.ts:197](https://github.com/TanStack/db/blob/main/packages/db/src/query/ir.ts#L197)
+Defined in: [packages/db/src/query/ir.ts:435](https://github.com/TanStack/db/blob/main/packages/db/src/query/ir.ts#L435)
 
 Check if a Where clause is marked as residual
 

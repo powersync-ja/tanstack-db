@@ -1,14 +1,20 @@
 import mitt from 'mitt'
 import { describe, expect, it, vi } from 'vitest'
-import { createCollection } from '../src/collection/index.js'
+import {
+  createCollection,
+  withCollectionSyncConfigFactory,
+} from '../src/collection/index.js'
 import {
   CollectionRequiresConfigError,
   DuplicateKeyError,
+  DuplicateKeySyncError,
   InvalidKeyError,
   KeyUpdateNotAllowedError,
+  LoadSubsetOperationAbortedError,
   MissingDeleteHandlerError,
   MissingInsertHandlerError,
   MissingUpdateHandlerError,
+  UndefinedKeyError,
 } from '../src/errors'
 import { createTransaction } from '../src/transactions'
 import { createLiveQueryCollection, eq } from '../src/query/index.js'
@@ -18,7 +24,12 @@ import {
   stripVirtualProps,
   withExpectedRejection,
 } from './utils'
-import type { ChangeMessage, MutationFn, PendingMutation } from '../src/types'
+import type {
+  ChangeMessage,
+  MutationFn,
+  PendingMutation,
+  SyncConfig,
+} from '../src/types'
 
 const getStateValue = <T extends object, TKey extends string | number>(
   collection: { state: Map<TKey, T> },
@@ -37,12 +48,447 @@ const getStateEntries = <
   ])
 
 describe(`Collection`, () => {
+  type SyncActionsForThis = Parameters<
+    SyncConfig<{ id: number; v: number }, number>[`sync`]
+  >[0]
+  // A config may define its handlers as methods. Each direct mutation calls
+  // its handler as a method of the config, so `this` is the config.
+  it(`calls mutation handlers as methods of the config`, async () => {
+    const calls: Array<string> = []
+    const config = {
+      id: `handler-this`,
+      getKey: (row: { id: number; v: number }) => row.id,
+      startSync: true,
+      sync: {
+        sync: ({ begin, write, commit, markReady }: SyncActionsForThis) => {
+          begin()
+          write({ type: `insert`, value: { id: 1, v: 0 } })
+          write({ type: `insert`, value: { id: 2, v: 0 } })
+          commit()
+          markReady()
+        },
+      },
+      label: `config`,
+      onInsert() {
+        calls.push(`insert:${this.label}`)
+        return Promise.resolve()
+      },
+      onUpdate() {
+        calls.push(`update:${this.label}`)
+        return Promise.resolve()
+      },
+      onDelete() {
+        calls.push(`delete:${this.label}`)
+        return Promise.resolve()
+      },
+    }
+    const collection = createCollection(config)
+    try {
+      await collection.stateWhenReady()
+      await collection.insert({ id: 3, v: 0 }).when(`settled`)
+      await collection
+        .update(1, (draft) => {
+          draft.v = 1
+        })
+        .when(`settled`)
+      await collection.delete(2).when(`settled`)
+      expect(calls).toEqual([`insert:config`, `update:config`, `delete:config`])
+    } finally {
+      await collection.cleanup()
+    }
+  })
+
+  it.each([false, true])(
+    `owns binding utilities only when a sync factory exists: %s`,
+    async (bind) => {
+      let value = 1
+      const read = vi.fn(() => value)
+      const utilities = Object.create(
+        { inherited: () => `prototype` },
+        {
+          current: { get: read, enumerable: true },
+        },
+      ) as { readonly current: number; inherited: () => string }
+      const source: SyncConfig<{ id: number }> = { sync: () => {} }
+      const factory = vi.fn((sync: typeof source) => sync)
+      const sync = bind
+        ? withCollectionSyncConfigFactory(source, factory)
+        : source
+      const options = {
+        getKey: (row: { id: number }) => row.id,
+        sync,
+        utils: utilities,
+      }
+      const a = createCollection(options)
+      const b = createCollection(options)
+      try {
+        expect(read).not.toHaveBeenCalled()
+        expect(a.utils === utilities).toBe(!bind)
+        expect(a.utils === b.utils).toBe(!bind)
+        expect(a.utils.inherited()).toBe(`prototype`)
+        value = 2
+        expect(a.utils.current).toBe(2)
+        expect(b.utils.current).toBe(2)
+        expect(factory).toHaveBeenCalledTimes(bind ? 2 : 0)
+      } finally {
+        await a.cleanup()
+        await b.cleanup()
+      }
+    },
+  )
+
   it(`should throw if there's no sync config`, () => {
     // @ts-expect-error we're testing for throwing when there's no config passed in
     expect(() => createCollection()).toThrow(CollectionRequiresConfigError)
   })
 
-  it(`removes optimistic insert when sync confirms with a different server-generated key`, async () => {
+  it(`throws DuplicateKeySyncError instead of TypeError when config has no utils`, async () => {
+    let begin!: () => void
+    let write!: Parameters<
+      SyncConfig<{ id: number; text: string }, number>[`sync`]
+    >[0][`write`]
+
+    const collection = createCollection<{ id: number; text: string }, number>({
+      id: `duplicate-key-no-utils-test`,
+      getKey: (item) => item.id,
+      sync: {
+        sync: (params) => {
+          begin = params.begin
+          write = params.write
+          params.begin()
+          params.write({ type: `insert`, value: { id: 1, text: `one` } })
+          params.commit()
+          params.markReady()
+        },
+      },
+    })
+
+    await collection.stateWhenReady()
+
+    begin()
+    expect(() =>
+      write({ type: `insert`, value: { id: 1, text: `changed` } }),
+    ).toThrow(DuplicateKeySyncError)
+  })
+
+  it(`does not track failed or rolled-back transactions after they settle`, async () => {
+    // Every mutation walks the tracked transactions, so a retained failed one
+    // makes each later mutation slower and keeps its rows alive.
+    const options = mockSyncCollectionOptionsNoInitialState<{
+      id: number
+      value: number
+    }>({
+      id: `failed-transaction-retention`,
+      getKey: (item) => item.id,
+      startSync: true,
+    })
+    const collection = createCollection({
+      ...options,
+      onUpdate: () => Promise.reject(new Error(`rejected`)),
+    })
+    options.utils.begin()
+    options.utils.write({ type: `insert`, value: { id: 1, value: 0 } })
+    options.utils.commit()
+    options.utils.markReady()
+    await collection.stateWhenReady()
+
+    for (let cycle = 0; cycle < 200; cycle++) {
+      const failed = collection.update(1, (draft) => {
+        draft.value = cycle + 1
+      })
+      await expect(failed.when(`settled`)).rejects.toThrow(`rejected`)
+
+      const rolledBack = createTransaction({
+        autoCommit: false,
+        mutationFn: () => Promise.resolve(),
+      })
+      rolledBack.mutate(() =>
+        collection.update(1, (draft) => {
+          draft.value = -cycle
+        }),
+      )
+      rolledBack.rollback()
+      await rolledBack.when(`settled`).catch(() => undefined)
+
+      expect(collection._state.transactions.size).toBe(0)
+      expect(collection.get(1)).toMatchObject({ id: 1, value: 0 })
+    }
+  })
+
+  it(`does not walk more tracked transactions per mutation after many rollbacks`, async () => {
+    // The public cost law behind the tracked-transaction bound: a mutation's
+    // work must not grow with settled history. Each per-mutation pass walks
+    // the Collection's tracked transactions, so count the entries those walks
+    // yield for one mutation after 0 and after 200 rollbacks.
+    const options = mockSyncCollectionOptionsNoInitialState<{
+      id: number
+      value: number
+    }>({
+      id: `rollback-history-work`,
+      getKey: (item) => item.id,
+      startSync: true,
+    })
+    const collection = createCollection(options)
+    options.utils.begin()
+    options.utils.write({ type: `insert`, value: { id: 1, value: 0 } })
+    options.utils.commit()
+    options.utils.markReady()
+    await collection.stateWhenReady()
+
+    const rollBack = async (count: number) => {
+      for (let cycle = 0; cycle < count; cycle++) {
+        const transaction = createTransaction({
+          autoCommit: false,
+          mutationFn: () => Promise.resolve(),
+        })
+        transaction.mutate(() =>
+          collection.update(1, (draft) => {
+            draft.value = cycle + 1
+          }),
+        )
+        transaction.rollback()
+        await transaction.when(`settled`).catch(() => undefined)
+      }
+    }
+    const walkedForOneMutation = async () => {
+      const transactions = collection._state.transactions
+      const methods = [`values`, `entries`, `keys`, Symbol.iterator] as const
+      let walked = 0
+      for (const name of methods) {
+        const original = Reflect.get(
+          transactions,
+          name,
+        ) as () => Iterator<unknown>
+        Reflect.set(transactions, name, function* () {
+          const iterator = original.call(transactions)
+          for (let next = iterator.next(); !next.done; next = iterator.next()) {
+            walked++
+            yield next.value
+          }
+        })
+      }
+      const transaction = createTransaction({
+        autoCommit: false,
+        mutationFn: () => Promise.resolve(),
+      })
+      try {
+        transaction.mutate(() =>
+          collection.update(1, (draft) => {
+            draft.value = -1
+          }),
+        )
+      } finally {
+        for (const name of methods) Reflect.deleteProperty(transactions, name)
+      }
+      transaction.rollback()
+      await transaction.when(`settled`).catch(() => undefined)
+      return walked
+    }
+
+    // Warm up first, so lazy first-call work does not count against either run.
+    await walkedForOneMutation()
+    const fresh = await walkedForOneMutation()
+    await rollBack(200)
+    expect(await walkedForOneMutation()).toBeLessThanOrEqual(fresh)
+  })
+
+  it(`releases every settled transaction found in one recompute`, async () => {
+    // Settled transactions leave the tracked map after the recompute pass.
+    // Deleting inside the pass would skip the entry after each deleted one.
+    const options = mockSyncCollectionOptionsNoInitialState<{
+      id: number
+      value: number
+    }>({ id: `adjacent-settled`, getKey: (item) => item.id, startSync: true })
+    const collection = createCollection(options)
+    options.utils.begin()
+    options.utils.write({ type: `insert`, value: { id: 1, value: 0 } })
+    options.utils.commit()
+    options.utils.markReady()
+    await collection.stateWhenReady()
+
+    const settled = [0, 1, 2].map(() => {
+      const transaction = createTransaction({
+        autoCommit: false,
+        mutationFn: () => Promise.resolve(),
+      })
+      transaction.mutate(() =>
+        collection.update(1, (draft) => {
+          draft.value++
+        }),
+      )
+      return transaction
+    })
+    // Mark all three failed before the Collection recomputes once.
+    for (const transaction of settled) {
+      transaction.setState(`failed`)
+    }
+    collection._state.recomputeOptimisticState(false)
+
+    expect(collection._state.transactions.size).toBe(0)
+    expect(collection.get(1)).toMatchObject({ id: 1, value: 0 })
+  })
+
+  it(`keeps a same-id successor tracked after its predecessor rolls back`, async () => {
+    // `createTransaction` accepts a caller id, so a retry can reuse it before
+    // the rolled-back transaction's settlement handlers run.
+    const options = mockSyncCollectionOptionsNoInitialState<{
+      id: number
+      value: number
+    }>({
+      id: `same-id-successor`,
+      getKey: (item) => item.id,
+      startSync: true,
+    })
+    const collection = createCollection(options)
+    options.utils.begin()
+    options.utils.write({ type: `insert`, value: { id: 1, value: 0 } })
+    options.utils.commit()
+    options.utils.markReady()
+    await collection.stateWhenReady()
+
+    const first = createTransaction({
+      id: `retry`,
+      autoCommit: false,
+      mutationFn: () => Promise.resolve(),
+    })
+    first.mutate(() =>
+      collection.update(1, (draft) => {
+        draft.value = 1
+      }),
+    )
+    first.rollback()
+    const successor = createTransaction({
+      id: `retry`,
+      autoCommit: false,
+      mutationFn: () => Promise.resolve(),
+    })
+    successor.mutate(() =>
+      collection.update(1, (draft) => {
+        draft.value = 2
+      }),
+    )
+    await first.when(`settled`).catch(() => undefined)
+    collection._state.recomputeOptimisticState(false)
+
+    expect(collection._state.transactions.get(`retry`)).toBe(successor)
+    expect(collection.get(1)).toMatchObject({ id: 1, value: 2 })
+  })
+
+  it(`releases a transaction whose Collection was cleaned up before it settled`, async () => {
+    // The ownership oracle keeps Collections alive for a whole history, so a
+    // cleanup in the middle of one is covered here.
+    const options = mockSyncCollectionOptionsNoInitialState<{
+      id: number
+      value: number
+    }>({
+      id: `cleanup-before-settlement`,
+      getKey: (item) => item.id,
+      startSync: true,
+    })
+    const collection = createCollection(options)
+    options.utils.begin()
+    options.utils.write({ type: `insert`, value: { id: 1, value: 0 } })
+    options.utils.commit()
+    options.utils.markReady()
+    await collection.stateWhenReady()
+
+    const transaction = createTransaction({
+      autoCommit: false,
+      mutationFn: () => Promise.resolve(),
+    })
+    transaction.mutate(() =>
+      collection.update(1, (draft) => {
+        draft.value = 1
+      }),
+    )
+    await collection.cleanup()
+    expect(() => transaction.rollback()).not.toThrow()
+    await transaction.when(`settled`).catch(() => undefined)
+
+    expect(transaction.collections.size).toBe(0)
+    expect(collection._state.transactions.size).toBe(0)
+  })
+
+  it(`recomputes every Collection of a rollback when one recompute throws`, async () => {
+    const make = (id: string) => {
+      const options = mockSyncCollectionOptionsNoInitialState<{
+        id: number
+        value: number
+      }>({ id, getKey: (item) => item.id, startSync: true })
+      const collection = createCollection(options)
+      options.utils.begin()
+      options.utils.write({ type: `insert`, value: { id: 1, value: 0 } })
+      options.utils.commit()
+      options.utils.markReady()
+      return collection
+    }
+    const first = make(`rollback-throw-a`)
+    const second = make(`rollback-throw-b`)
+    await Promise.all([first.stateWhenReady(), second.stateWhenReady()])
+
+    const transaction = createTransaction({
+      autoCommit: false,
+      mutationFn: () => Promise.resolve(),
+    })
+    transaction.mutate(() => {
+      first.update(1, (draft) => {
+        draft.value = 1
+      })
+      second.update(1, (draft) => {
+        draft.value = 1
+      })
+    })
+    first.subscribeChanges(() => {
+      throw new Error(`subscriber failed`)
+    })
+
+    expect(() => transaction.rollback()).toThrow(`subscriber failed`)
+    await transaction.when(`settled`).catch(() => undefined)
+
+    expect(second.get(1)).toMatchObject({ id: 1, value: 0 })
+    expect(second._state.transactions.size).toBe(0)
+  })
+
+  it(`releases a settled transaction from two Collection instances that share an id`, async () => {
+    // Settlement reaches each Collection instance that tracked the
+    // transaction. Mutations on two instances with one id share a global key,
+    // so the first instance's mutation merges into the second's.
+    const make = async (id: string) => {
+      const options = mockSyncCollectionOptionsNoInitialState<{
+        id: number
+        value: number
+      }>({ id, getKey: (item) => item.id, startSync: true })
+      const collection = createCollection(options)
+      options.utils.begin()
+      options.utils.write({ type: `insert`, value: { id: 1, value: 0 } })
+      options.utils.commit()
+      options.utils.markReady()
+      await collection.stateWhenReady()
+      return collection
+    }
+    const first = await make(`shared-collection-id`)
+    const second = await make(`shared-collection-id`)
+    const transaction = createTransaction({
+      autoCommit: false,
+      mutationFn: () => Promise.reject(new Error(`rejected`)),
+    })
+    transaction.mutate(() => {
+      first.update(1, (draft) => {
+        draft.value = 1
+      })
+      second.update(1, (draft) => {
+        draft.value = 1
+      })
+    })
+    await transaction.commit().catch(() => undefined)
+
+    expect(first._state.transactions.has(transaction.id)).toBe(false)
+    expect(second._state.transactions.has(transaction.id)).toBe(false)
+    expect(first.get(1)).toMatchObject({ id: 1, value: 0 })
+    expect(second.get(1)).toMatchObject({ id: 1, value: 0 })
+  })
+
+  it(`keeps ambiguous server-key sync queued while a temp-key optimistic insert is pending`, async () => {
     const options = mockSyncCollectionOptionsNoInitialState<{
       id: number
       text: string
@@ -67,12 +513,17 @@ describe(`Collection`, () => {
     options.utils.commit()
 
     // The sync commit is held while the local insert transaction is persisting.
+    // Without an explicit temp-key -> server-key mapping, core cannot know
+    // whether key 24 is this optimistic insert's server echo or an unrelated
+    // row, so it must not expose both rows at the same time.
+    expect(tx.state).toBe(`persisting`)
+    expect(collection.has(24)).toBe(false)
     expect(getStateEntries(collection)).toEqual([
       [4733, { id: 4733, text: `two` }],
     ])
 
     options.utils.resolveSync()
-    await tx.isPersisted.promise
+    await tx.when(`settled`)
     await flushPromises()
 
     expect(getStateEntries(collection)).toEqual([[24, { id: 24, text: `two` }]])
@@ -92,14 +543,14 @@ describe(`Collection`, () => {
     const liveCollection = createLiveQueryCollection((q) =>
       q
         .from({ collection })
-        .where(({ collection }) => eq(collection.project_id, 1))
-        .select(({ collection }) => ({
-          id: collection.id,
-          text: collection.text,
-          project_id: collection.project_id,
-          $synced: collection.$synced,
-          $origin: collection.$origin,
-          $key: collection.$key,
+        .where(({ collection: item }) => eq(item.project_id, 1))
+        .select(({ collection: item }) => ({
+          id: item.id,
+          text: item.text,
+          project_id: item.project_id,
+          $hasPendingWrites: item.$hasPendingWrites,
+          $origin: item.$origin,
+          $key: item.$key,
         })),
     )
 
@@ -118,17 +569,17 @@ describe(`Collection`, () => {
     options.utils.commit()
 
     options.utils.resolveSync()
-    await tx.isPersisted.promise
+    await tx.when(`settled`)
     await flushPromises()
 
     expect(
       liveCollection.toArray.map((todo) => ({
         id: todo.id,
-        synced: todo.$synced,
+        hasPendingWrites: todo.$hasPendingWrites,
         origin: todo.$origin,
         key: todo.$key,
       })),
-    ).toEqual([{ id: 24, synced: true, origin: `remote`, key: 24 }])
+    ).toEqual([{ id: 24, hasPendingWrites: false, origin: `remote`, key: 24 }])
   })
 
   it(`should throw an error when trying to use mutation operations outside of a transaction`, async () => {
@@ -138,7 +589,7 @@ describe(`Collection`, () => {
       getKey: (item) => item.value,
       startSync: true,
       sync: {
-        sync: ({ begin, write, commit }) => {
+        sync: ({ begin, write, commit, markReady }) => {
           // Immediately execute the sync cycle
           begin()
           write({
@@ -146,6 +597,7 @@ describe(`Collection`, () => {
             value: { value: `initial value` },
           })
           commit()
+          markReady()
         },
       },
     })
@@ -184,13 +636,14 @@ describe(`Collection`, () => {
       getKey: (item) => item.id,
       startSync: true,
       sync: {
-        sync: ({ begin, write, commit }) => {
+        sync: ({ begin, write, commit, markReady }) => {
           begin()
           write({
             type: `insert`,
             value: { id: `item-1`, value: `initial value` },
           })
           commit()
+          markReady()
         },
       },
     })
@@ -273,7 +726,7 @@ describe(`Collection`, () => {
       getKey: (item) => item.id,
       startSync: true,
       sync: {
-        sync: ({ begin, write, commit }) => {
+        sync: ({ begin, write, commit, markReady }) => {
           // @ts-expect-error don't trust mitt's typing
           emitter.on(`*`, (_, changes: Array<PendingMutation>) => {
             begin()
@@ -285,6 +738,7 @@ describe(`Collection`, () => {
               })
             })
             commit()
+            markReady()
           })
         },
       },
@@ -363,7 +817,7 @@ describe(`Collection`, () => {
       value: `bar`,
     })
 
-    await tx.isPersisted.promise
+    await tx.when(`settled`)
 
     // @ts-expect-error possibly undefined is ok in test
     const syncData = syncMock.mock.calls[0][0]
@@ -392,7 +846,7 @@ describe(`Collection`, () => {
       id: 2,
       value: `baz`,
     })
-    await tx2.isPersisted.promise
+    await tx2.when(`settled`)
 
     // Test bulk insert
     const tx3 = createTransaction({ mutationFn })
@@ -410,7 +864,7 @@ describe(`Collection`, () => {
     expect(stripVirtualProps(collection.state.get(keys[3]))).toEqual(
       bulkData[1],
     )
-    await tx3.isPersisted.promise
+    await tx3.when(`settled`)
 
     const tx4 = createTransaction({ mutationFn })
     // Test update with callback
@@ -426,7 +880,7 @@ describe(`Collection`, () => {
       id: 1,
       value: `bar2`,
     })
-    await tx4.isPersisted.promise
+    await tx4.when(`settled`)
 
     const tx5 = createTransaction({ mutationFn })
     // Test update with config and callback
@@ -448,7 +902,7 @@ describe(`Collection`, () => {
       newProp: `new value`,
     })
 
-    await tx5.isPersisted.promise
+    await tx5.when(`settled`)
 
     // If there are two updates, the second should overwrite the first.
     const tx55 = createTransaction({ mutationFn })
@@ -480,13 +934,13 @@ describe(`Collection`, () => {
     })
     expect(tx55.mutations).toHaveLength(1)
 
-    await tx55.isPersisted.promise
+    await tx55.when(`settled`)
 
     const tx6 = createTransaction({ mutationFn })
     // Test bulk update
     tx6.mutate(() =>
       collection.update(
-        [keys[2], keys[3]],
+        [keys[2]!, keys[3]!],
         { metadata: { bulkUpdate: true } },
         (drafts) => {
           drafts.forEach((draft) => {
@@ -510,21 +964,21 @@ describe(`Collection`, () => {
       id: 4,
       value: `item2-updated`,
     })
-    await tx6.isPersisted.promise
+    await tx6.when(`settled`)
 
     const tx7 = createTransaction({ mutationFn })
     // Test delete single item
     tx7.mutate(() => collection.delete(insertedKey))
     expect(collection.state.has(insertedKey)).toBe(false)
     // objectKeyMap check removed as it no longer exists
-    await tx7.isPersisted.promise
+    await tx7.when(`settled`)
 
     // Test delete with metadata
     const tx8Insert = createTransaction({ mutationFn })
     tx8Insert.mutate(() => collection.insert({ id: 5, value: `foostyle` }))
     // @ts-expect-error possibly undefined is ok in test
     const tx8insertKey = tx8Insert.mutations[0].key
-    await tx8Insert.isPersisted.promise
+    await tx8Insert.when(`settled`)
     const tx8 = createTransaction({ mutationFn })
     tx8.mutate(() =>
       collection.delete(tx8insertKey, {
@@ -533,7 +987,7 @@ describe(`Collection`, () => {
     )
     expect(tx8.mutations[0]?.metadata).toEqual({ reason: `test delete` })
     expect(collection.state.has(tx8insertKey)).toBe(false)
-    await tx8.isPersisted.promise
+    await tx8.when(`settled`)
 
     // Test bulk delete
     const tx9 = createTransaction({ mutationFn })
@@ -542,7 +996,7 @@ describe(`Collection`, () => {
     expect(collection.state.has(keys[2])).toBe(false)
     // @ts-expect-error possibly undefined is ok in test
     expect(collection.state.has(keys[3])).toBe(false)
-    await tx9.isPersisted.promise
+    await tx9.when(`settled`)
   })
 
   it(`synced updates should *not* be applied while there's a persisting transaction`, async () => {
@@ -556,7 +1010,7 @@ describe(`Collection`, () => {
       },
       startSync: true,
       sync: {
-        sync: ({ begin, write, commit }) => {
+        sync: ({ begin, write, commit, markReady }) => {
           // @ts-expect-error don't trust Mitt's typing and this works.
           emitter.on(`*`, (_, changes: Array<PendingMutation>) => {
             begin()
@@ -568,6 +1022,7 @@ describe(`Collection`, () => {
               })
             })
             commit()
+            markReady()
           })
         },
       },
@@ -621,7 +1076,7 @@ describe(`Collection`, () => {
       value: `bar`,
     })
 
-    await tx1.isPersisted.promise
+    await tx1.when(`settled`)
 
     expect(getStateEntries(collection)).toEqual([[1, { id: 1, value: `bar` }]])
   })
@@ -665,13 +1120,14 @@ describe(`Collection`, () => {
       getKey: (item) => item.id,
       startSync: true,
       sync: {
-        sync: ({ begin, write, commit }) => {
+        sync: ({ begin, write, commit, markReady }) => {
           begin()
           write({
             type: `insert`,
             value: { id: 1, value: `initial value` },
           })
           commit()
+          markReady()
         },
       },
     })
@@ -818,6 +1274,48 @@ describe(`Collection`, () => {
     }).toThrow(InvalidKeyError)
   })
 
+  it.each([
+    [`undefined`, undefined, UndefinedKeyError],
+    [`null`, null, InvalidKeyError],
+    [`a boolean`, true, InvalidKeyError],
+    [`a bigint`, 10n, InvalidKeyError],
+  ])(
+    `rejects a sync write whose key is %s before staging it`,
+    async (_name, badKey, error) => {
+      // Collection keys are strings or numbers. A sync adapter that writes
+      // another key breaks that contract, so the write throws at the sync
+      // boundary instead of reaching ordered Collection state.
+      type Row = { id: unknown; value: string }
+      let sync!: Parameters<SyncConfig<Row, string | number>[`sync`]>[0]
+      const collection = createCollection<Row, string | number>({
+        id: `sync-invalid-key-${String(badKey)}`,
+        getKey: (item) => item.id as string | number,
+        startSync: true,
+        sync: {
+          sync: (actions) => {
+            sync = actions
+            actions.markReady()
+          },
+        },
+      })
+      await collection.stateWhenReady()
+      sync.begin()
+      expect(() =>
+        sync.write({ type: `insert`, value: { id: badKey, value: `bad` } }),
+      ).toThrow(error)
+      expect(() =>
+        sync.write({
+          type: `delete`,
+          key: badKey as unknown as string | number,
+        }),
+      ).toThrow(error)
+      sync.write({ type: `insert`, value: { id: 1, value: `good` } })
+      sync.commit()
+      expect([...collection.keys()]).toEqual([1])
+      await collection.cleanup()
+    },
+  )
+
   it(`should accept valid string and number keys`, async () => {
     const stringKeyCollection = createCollection<{ id: string; value: string }>(
       {
@@ -895,13 +1393,14 @@ describe(`Collection`, () => {
       getKey: (item) => item.id,
       startSync: true,
       sync: {
-        sync: ({ begin, write, commit }) => {
+        sync: ({ begin, write, commit, markReady }) => {
           begin()
           write({
             type: `insert`,
             value: { id: 1, value: `initial value` },
           })
           commit()
+          markReady()
         },
       },
       // Add the new handler functions
@@ -960,13 +1459,14 @@ describe(`Collection`, () => {
       getKey: (item) => item.id,
       startSync: true,
       sync: {
-        sync: ({ begin, write, commit }) => {
+        sync: ({ begin, write, commit, markReady }) => {
           begin()
           write({
             type: `insert`,
             value: { id: 1, value: `initial value` },
           })
           commit()
+          markReady()
         },
       },
       // Add the handler functions
@@ -996,9 +1496,9 @@ describe(`Collection`, () => {
 
     // Wait for all transactions to complete
     await Promise.all([
-      insertTx.isPersisted.promise,
-      updateTx.isPersisted.promise,
-      deleteTx.isPersisted.promise,
+      insertTx.when(`settled`),
+      updateTx.when(`settled`),
+      deleteTx.when(`settled`),
     ])
 
     // Verify the transactions were created with the correct configuration
@@ -1014,13 +1514,14 @@ describe(`Collection`, () => {
       getKey: (item) => item.id,
       startSync: true,
       sync: {
-        sync: ({ begin, write, commit }) => {
+        sync: ({ begin, write, commit, markReady }) => {
           begin()
           write({
             type: `insert`,
             value: { id: 1, value: `initial value` },
           })
           commit()
+          markReady()
         },
       },
       // No handler functions defined
@@ -1065,7 +1566,7 @@ describe(`Collection`, () => {
       getKey: (item) => item.id,
       startSync: true,
       sync: {
-        sync: ({ begin, write, commit }) => {
+        sync: ({ begin, write, commit, markReady }) => {
           // Initialize with some data
           begin()
           write({
@@ -1073,6 +1574,7 @@ describe(`Collection`, () => {
             value: { id: 1, value: `initial value` },
           })
           commit()
+          markReady()
 
           // @ts-expect-error don't trust mitt's typing
           emitter.on(`*`, (_, changes: Array<PendingMutation>) => {
@@ -1111,7 +1613,7 @@ describe(`Collection`, () => {
 
     // Now resolve the mutation and wait for completion
     pendingMutations[0]?.()
-    await nonOptimisticInsertTx.isPersisted.promise
+    await nonOptimisticInsertTx.when(`settled`)
 
     // Now the item should appear after server confirmation
     expect(collection.state.has(2)).toBe(true)
@@ -1135,7 +1637,7 @@ describe(`Collection`, () => {
 
     // Now resolve the update mutation and wait for completion
     pendingMutations[1]?.()
-    await nonOptimisticUpdateTx.isPersisted.promise
+    await nonOptimisticUpdateTx.when(`settled`)
 
     // Now the update should be reflected
     expect(getStateValue(collection, 1)?.value).toBe(`non-optimistic update`)
@@ -1149,7 +1651,7 @@ describe(`Collection`, () => {
 
     // Now resolve the delete mutation and wait for completion
     pendingMutations[2]?.()
-    await nonOptimisticDeleteTx.isPersisted.promise
+    await nonOptimisticDeleteTx.when(`settled`)
 
     // Now the item should be gone
     expect(collection.state.has(2)).toBe(false)
@@ -1168,7 +1670,7 @@ describe(`Collection`, () => {
       getKey: (item) => item.id,
       startSync: true,
       sync: {
-        sync: ({ begin, write, commit }) => {
+        sync: ({ begin, write, commit, markReady }) => {
           // Initialize with some data
           begin()
           write({
@@ -1176,6 +1678,7 @@ describe(`Collection`, () => {
             value: { id: 1, value: `initial value` },
           })
           commit()
+          markReady()
 
           // @ts-expect-error don't trust mitt's typing
           emitter.on(`*`, (_, changes: Array<PendingMutation>) => {
@@ -1212,7 +1715,7 @@ describe(`Collection`, () => {
       value: `default optimistic`,
     })
 
-    await defaultOptimisticTx.isPersisted.promise
+    await defaultOptimisticTx.when(`settled`)
 
     // Test explicit optimistic: true
     const explicitOptimisticTx = collection.insert(
@@ -1228,7 +1731,7 @@ describe(`Collection`, () => {
       value: `explicit optimistic`,
     })
 
-    await explicitOptimisticTx.isPersisted.promise
+    await explicitOptimisticTx.when(`settled`)
 
     // Test optimistic update
     const optimisticUpdateTx = collection.update(
@@ -1243,7 +1746,7 @@ describe(`Collection`, () => {
     expect(getStateValue(collection, 1)?.value).toBe(`optimistic update`)
     expect(collection._state.optimisticUpserts.has(1)).toBe(true)
 
-    await optimisticUpdateTx.isPersisted.promise
+    await optimisticUpdateTx.when(`settled`)
 
     // Test optimistic delete
     const optimisticDeleteTx = collection.delete(3, { optimistic: true })
@@ -1252,7 +1755,7 @@ describe(`Collection`, () => {
     expect(collection.state.has(3)).toBe(false)
     expect(collection._state.optimisticDeletes.has(3)).toBe(true)
 
-    await optimisticDeleteTx.isPersisted.promise
+    await optimisticDeleteTx.when(`settled`)
   })
 
   it(`should not block user actions when keys are recently synced`, async () => {
@@ -1343,7 +1846,7 @@ describe(`Collection`, () => {
 
     // Now complete the first transaction to trigger sync and batching
     txResolvers[0]?.()
-    await tx1.isPersisted.promise
+    await tx1.when(`settled`)
 
     // Step 4: More rapid clicks after sync starts (this is where the bug occurred)
     const eventCountBeforeRapidClicks = changeEvents.length
@@ -1364,10 +1867,10 @@ describe(`Collection`, () => {
       txResolvers[i]?.()
     }
     await Promise.all([
-      tx2.isPersisted.promise,
-      tx3.isPersisted.promise,
-      tx4.isPersisted.promise,
-      tx5.isPersisted.promise,
+      tx2.when(`settled`),
+      tx3.when(`settled`),
+      tx4.when(`settled`),
+      tx5.when(`settled`),
     ])
   })
 
@@ -2142,6 +2645,45 @@ describe(`Collection isLoadingSubset property`, () => {
     expect(collection.isLoadingSubset).toBe(false)
   })
 
+  it(`cleanup isolates subset loading state from a later sync run`, async () => {
+    const resolveLoads: Array<() => void> = []
+    const collection = createCollection<{ id: string; value: string }>({
+      id: `cleanup-isolates-subset-loading`,
+      getKey: (item) => item.id,
+      syncMode: `on-demand`,
+      startSync: true,
+      sync: {
+        sync: ({ markReady }) => {
+          markReady()
+          return {
+            loadSubset: () =>
+              new Promise<void>((resolve) => resolveLoads.push(resolve)),
+          }
+        },
+      },
+    })
+
+    collection._sync.loadSubset({})
+    expect(collection.isLoadingSubset).toBe(true)
+
+    await collection.cleanup()
+    expect(collection.isLoadingSubset).toBe(false)
+
+    collection.startSyncImmediate()
+    collection._sync.loadSubset({})
+    expect(collection.isLoadingSubset).toBe(true)
+
+    resolveLoads[0]!()
+    await flushPromises()
+    expect(collection.isLoadingSubset).toBe(true)
+
+    resolveLoads[1]!()
+    await flushPromises()
+    expect(collection.isLoadingSubset).toBe(false)
+
+    await collection.cleanup()
+  })
+
   it(`emits loadingSubset:change event`, async () => {
     let resolveLoadSubset: () => void
     const loadSubsetPromise = new Promise<void>((resolve) => {
@@ -2249,5 +2791,85 @@ describe(`Collection isLoadingSubset property`, () => {
     const result = collection._sync.loadSubset({})
     expect(result).toBe(true)
     expect(collection.isLoadingSubset).toBe(false)
+  })
+
+  it(`rejects an already-aborted subset request before the adapter branch`, async () => {
+    const loadSubset = vi.fn(() => true as const)
+    const collection = createCollection<{ id: string; value: string }>({
+      id: `already-aborted-subset-request`,
+      getKey: (item) => item.id,
+      syncMode: `on-demand`,
+      startSync: true,
+      sync: {
+        sync: ({ markReady }) => {
+          markReady()
+          return { loadSubset }
+        },
+      },
+    })
+    const request = new AbortController()
+    request.abort()
+
+    await expect(
+      collection._sync.loadSubset({ signal: request.signal }),
+    ).rejects.toBeInstanceOf(LoadSubsetOperationAbortedError)
+
+    expect(loadSubset).not.toHaveBeenCalled()
+    expect(collection.isLoadingSubset).toBe(false)
+    await collection.cleanup()
+  })
+
+  it(`rejects an already-aborted subset request before the eager return`, async () => {
+    const loadSubset = vi.fn(() => true as const)
+    const collection = createCollection<{ id: string; value: string }>({
+      id: `already-aborted-eager-subset-request`,
+      getKey: (item) => item.id,
+      syncMode: `eager`,
+      startSync: true,
+      sync: {
+        sync: ({ markReady }) => {
+          markReady()
+          return { loadSubset }
+        },
+      },
+    })
+    const request = new AbortController()
+    request.abort()
+
+    await expect(
+      collection._sync.loadSubset({ signal: request.signal }),
+    ).rejects.toMatchObject({ name: `AbortError` })
+
+    expect(loadSubset).not.toHaveBeenCalled()
+    expect(collection.isLoadingSubset).toBe(false)
+    await collection.cleanup()
+  })
+
+  it(`rejects an already-aborted subset request before deferred start`, async () => {
+    const loadSubset = vi.fn(() => true as const)
+    const collection = createCollection<{ id: string; value: string }>({
+      id: `already-aborted-deferred-subset-request`,
+      getKey: (item) => item.id,
+      syncMode: `on-demand`,
+      sync: {
+        sync: ({ markReady }) => {
+          markReady()
+          return { loadSubset }
+        },
+      },
+    })
+    expect(collection._deferSyncStart()).toBe(true)
+    const request = new AbortController()
+    request.abort()
+
+    await expect(
+      collection._sync.loadSubset({ signal: request.signal }),
+    ).rejects.toMatchObject({ name: `AbortError` })
+
+    expect(loadSubset).not.toHaveBeenCalled()
+    expect(collection.isLoadingSubset).toBe(false)
+    collection._resumeSyncStart()
+    expect(loadSubset).not.toHaveBeenCalled()
+    await collection.cleanup()
   })
 })

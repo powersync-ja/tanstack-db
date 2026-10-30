@@ -2,8 +2,6 @@
 title: LocalOnly Collection
 ---
 
-# LocalOnly Collection
-
 LocalOnly collections are designed for in-memory client data or UI state that doesn't need to persist across browser sessions or sync across tabs.
 
 ## Overview
@@ -62,10 +60,34 @@ The `localOnlyCollectionOptions` function accepts the following options:
 ### Optional Options
 
 - `schema`: [Standard Schema](https://standardschema.dev) compatible schema (e.g., Zod, Effect) for client-side validation
-- `initialData`: Array of items to populate the collection with on creation
+- `initialData`: Array of items to populate the collection with on creation. It loads when the Collection starts empty: at creation, or after cleanup. `reload()` keeps the rows, including your writes; the rows are the only copy of them.
 - `onInsert`: Optional handler function called before confirming inserts
 - `onUpdate`: Optional handler function called before confirming updates
 - `onDelete`: Optional handler function called before confirming deletes
+
+## Storable Values
+
+A local-only Collection keeps rows in memory and never serializes them. A row
+can hold values that a persisted Collection cannot store, such as functions.
+The Collection returns such a value unchanged, with the same identity, after
+inserts and updates. See [Mutations](../guides/mutations.md) for how drafts
+copy plain objects and keep class instances by reference.
+
+```typescript
+const handlers = createCollection(
+  localOnlyCollectionOptions({
+    getKey: (item) => item.id,
+  }),
+)
+
+handlers.insert({ id: 'save', run: () => console.log('saved') })
+handlers.get('save')?.run() // logs "saved"
+```
+
+Nothing survives a page reload. If you might move these rows to
+[LocalStorageCollection](./local-storage-collection.md) or
+[IndexedDB](./indexed-db-collection.md) later, keep rows as plain data and look
+up behavior outside the row. Those Collections reject values they cannot store.
 
 ## Initial Data
 
@@ -192,10 +214,12 @@ export const modalStateCollection = createCollection(
 
 // Use in component
 function UserProfileModal() {
-  const { data: modals } = useLiveQuery((q) =>
-    q.from({ modal: modalStateCollection })
-      .where(({ modal }) => eq(modal.id, 'user-profile'))
-  )
+  const { data: modals } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ modal: modalStateCollection })
+        .where(({ modal }) => eq(modal.id, 'user-profile')),
+  })
 
   const modalState = modals[0]
 
@@ -248,10 +272,12 @@ export const formDraftsCollection = createCollection(
 
 // Use in component
 function CreatePostForm() {
-  const { data: drafts } = useLiveQuery((q) =>
-    q.from({ draft: formDraftsCollection })
-      .where(({ draft }) => eq(draft.id, 'new-post'))
-  )
+  const { data: drafts } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ draft: formDraftsCollection })
+        .where(({ draft }) => eq(draft.id, 'new-post')),
+  })
 
   const currentDraft = drafts[0]
 
@@ -315,9 +341,12 @@ LocalOnly collections are perfect for:
 | Survives page reload | No | Yes |
 | Performance | Fastest | Fast |
 | Size limits | Memory limits | ~5-10MB |
+| Row values | Any JavaScript value | Values the configured `parser` can store (JSON by default) |
 | Best for | Temporary UI state | User preferences |
 
 ## Learn More
+
+- [IndexedDB Collection](./indexed-db-collection.md)
 
 - [Optimistic Mutations](../guides/mutations.md)
 - [Live Queries](../guides/live-queries.md)

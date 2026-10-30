@@ -9,7 +9,10 @@ yarn.lock
 # builds
 build
 coverage
+.vitest-reports
 dist
+playwright-report
+test-results
 
 # misc
 .DS_Store
@@ -19,6 +22,7 @@ dist
 .env.test.local
 .env.production.local
 .next
+next-env.d.ts
 
 npm-debug.log*
 yarn-debug.log*
@@ -44,3 +48,11 @@ examples/react-native/shopping-list/ios/
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 tsconfig.vitest-temp.json
+
+# The part-reach oracle lints scratch programs inside the repository; an
+# interrupted run can leave them behind.
+/part-reach-scratch-*/
+
+# Other checkouts and scratch copies. A plain directory here is not part of
+# this checkout's branch, so the oracle lint hooks must not see its files.
+/.worktrees/

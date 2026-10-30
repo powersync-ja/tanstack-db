@@ -1,13 +1,13 @@
 import { DEFAULT_COMPARE_OPTIONS } from '../utils'
+import { indexableOperations } from '../query/builder/functions.js'
 import { hasVirtualPropPath } from '../virtual-props'
+import { findIndexForField } from '../utils/index-optimization.js'
+import { codedWarning, devBuild } from '../error-message.js'
 import { checkCollectionSizeForIndex, isDevModeEnabled } from './index-registry'
 import type { CompareOptions } from '../query/builder/types'
 import type { BasicExpression } from '../query/ir'
 import type { CollectionImpl } from '../collection/index.js'
-
-export interface AutoIndexConfig {
-  autoIndex?: `off` | `eager`
-}
+import type { IndexReader } from './base-index.js'
 
 function shouldAutoIndex(collection: CollectionImpl<any, any, any, any, any>) {
   // Only proceed if auto-indexing is enabled
@@ -24,12 +24,13 @@ export function ensureIndexForField<
   fieldPath: Array<string>,
   collection: CollectionImpl<T, TKey, any, any, any>,
   compareOptions?: CompareOptions,
-  compareFn?: (a: any, b: any) => number,
+  canUse?: (index: IndexReader<TKey>) => boolean,
 ) {
   if (hasVirtualPropPath(fieldPath)) {
     return
   }
-  if (!shouldAutoIndex(collection)) {
+  const autoIndex = shouldAutoIndex(collection)
+  if (!autoIndex && !isDevModeEnabled()) {
     return
   }
 
@@ -39,22 +40,24 @@ export function ensureIndexForField<
   }
 
   // Check if we already have an index for this field
-  const existingIndex = Array.from(collection.indexes.values()).find(
-    (index) =>
-      index.matchesField(fieldPath) && index.matchesCompareOptions(compareOpts),
+  const existingIndex = findIndexForField(
+    collection,
+    fieldPath,
+    compareOpts,
+    canUse,
   )
 
   if (existingIndex) {
     return // Index already exists
   }
 
-  // Dev mode: check if collection size warrants an index suggestion
-  if (isDevModeEnabled()) {
+  if (!autoIndex) {
     checkCollectionSizeForIndex(
       collection.id || `unknown`,
       collection.size,
       fieldPath,
     )
+    return
   }
 
   // Create a new index for this field using the collection's createIndex method
@@ -71,20 +74,20 @@ export function ensureIndexForField<
       },
       {
         name: `auto:${fieldPath.join(`.`)}`,
-        options: compareFn ? { compareFn, compareOptions: compareOpts } : {},
+        options: { compareOptions: compareOpts },
       },
     )
   } catch (error) {
     console.warn(
-      `${collection.id ? `[${collection.id}] ` : ``}Failed to create auto-index for field path "${fieldPath.join(`.`)}":`,
+      devBuild() && process.env.NODE_ENV !== `production`
+        ? `${collection.id ? `[${collection.id}] ` : ``}Failed to create auto-index for field path "${fieldPath.join(`.`)}":`
+        : codedWarning(215, { id: collection.id, value: fieldPath.join(`.`) }),
       error,
     )
   }
 }
 
-/**
- * Analyzes a where expression and creates indexes for all simple operations on single fields
- */
+/** Check indexable WHERE fields for eager indexes or development advice. */
 export function ensureIndexForExpression<
   T extends Record<string, any>,
   TKey extends string | number,
@@ -92,11 +95,8 @@ export function ensureIndexForExpression<
   expression: BasicExpression,
   collection: CollectionImpl<T, TKey, any, any, any>,
 ): void {
-  if (!shouldAutoIndex(collection)) {
-    return
-  }
+  if (!shouldAutoIndex(collection) && !isDevModeEnabled()) return
 
-  // Extract all indexable expressions and create indexes for them
   const indexableExpressions = extractIndexableExpressions(expression)
 
   for (const { fieldName, fieldPath } of indexableExpressions) {
@@ -128,8 +128,7 @@ function extractIndexableExpressions(
     }
 
     // Check if this is a supported operation
-    const supportedOperations = [`eq`, `gt`, `gte`, `lt`, `lte`, `in`]
-    if (!supportedOperations.includes(func.name)) {
+    if (!indexableOperations.includes(func.name)) {
       return
     }
 

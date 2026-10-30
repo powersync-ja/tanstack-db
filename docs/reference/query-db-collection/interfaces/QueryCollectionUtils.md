@@ -3,16 +3,16 @@ id: QueryCollectionUtils
 title: QueryCollectionUtils
 ---
 
-# Interface: QueryCollectionUtils\<TItem, TKey, TInsertInput, TError\>
-
-Defined in: [packages/query-db-collection/src/query.ts:163](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L163)
+Defined in: [packages/query-db-collection/src/query.ts:301](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L301)
 
 Utility methods available on Query Collections for direct writes and manual operations.
-Direct writes bypass the normal query/mutation flow and write directly to the synced data store.
+Direct writes bypass optimistic mutations and write to the synced data store.
+Direct writes do not trigger a Query refetch. On-demand cache edits are
+best-effort and do not establish scoped result authority.
 
-## Extends
+## Template
 
-- `UtilsRecord`
+The type of errors that can occur during queries
 
 ## Type Parameters
 
@@ -34,41 +34,11 @@ The type of the item keys
 
 The type accepted for insert operations
 
-### TError
+### _TError
 
-`TError` = `unknown`
-
-The type of errors that can occur during queries
-
-## Indexable
-
-```ts
-[key: string]: any
-```
+`_TError` = `unknown`
 
 ## Properties
-
-### clearError()
-
-```ts
-clearError: () => Promise<void>;
-```
-
-Defined in: [packages/query-db-collection/src/query.ts:208](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L208)
-
-Clear the error state and trigger a refetch of the query
-
-#### Returns
-
-`Promise`\<`void`\>
-
-Promise that resolves when the refetch completes successfully
-
-#### Throws
-
-Error if the refetch fails
-
-***
 
 ### dataUpdatedAt
 
@@ -76,22 +46,9 @@ Error if the refetch fails
 dataUpdatedAt: number;
 ```
 
-Defined in: [packages/query-db-collection/src/query.ts:199](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L199)
+Defined in: [packages/query-db-collection/src/query.ts:334](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L334)
 
 Get timestamp of last successful data update (in milliseconds)
-
-***
-
-### errorCount
-
-```ts
-errorCount: number;
-```
-
-Defined in: [packages/query-db-collection/src/query.ts:191](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L191)
-
-Get the number of consecutive sync failures.
-Incremented only when query fails completely (not per retry attempt); reset on success.
 
 ***
 
@@ -101,21 +58,11 @@ Incremented only when query fails completely (not per retry attempt); reset on s
 fetchStatus: "idle" | "fetching" | "paused";
 ```
 
-Defined in: [packages/query-db-collection/src/query.ts:201](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L201)
+Defined in: [packages/query-db-collection/src/query.ts:340](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L340)
 
-Get current fetch status
-
-***
-
-### isError
-
-```ts
-isError: boolean;
-```
-
-Defined in: [packages/query-db-collection/src/query.ts:186](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L186)
-
-Check if the collection is in an error state
+Get the aggregate observer fetch status. Returns `fetching` if any
+observer is fetching, otherwise `paused` if any observer is paused, and
+`idle` when every observer is idle or no observers exist.
 
 ***
 
@@ -125,7 +72,7 @@ Check if the collection is in an error state
 isFetching: boolean;
 ```
 
-Defined in: [packages/query-db-collection/src/query.ts:193](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L193)
+Defined in: [packages/query-db-collection/src/query.ts:328](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L328)
 
 Check if query is currently fetching (initial or background)
 
@@ -137,7 +84,7 @@ Check if query is currently fetching (initial or background)
 isLoading: boolean;
 ```
 
-Defined in: [packages/query-db-collection/src/query.ts:197](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L197)
+Defined in: [packages/query-db-collection/src/query.ts:332](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L332)
 
 Check if query is loading for the first time (no data yet)
 
@@ -149,21 +96,9 @@ Check if query is loading for the first time (no data yet)
 isRefetching: boolean;
 ```
 
-Defined in: [packages/query-db-collection/src/query.ts:195](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L195)
+Defined in: [packages/query-db-collection/src/query.ts:330](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L330)
 
 Check if query is refetching in background (not initial fetch)
-
-***
-
-### lastError
-
-```ts
-lastError: TError | undefined;
-```
-
-Defined in: [packages/query-db-collection/src/query.ts:184](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L184)
-
-Get the last error encountered by the query (if any); reset on success
 
 ***
 
@@ -173,21 +108,21 @@ Get the last error encountered by the query (if any); reset on success
 refetch: RefetchFn;
 ```
 
-Defined in: [packages/query-db-collection/src/query.ts:170](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L170)
+Defined in: [packages/query-db-collection/src/query.ts:311](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L311)
 
-Manually trigger a refetch of the query
+Manually refetch and await the applicable fetch or application boundary.
 
 ***
 
 ### writeBatch()
 
 ```ts
-writeBatch: (callback) => void;
+writeBatch: (callback) => Promise<void>;
 ```
 
-Defined in: [packages/query-db-collection/src/query.ts:180](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L180)
+Defined in: [packages/query-db-collection/src/query.ts:323](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L323)
 
-Execute multiple write operations as a single atomic batch to the synced data store
+Execute direct writes as one atomic batch. Resolves when the sync commit applies.
 
 #### Parameters
 
@@ -197,19 +132,19 @@ Execute multiple write operations as a single atomic batch to the synced data st
 
 #### Returns
 
-`void`
+`Promise`\<`void`\>
 
 ***
 
 ### writeDelete()
 
 ```ts
-writeDelete: (keys) => void;
+writeDelete: (keys) => Promise<void>;
 ```
 
-Defined in: [packages/query-db-collection/src/query.ts:176](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L176)
+Defined in: [packages/query-db-collection/src/query.ts:319](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L319)
 
-Delete one or more items directly from the synced data store without triggering a query refetch or optimistic update
+Delete items without an optimistic update. Resolves when the sync commit applies.
 
 #### Parameters
 
@@ -219,19 +154,19 @@ Delete one or more items directly from the synced data store without triggering 
 
 #### Returns
 
-`void`
+`Promise`\<`void`\>
 
 ***
 
 ### writeInsert()
 
 ```ts
-writeInsert: (data) => void;
+writeInsert: (data) => Promise<void>;
 ```
 
-Defined in: [packages/query-db-collection/src/query.ts:172](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L172)
+Defined in: [packages/query-db-collection/src/query.ts:313](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L313)
 
-Insert one or more items directly into the synced data store without triggering a query refetch or optimistic update
+Insert items without an optimistic update. Resolves when the sync commit applies.
 
 #### Parameters
 
@@ -241,19 +176,19 @@ Insert one or more items directly into the synced data store without triggering 
 
 #### Returns
 
-`void`
+`Promise`\<`void`\>
 
 ***
 
 ### writeUpdate()
 
 ```ts
-writeUpdate: (updates) => void;
+writeUpdate: (updates) => Promise<void>;
 ```
 
-Defined in: [packages/query-db-collection/src/query.ts:174](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L174)
+Defined in: [packages/query-db-collection/src/query.ts:315](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L315)
 
-Update one or more items directly in the synced data store without triggering a query refetch or optimistic update
+Update items without an optimistic update. Resolves when the sync commit applies.
 
 #### Parameters
 
@@ -263,19 +198,19 @@ Update one or more items directly in the synced data store without triggering a 
 
 #### Returns
 
-`void`
+`Promise`\<`void`\>
 
 ***
 
 ### writeUpsert()
 
 ```ts
-writeUpsert: (data) => void;
+writeUpsert: (data) => Promise<void>;
 ```
 
-Defined in: [packages/query-db-collection/src/query.ts:178](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L178)
+Defined in: [packages/query-db-collection/src/query.ts:321](https://github.com/TanStack/db/blob/main/packages/query-db-collection/src/query.ts#L321)
 
-Insert or update one or more items directly in the synced data store without triggering a query refetch or optimistic update
+Insert or update items without an optimistic update. Resolves when the sync commit applies.
 
 #### Parameters
 
@@ -285,4 +220,4 @@ Insert or update one or more items directly in the synced data store without tri
 
 #### Returns
 
-`void`
+`Promise`\<`void`\>

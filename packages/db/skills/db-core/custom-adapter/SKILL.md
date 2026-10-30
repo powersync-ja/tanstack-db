@@ -2,17 +2,20 @@
 name: db-core/custom-adapter
 description: >
   Building custom collection adapters for new backends. SyncConfig interface:
-  sync function receiving begin, write, commit, markReady, truncate, metadata
-  primitives. ChangeMessage format (insert, update, delete). loadSubset for
-  on-demand sync. LoadSubsetOptions (where, orderBy, limit, cursor). Expression
-  parsing: parseWhereExpression, parseOrderByExpression,
+  sync function receiving begin, write, commit, markReady, fail,
+  reportError, reportHealthy, truncate, metadata
+  primitives and returning cleanup, loadSubset, and optional unloadSubset
+  handlers.
+  ChangeMessage format (insert, update, delete). On-demand LoadSubsetOptions
+  (where, orderBy, limit, offset, cursor). Expression parsing:
+  parseWhereExpression, parseOrderByExpression,
   extractSimpleComparisons, parseLoadSubsetOptions. Collection options creator
-  pattern. rowUpdateMode (partial vs full). Subscription lifecycle and cleanup
-  functions. Persisted sync metadata API (metadata.row and metadata.collection)
+  pattern. rowUpdateMode (partial vs full). Sync run, subscription lifecycle,
+  and cleanup functions. Persisted sync metadata API (metadata.row and metadata.collection)
   for storing per-row and per-collection adapter state.
 type: sub-skill
 library: db
-library_version: '0.6.0'
+library_version: '0.6.17'
 sources:
   - 'TanStack/db:docs/guides/collection-options-creator.md'
   - 'TanStack/db:packages/db/src/collection/sync.ts'
@@ -22,27 +25,40 @@ This skill builds on db-core and db-core/collection-setup. Read those first.
 
 # Custom Adapter Authoring
 
+Each call to an adapter's `sync()` function starts a **sync run**. The run owns
+the callbacks and resources installed by that call until its returned cleanup
+ends them. A sync run may make several backend requests or open a longer-lived
+provider session, so do not use “request” or “session” as a synonym for the
+run.
+
 ## Setup
 
 ```ts
 import { createCollection } from '@tanstack/db'
-import type { SyncConfig, CollectionConfig } from '@tanstack/db'
+import type { CollectionConfig } from '@tanstack/db'
 
 interface MyItem {
   id: string
   name: string
 }
 
-function myBackendCollectionOptions<T>(config: {
+interface BackendEvent<T> {
+  type: 'insert' | 'update' | 'delete'
+  id: string
+  data: T
+}
+
+function myBackendCollectionOptions<T extends object>(config: {
   endpoint: string
   getKey: (item: T) => string
-}): CollectionConfig<T, string, {}> {
+}): CollectionConfig<T, string> {
   return {
     getKey: config.getKey,
     sync: {
-      sync: ({ begin, write, commit, markReady, metadata, collection }) => {
+      sync: ({ begin, write, commit, markReady, fail }) => {
         let isInitialSyncComplete = false
-        const bufferedEvents: Array<any> = []
+        const bufferedEvents: Array<BackendEvent<T>> = []
+        const initialSyncAbort = new AbortController()
 
         // 1. Subscribe to real-time events FIRST
         const unsubscribe = myWebSocket.subscribe(config.endpoint, (event) => {
@@ -56,50 +72,66 @@ function myBackendCollectionOptions<T>(config: {
         })
 
         // 2. Fetch initial data
-        fetch(config.endpoint).then(async (res) => {
-          const items = await res.json()
-          begin()
-          for (const item of items) {
-            write({ type: 'insert', value: item })
-          }
-          commit()
-
-          // 3. Process buffered events
-          isInitialSyncComplete = true
-          for (const event of bufferedEvents) {
+        void fetch(config.endpoint, { signal: initialSyncAbort.signal })
+          .then(async (res) => {
+            const items = await res.json()
             begin()
-            write({ type: event.type, key: event.id, value: event.data })
+            for (const item of items) {
+              write({ type: 'insert', value: item })
+            }
             commit()
-          }
 
-          // 4. Signal readiness
-          markReady()
-        })
+            // 3. Process buffered events
+            isInitialSyncComplete = true
+            for (const event of bufferedEvents) {
+              begin()
+              write({ type: event.type, key: event.id, value: event.data })
+              commit()
+            }
+
+            // 4. Signal that a usable snapshot exists
+            markReady()
+          })
+          .catch((error) => {
+            if (initialSyncAbort.signal.aborted) return
+            console.error('Initial sync failed:', error)
+            // This catch runs only before this run's markReady(). After it,
+            // report problems with reportError() and keep the rows. Do not
+            // read collection.status: a reload keeps the previous status.
+            fail(error)
+          })
 
         // 5. Return cleanup function
         return () => {
+          initialSyncAbort.abort()
           unsubscribe()
         }
       },
       rowUpdateMode: 'partial',
     },
     onInsert: async ({ transaction }) => {
-      await fetch(config.endpoint, {
+      const response = await fetch(config.endpoint, {
         method: 'POST',
         body: JSON.stringify(transaction.mutations[0].modified),
       })
+      await waitForServerObservation(response)
     },
     onUpdate: async ({ transaction }) => {
       const mut = transaction.mutations[0]
-      await fetch(`${config.endpoint}/${mut.key}`, {
+      const response = await fetch(`${config.endpoint}/${mut.key}`, {
         method: 'PATCH',
         body: JSON.stringify(mut.changes),
       })
+      await waitForServerObservation(response)
     },
     onDelete: async ({ transaction }) => {
-      await fetch(`${config.endpoint}/${transaction.mutations[0].key}`, {
-        method: 'DELETE',
-      })
+      const response = await fetch(
+        `${config.endpoint}/${transaction.mutations[0].key}`,
+        {
+          method: 'DELETE',
+        },
+      )
+      await waitForServerObservation(response)
     },
   }
 }
@@ -127,34 +159,68 @@ write({ type: 'delete', key: itemId, value: item })
 ### On-demand sync with loadSubset
 
 ```ts
-import { parseLoadSubsetOptions } from "@tanstack/db"
+import { parseLoadSubsetOptions } from '@tanstack/db'
 
+syncMode: 'on-demand',
 sync: {
-  sync: ({ begin, write, commit, markReady }) => {
-    // Initial sync...
+  sync: ({ begin, write, commit, markReady, collection }) => {
+    const stopSync = subscribeToBackendChanges()
     markReady()
-    return () => {}
-  },
-  loadSubset: async (options) => {
-    const { filters, sorts, limit, offset } = parseLoadSubsetOptions(options)
-    // filters: [{ field: ['category'], operator: 'eq', value: 'electronics' }]
-    // sorts:   [{ field: ['price'], direction: 'asc', nulls: 'last' }]
-    const params = new URLSearchParams()
-    for (const f of filters) {
-      params.set(f.field.join("."), `${f.operator}:${f.value}`)
+
+    return {
+      cleanup: stopSync,
+      loadSubset: async (options) => {
+        const { filters, sorts, limit } = parseLoadSubsetOptions(options)
+        const items = await api.items.list({
+          filters,
+          sorts,
+          limit,
+          offset: options.offset,
+          // Translate cursor.whereFrom/whereCurrent expressions for your API.
+          cursor: translateCursorExpressions(options.cursor),
+        })
+
+        begin()
+        for (const item of items) {
+          const key = collection.config.getKey(item)
+          write(
+            collection.has(key)
+              ? { type: 'update', key, value: item }
+              : { type: 'insert', value: item },
+          )
+        }
+        commit()
+      },
     }
-    const res = await fetch(`/api/items?${params}`)
-    return res.json()
   },
+  rowUpdateMode: 'full',
 }
 ```
+
+`sync()` returns the handlers in a `SyncConfigRes` object. `loadSubset()` must
+write fetched rows through `begin()` → `write()` → `commit()` and resolve
+`void` (or return `true` for an immediate synchronous result); it does not
+return the fetched rows. `parseLoadSubsetOptions()` returns only `filters`,
+`sorts`, and `limit`. Read `offset` and `cursor` from the original options.
+`cursor` contains query expressions (`whereFrom` and `whereCurrent`), not an
+opaque backend cursor; translate or combine those expressions for your API.
+Return `unloadSubset` only when `loadSubset` creates an ongoing resource, such
+as a per-subset server subscription, that must be released.
+A Collection subscription installs its logical owner before calling
+`loadSubset`. A synchronous throw fails the load but keeps that owner; when
+the owner is released, core calls `unloadSubset` for the failed load too.
+Make `unloadSubset` safe after partial setup. A must-refetch can call
+`loadSubset` again with the same options. Replay first detaches and releases
+the old acquisition lease, then starts a fresh acquisition if the logical
+demand and replay are still current. Core releases the current acquisition
+when the demand ends.
 
 ### Managing optimistic state duration
 
 Mutation handlers must not resolve until server changes have synced back to the collection. Five strategies:
 
 1. **Refetch** (simplest): `await collection.utils.refetch()`
-2. **Transaction ID**: return `{ txid }` and track via sync stream
+2. **Transaction ID**: await a utility that observes the mutation's transaction ID in the sync stream, such as Electric's `await collection.utils.awaitTxId(txid)`
 3. **ID-based tracking**: await specific record ID appearing in sync stream
 4. **Version/timestamp**: wait until sync stream catches up to mutation time
 5. **Provider method**: `await backend.waitForPendingWrites()`
@@ -163,10 +229,16 @@ Mutation handlers must not resolve until server changes have synced back to the 
 
 The `metadata` API on the sync config allows adapters to store per-row and per-collection metadata that persists across sync transactions. This is useful for tracking resume tokens, cursors, LSNs, or other adapter-specific state.
 
-The `metadata` object is available as a property on the sync config argument alongside `begin`, `write`, `commit`, etc. It is always provided, but without persistence the metadata is in-memory only and does not survive reloads. With persistence, metadata is durable across sessions.
+The `metadata` object is available on the sync config argument alongside
+`begin`, `write`, and `commit`. Core supplies it at runtime, but its public type
+is optional, so strict TypeScript code must guard it or assert its presence.
+Without persistence the metadata is in-memory only and does not survive
+reloads. With persistence, it is durable across sessions.
 
 ```ts
-sync: ({ begin, write, commit, markReady, metadata }) => {
+sync: ({ begin, write, commit, markReady, fail, metadata }) => {
+  if (!metadata) throw new Error('Sync metadata API is unavailable')
+
   // Row metadata: store per-row state (e.g. server version, ETag)
   metadata.row.get(key) // => unknown | undefined
   metadata.row.set(key, { version: 3, etag: 'abc' })
@@ -181,7 +253,11 @@ sync: ({ begin, write, commit, markReady, metadata }) => {
 }
 ```
 
-Row metadata writes are tied to the current transaction. When a row is deleted via `write({ type: 'delete', ... })`, its row metadata is automatically deleted. When a row is inserted, its metadata is set from `message.metadata` if provided, or deleted otherwise.
+Row metadata writes are tied to the current transaction. Deleting a row also
+deletes its metadata. An insert sets metadata from `message.metadata`. A
+metadata-less insert deletes stale metadata unless `metadata.row.set()` already
+queued an explicit value for that key in the same transaction; that queued
+value wins.
 
 Collection metadata writes staged before `truncate()` are preserved and commit atomically with the truncate transaction.
 
@@ -189,6 +265,8 @@ Collection metadata writes staged before `truncate()` are preserved and commit a
 
 ```ts
 sync: ({ begin, write, commit, markReady, metadata }) => {
+  if (!metadata) throw new Error('Sync metadata API is unavailable')
+
   const lastCursor = metadata.collection.get('cursor') as string | undefined
 
   const stream = subscribeFromCursor(lastCursor)
@@ -202,6 +280,7 @@ sync: ({ begin, write, commit, markReady, metadata }) => {
   })
 
   stream.on('ready', () => markReady())
+  stream.on('initial-error', (error) => fail(error))
   return () => stream.close()
 }
 ```
@@ -224,6 +303,21 @@ const orderBy = parseOrderByExpression(options.orderBy)
 ```
 
 ## Common Mistakes
+
+### CRITICAL Defining loadSubset beside sync()
+
+Wrong:
+
+```ts
+sync: {
+  sync: ({ markReady }) => markReady(),
+  loadSubset: async () => fetch('/items').then((response) => response.json()),
+}
+```
+
+Correct: return `{ loadSubset, cleanup }` from `sync()` and apply loaded rows
+with the sync transaction primitives, as shown above. Add `unloadSubset` when
+each loaded subset owns a resource that must be released.
 
 ### CRITICAL Not calling markReady() in sync implementation
 
@@ -254,6 +348,24 @@ sync: ({ begin, write, commit, markReady }) => {
 ```
 
 `markReady()` transitions the collection to "ready" status. Without it, live queries never resolve and `useLiveSuspenseQuery` hangs forever in Suspense.
+
+If initial sync fails before it produces a usable snapshot and you stop
+retrying, call `fail(error)` instead. The status becomes `error`, readiness
+waits reject with the supplied cause, and dependent live queries move to
+`error`. A later `markReady()` in the same sync run does nothing; only a new
+sync run can reach `ready`. Use `collection.reload()` to start a new sync run.
+
+After the first `markReady()`, the rows stay. Report a sync problem with
+`reportError(error)` while you keep trying; it sets the node's
+`failureReason`. Call `reportHealthy()` when sync works again; it does nothing
+when nothing is wrong. When you stop trying, call `fail(error)`: after
+readiness the node shows an `error`, and only `reload()` clears it.
+`reportError()` and `reportHealthy()` throw before the first `markReady()`.
+Apps read these reports from `collection.health` and from each live query's
+`health` tree. While a retry is in progress before readiness, report nothing.
+
+A throwing `sync` function crashes the Collection (`status: 'crashed'`).
+Reserve that for broken local state, not for network failures.
 
 Source: docs/guides/collection-options-creator.md
 
@@ -326,6 +438,14 @@ onMessage((event) => {
 Sync data must be written within a transaction (`begin` → `write` → `commit`). Calling `write()` without `begin()` throws `NoPendingSyncTransactionWriteError`.
 
 Source: packages/db/src/collection/sync.ts:110
+
+### HIGH Inserting a different value for an existing synced key
+
+An `insert` for an existing synced key is normalized to an update only when
+the value is unchanged. A different value throws `DuplicateKeySyncError`,
+including for plain custom configs with no `utils`.
+
+Emit an `update`, or delete/truncate the old row before inserting the new one.
 
 ## Tension: Simplicity vs. Correctness in Sync
 

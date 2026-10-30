@@ -3,9 +3,7 @@ id: TanStackDBError
 title: TanStackDBError
 ---
 
-# Class: TanStackDBError
-
-Defined in: [packages/db/src/errors.ts:2](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L2)
+Defined in: [packages/db/src/errors.ts:4](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L4)
 
 ## Extends
 
@@ -28,6 +26,9 @@ Defined in: [packages/db/src/errors.ts:2](https://github.com/TanStack/db/blob/ma
 - [`StorageError`](StorageError.md)
 - [`SyncCleanupError`](SyncCleanupError.md)
 - [`QueryOptimizerError`](QueryOptimizerError.md)
+- [`SetWindowReentrancyError`](SetWindowReentrancyError.md)
+- [`SourceCollectionIdReuseError`](SourceCollectionIdReuseError.md)
+- [`InvalidPoolOptionError`](InvalidPoolOptionError.md)
 
 ## Constructors
 
@@ -37,7 +38,7 @@ Defined in: [packages/db/src/errors.ts:2](https://github.com/TanStack/db/blob/ma
 new TanStackDBError(message): TanStackDBError;
 ```
 
-Defined in: [packages/db/src/errors.ts:3](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L3)
+Defined in: [packages/db/src/errors.ts:5](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L5)
 
 #### Parameters
 

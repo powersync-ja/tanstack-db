@@ -1,10 +1,15 @@
 // @ts-nocheck
 import { DurableObject } from 'cloudflare:workers'
-import { createCollection } from '../../../db/dist/esm/index.js'
+// Wrangler resolves `@tanstack/*` through the package tsconfig paths, so the
+// persistence code below loads `@tanstack/db` from source. Import the
+// Collection from the same module graph: one runtime must load one copy of
+// `@tanstack/db`.
+import { createCollection } from '@tanstack/db'
 import {
   createCloudflareDOSQLitePersistence,
   persistedCollectionOptions,
 } from '../../dist/esm/index.js'
+import { runDemandCoverageSession } from './demand-coverage-session.mjs'
 
 const DEFAULT_COLLECTION_ID = `todos`
 const DEFAULT_SCHEMA_VERSION = 1
@@ -94,6 +99,10 @@ function createUnknownCollectionError(collectionId) {
   return error
 }
 
+function eagerTarget(collectionId) {
+  return { kind: `eager`, collectionId }
+}
+
 export class PersistenceObject extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env)
@@ -110,7 +119,7 @@ export class PersistenceObject extends DurableObject {
       schemaVersion: this.schemaVersion,
     })
     this.ready = this.collectionPersistence.adapter.loadSubset(
-      this.collectionId,
+      eagerTarget(this.collectionId),
       {
         limit: 0,
       },
@@ -162,6 +171,13 @@ export class PersistenceObject extends DurableObject {
       const requestBody = await request.json()
       const collectionId = requestBody.collectionId ?? this.collectionId
 
+      if (request.method === `POST` && url.pathname === `/demand-session`) {
+        return jsonResponse(200, {
+          ok: true,
+          rows: await runDemandCoverageSession(this.ctx.storage, requestBody),
+        })
+      }
+
       if (request.method === `POST` && url.pathname === `/write-todo`) {
         if (collectionId !== this.collectionId) {
           throw createUnknownCollectionError(collectionId)
@@ -178,7 +194,7 @@ export class PersistenceObject extends DurableObject {
               ? requestBody.rowVersion
               : seq
           await this.collectionPersistence.adapter.applyCommittedTx(
-            collectionId,
+            eagerTarget(collectionId),
             {
               txId,
               term: 1,
@@ -200,7 +216,7 @@ export class PersistenceObject extends DurableObject {
         }
         await this.collectionReady
         const tx = this.collection.insert(requestBody.todo)
-        await tx.isPersisted.promise
+        await tx.when(`settled`)
 
         return jsonResponse(200, {
           ok: true,
@@ -213,7 +229,7 @@ export class PersistenceObject extends DurableObject {
         }
         if (this.syncEnabled) {
           const rows = await this.collectionPersistence.adapter.loadSubset(
-            collectionId,
+            eagerTarget(collectionId),
             {},
           )
           return jsonResponse(200, {
@@ -244,7 +260,7 @@ export class PersistenceObject extends DurableObject {
           throw createUnknownCollectionError(unknownCollectionId)
         }
         const rows = await this.persistence.adapter.loadSubset(
-          unknownCollectionId,
+          eagerTarget(unknownCollectionId),
           {},
         )
         return jsonResponse(200, {

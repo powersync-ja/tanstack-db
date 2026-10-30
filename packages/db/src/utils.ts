@@ -2,12 +2,27 @@
  * Generic utility functions
  */
 
+import { InvalidKeyError, UndefinedKeyError } from './errors'
 import type { CompareOptions } from './query/builder/types'
 
 interface TypedArray {
   length: number
   [index: number]: number
 }
+
+export const durationFields = [
+  `years`,
+  `months`,
+  `weeks`,
+  `days`,
+  `hours`,
+  `minutes`,
+  `seconds`,
+  `milliseconds`,
+  `microseconds`,
+  `nanoseconds`,
+] as const
+export type DurationFields = Record<(typeof durationFields)[number], number>
 
 /**
  * Deep equality function that compares two values recursively
@@ -27,19 +42,45 @@ interface TypedArray {
  * ```
  */
 export function deepEquals(a: any, b: any): boolean {
-  return deepEqualsInternal(a, b, new Map())
+  return deepEqualsInternal(a, b, undefined)
+}
+
+/** @internal Compare persisted public and durable value shapes before skipping a reload. */
+export function equalPersistedSnapshotValues(a: unknown, b: unknown): boolean {
+  return deepEqualsInternal(a, b, undefined, true, true)
+}
+
+function isPlainPrototype(prototype: object | null): boolean {
+  return prototype === null || Object.getPrototypeOf(prototype) === null
+}
+
+function enumerableOwnKeys(value: object): Array<string | symbol> {
+  const keys: Array<string | symbol> = Object.keys(value)
+  for (const key of Object.getOwnPropertySymbols(value)) {
+    if (Object.prototype.propertyIsEnumerable.call(value, key)) keys.push(key)
+  }
+  return keys
 }
 
 /**
- * Internal implementation with cycle detection to prevent infinite recursion
+ * Internal implementation with cycle detection to prevent infinite recursion.
+ * Internal callers can seed already-paired roots when comparing their children.
+ *
+ * `draft` selects the stricter equality used by change-tracking drafts: Map
+ * and Set contents must match in order, RegExp match position must match, and
+ * arrays compare as keyed objects (holes and extra enumerable keys count).
+ * `persistedSnapshot` also distinguishes prototypes after serialization.
  */
-function deepEqualsInternal(
+export function deepEqualsInternal(
   a: any,
   b: any,
-  visited: Map<object, object>,
+  // Created on the first container that descends into a child.
+  visited: Map<object, object> | undefined,
+  draft = false,
+  persistedSnapshot = false,
 ): boolean {
   // Handle strict equality (primitives, same reference)
-  if (a === b) return true
+  if (a === b || Object.is(a, b)) return true
 
   // Handle null/undefined
   if (a == null || b == null) return false
@@ -47,10 +88,20 @@ function deepEqualsInternal(
   // Handle different types
   if (typeof a !== typeof b) return false
 
+  // SQLite can turn an authored nested instance into an equal-keyed plain
+  // record. A skipped persisted reload must not retain the old public shape.
+  if (
+    persistedSnapshot &&
+    typeof a === `object` &&
+    Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)
+  ) {
+    return false
+  }
+
   // Handle Date objects
   if (a instanceof Date) {
     if (!(b instanceof Date)) return false
-    return a.getTime() === b.getTime()
+    return Object.is(a.getTime(), b.getTime())
   }
   // Symmetric check: if b is Date but a is not, they're not equal
   if (b instanceof Date) return false
@@ -58,7 +109,11 @@ function deepEqualsInternal(
   // Handle RegExp objects
   if (a instanceof RegExp) {
     if (!(b instanceof RegExp)) return false
-    return a.source === b.source && a.flags === b.flags
+    return (
+      a.source === b.source &&
+      a.flags === b.flags &&
+      (!draft || a.lastIndex === b.lastIndex)
+    )
   }
   // Symmetric check: if b is RegExp but a is not, they're not equal
   if (b instanceof RegExp) return false
@@ -69,15 +124,33 @@ function deepEqualsInternal(
     if (a.size !== b.size) return false
 
     // Check for circular references
-    if (visited.has(a)) {
+    if (visited?.has(a)) {
       return visited.get(a) === b
     }
+    visited ??= new Map()
     visited.set(a, b)
 
-    const entries = Array.from(a.entries())
-    const result = entries.every(([key, val]) => {
-      return b.has(key) && deepEqualsInternal(val, b.get(key), visited)
-    })
+    // A draft compares entries in order; general equality looks keys up.
+    const bEntries = draft && Array.from(b.entries())
+    const result = Array.from(a.entries()).every(([key, val], index) =>
+      bEntries
+        ? Object.is(key, bEntries[index]![0]) &&
+          deepEqualsInternal(
+            val,
+            bEntries[index]![1],
+            visited,
+            true,
+            persistedSnapshot,
+          )
+        : b.has(key) &&
+          deepEqualsInternal(
+            val,
+            b.get(key),
+            visited,
+            draft,
+            persistedSnapshot,
+          ),
+    )
 
     visited.delete(a)
     return result
@@ -91,14 +164,29 @@ function deepEqualsInternal(
     if (a.size !== b.size) return false
 
     // Check for circular references
-    if (visited.has(a)) {
+    if (visited?.has(a)) {
       return visited.get(a) === b
     }
+    visited ??= new Map()
     visited.set(a, b)
 
     // Convert to arrays for comparison
     const aValues = Array.from(a)
     const bValues = Array.from(b)
+
+    if (draft) {
+      const result = aValues.every((val, index) =>
+        deepEqualsInternal(
+          val,
+          bValues[index],
+          visited,
+          draft,
+          persistedSnapshot,
+        ),
+      )
+      visited.delete(a)
+      return result
+    }
 
     // Simple comparison for primitive values
     if (aValues.every((val) => typeof val !== `object`)) {
@@ -106,9 +194,41 @@ function deepEqualsInternal(
       return aValues.every((val) => b.has(val))
     }
 
-    // For objects in sets, we need to do a more complex comparison
-    // This is a simplified approach and may not work for all cases
-    const result = aValues.length === bValues.length
+    // Object-valued Sets are unordered. Match each value once, carrying a
+    // branch-local cycle map so a failed candidate cannot poison the next.
+    const matchValues = (
+      index: number,
+      remaining: ReadonlyArray<number>,
+      branchVisited: Map<object, object>,
+    ): boolean => {
+      if (index === aValues.length) return true
+      const value = aValues[index]
+      for (const [remainingIndex, candidateIndex] of remaining.entries()) {
+        const candidateVisited = new Map(branchVisited)
+        if (
+          deepEqualsInternal(
+            value,
+            bValues[candidateIndex],
+            candidateVisited,
+            draft,
+            persistedSnapshot,
+          ) &&
+          matchValues(
+            index + 1,
+            remaining.filter((_, otherIndex) => otherIndex !== remainingIndex),
+            candidateVisited,
+          )
+        ) {
+          return true
+        }
+      }
+      return false
+    }
+    const result = matchValues(
+      0,
+      bValues.map((_, index) => index),
+      visited,
+    )
     visited.delete(a)
     return result
   }
@@ -124,10 +244,18 @@ function deepEqualsInternal(
   ) {
     const typedA = a as unknown as TypedArray
     const typedB = b as unknown as TypedArray
-    if (typedA.length !== typedB.length) return false
+    // Elements compare like numbers: -0 equals 0, NaN equals NaN. Only a
+    // draft treats a change of typed-array class as a change.
+    if (
+      (draft && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) ||
+      typedA.length !== typedB.length
+    )
+      return false
 
     for (let i = 0; i < typedA.length; i++) {
-      if (typedA[i] !== typedB[i]) return false
+      const x = typedA[i]!
+      const y = typedB[i]!
+      if (x !== y && !(x !== x && y !== y)) return false
     }
 
     return true
@@ -150,6 +278,16 @@ function deepEqualsInternal(
     // If they're different Temporal types, they're not equal
     if (aTag !== bTag) return false
 
+    // Duration identity preserves its fields, even when toString normalizes
+    // different units to the same elapsed time.
+    if (aTag === `Temporal.Duration`) {
+      const durationA = a as unknown as DurationFields
+      const durationB = b as unknown as DurationFields
+      return durationFields.every(
+        (field) => durationA[field] === durationB[field],
+      )
+    }
+
     // Use Temporal's built-in equals method if available
     if (typeof a.equals === `function`) {
       return a.equals(b)
@@ -162,48 +300,74 @@ function deepEqualsInternal(
   if (isTemporal(b)) return false
 
   // Handle arrays
-  if (Array.isArray(a)) {
-    if (!Array.isArray(b) || a.length !== b.length) return false
-
+  if (Array.isArray(a) !== Array.isArray(b)) return false
+  if (Array.isArray(a) && a.length !== b.length) return false
+  if (Array.isArray(a) && !draft) {
     // Check for circular references
-    if (visited.has(a)) {
+    if (visited?.has(a)) {
       return visited.get(a) === b
     }
+    visited ??= new Map()
     visited.set(a, b)
 
     const result = a.every((item, index) =>
-      deepEqualsInternal(item, b[index], visited),
+      deepEqualsInternal(item, b[index], visited, draft, persistedSnapshot),
     )
     visited.delete(a)
     return result
   }
-  // Symmetric check: if b is array but a is not, they're not equal
-  if (Array.isArray(b)) return false
-
   // Handle objects
   if (typeof a === `object`) {
+    // Instances of two different classes differ. A plain or null-prototype
+    // object, from any realm, compares by keys with any class: a draft
+    // snapshot and plain JSON both hold class instances as plain objects.
+    const prototype = Object.getPrototypeOf(a)
+    const prototypeB = Object.getPrototypeOf(b)
+    const plain = isPlainPrototype(prototype)
+    const plainB = isPlainPrototype(prototypeB)
+    if (prototype !== prototypeB && !plain && !plainB) return false
+
     // Check for circular references
-    if (visited.has(a)) {
+    if (visited?.has(a)) {
       return visited.get(a) === b
     }
-    visited.set(a, b)
 
-    // Get all keys from both objects
-    const keysA = Object.keys(a)
-    const keysB = Object.keys(b)
+    // Compare enumerable symbol keys as well as string keys. Query results may
+    // use user-owned symbols, and a symbol-only update is still a value change.
+    const keysA = enumerableOwnKeys(a)
+    const keysB = enumerableOwnKeys(b)
 
     // Check if they have the same number of keys
-    if (keysA.length !== keysB.length) {
-      visited.delete(a)
-      return false
+    if (keysA.length !== keysB.length) return false
+
+    // A class instance without enumerable keys (a File, an object with
+    // private fields) keeps its state elsewhere, so it equals only itself.
+    // A draft copies a URL by its href, so URLs compare by href.
+    if (keysA.length === 0 && !Array.isArray(a) && !(plain && plainB)) {
+      return a instanceof URL && a.href === b.href
     }
 
-    // Check if all keys exist in both objects and their values are equal
-    const result = keysA.every(
-      (key) => key in b && deepEqualsInternal(a[key], b[key], visited),
-    )
-
-    visited.delete(a)
+    // Check if all keys exist in both objects and their values are equal.
+    // Register for cycles only before descending, so a flat object
+    // allocates no cycle map.
+    let registered = false
+    let result = true
+    for (const key of keysA) {
+      const value = a[key]
+      if (!registered && value !== null && typeof value === `object`) {
+        visited ??= new Map()
+        visited.set(a, b)
+        registered = true
+      }
+      if (
+        !Object.prototype.propertyIsEnumerable.call(b, key) ||
+        !deepEqualsInternal(value, b[key], visited, draft, persistedSnapshot)
+      ) {
+        result = false
+        break
+      }
+    }
+    if (registered) visited!.delete(a)
     return result
   }
 
@@ -235,8 +399,20 @@ export function isTemporal(a: unknown): a is TemporalLike {
   return typeof tag === `string` && temporalTypes.has(tag)
 }
 
-export const DEFAULT_COMPARE_OPTIONS: CompareOptions = {
+export const DEFAULT_COMPARE_OPTIONS: Exclude<
+  CompareOptions,
+  { stringSort: `custom` }
+> = {
   direction: `asc`,
   nulls: `first`,
   stringSort: `locale`,
+}
+
+/** Throws unless a key has the Collection key type: a string or a number. */
+export function assertCollectionKey(key: unknown, item: unknown): void {
+  if (typeof key !== `string` && typeof key !== `number`) {
+    throw key === undefined
+      ? new UndefinedKeyError(item)
+      : new InvalidKeyError(key, item)
+  }
 }

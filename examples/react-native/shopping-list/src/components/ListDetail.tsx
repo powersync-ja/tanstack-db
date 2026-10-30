@@ -21,7 +21,7 @@ type ListItemRow = {
   text: string
   checked: boolean
   createdAt: string
-  $synced?: boolean
+  $hasPendingWrites?: boolean
 }
 
 function ItemRow({
@@ -36,7 +36,7 @@ function ItemRow({
   const [showSavingBadge, setShowSavingBadge] = useState(false)
 
   useEffect(() => {
-    if (item.$synced !== false) {
+    if (!item.$hasPendingWrites) {
       setShowSavingBadge(false)
       return
     }
@@ -48,7 +48,7 @@ function ItemRow({
     return () => {
       clearTimeout(timer)
     }
-  }, [item.id, item.$synced])
+  }, [item.id, item.$hasPendingWrites])
 
   return (
     <View style={styles.itemRow}>
@@ -82,12 +82,13 @@ export function ListDetail({ listId }: ListDetailProps) {
   const { itemActions } = useShopping()
 
   // Get items for this list
-  const itemsResult = useLiveQuery((q) =>
-    q
-      .from({ item: itemsCollection })
-      .where(({ item }) => eq(item.listId, listId))
-      .orderBy(({ item }) => item.createdAt, `asc`),
-  )
+  const itemsResult = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ item: itemsCollection })
+        .where(({ item }) => eq(item.listId, listId))
+        .orderBy(({ item }) => item.createdAt, `asc`),
+  })
   const items = itemsResult.data as Array<ListItemRow>
 
   const handleAddItem = async () => {

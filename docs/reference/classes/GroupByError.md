@@ -3,9 +3,7 @@ id: GroupByError
 title: GroupByError
 ---
 
-# Class: GroupByError
-
-Defined in: [packages/db/src/errors.ts:593](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L593)
+Defined in: [packages/db/src/errors.ts:990](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L990)
 
 ## Extends
 
@@ -26,7 +24,7 @@ Defined in: [packages/db/src/errors.ts:593](https://github.com/TanStack/db/blob/
 new GroupByError(message): GroupByError;
 ```
 
-Defined in: [packages/db/src/errors.ts:594](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L594)
+Defined in: [packages/db/src/errors.ts:991](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L991)
 
 #### Parameters
 

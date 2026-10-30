@@ -9,20 +9,36 @@
  */
 
 /**
- * Origin of the last confirmed change to a row, from the current client's perspective.
+ * Collection attribution for a row's current value.
  *
- * - `'local'`: The change originated from this client (e.g., a mutation made here)
- * - `'remote'`: The change was received via sync from another client/server
+ * - `'local'`: An optimistic row, or a source write attributed through a
+ *   same-key local mutation
+ * - `'remote'`: A source write without that local attribution
  *
- * Note: This reflects the client's perspective, not the original creator.
- * User A creates order → $origin = 'local' on User A's client
- * Order syncs to server
- * User B receives order → $origin = 'remote' on User B's client
+ * Synced Collections infer attribution from key and timing, without a source
+ * client ID. With one persisting local mutation and no truncate, the first queued
+ * same-key source transaction published at successful mutation settlement
+ * consumes local attribution. Its surviving row is `'local'`; later source
+ * transactions are `'remote'`. A failed mutation gives those queued
+ * writes no local attribution. A truncate can publish while a mutation remains
+ * active, leaving its same-key row `'local'` even if the mutation later fails.
+ * An unconsumed active mutation on a key omitted by the truncate retains
+ * attribution for its first later same-key source transaction, even in that
+ * drain. A truncate's write consumes attribution for its key, so a later
+ * same-key transaction in that drain is `'remote'` without a new local owner.
+ * A source write on a still-pending manual mutation's key applies immediately
+ * and can keep `'local'` attribution if that mutation rolls back.
+ * When two same-key mutations both persist before a source transaction is
+ * queued, with no truncate, a successful one retains one local attribution
+ * for the key even if its sibling fails; two failures retain none.
+ * An independent peer write can be labeled `'local'`, and a later confirmation
+ * from this client can be labeled `'remote'`. Local-only Collections always use
+ * `'local'`.
  */
 export type VirtualOrigin = 'local' | 'remote'
 
 /**
- * Virtual properties available on every row in TanStack DB collections.
+ * Virtual properties recognized on TanStack DB rows.
  *
  * These properties are:
  * - Computed (not stored in the data model)
@@ -30,27 +46,32 @@ export type VirtualOrigin = 'local' | 'remote'
  * - Available in queries (WHERE, ORDER BY, SELECT)
  * - Included when spreading rows (`...user`)
  *
+ * Structured whole-row selections and spreads retain source metadata.
+ * A functional selection retains it only when returning a source row directly.
+ * New functional objects and other projections receive the output Collection's
+ * metadata. Selected virtual names cannot change that attribution.
+ *
  * @template TKey - The type of the row's key (string or number)
  *
  * @example
  * ```typescript
  * // Accessing virtual properties on a row
  * const user = collection.get('user-1')
- * if (user.$synced) {
- *   console.log('Confirmed by backend')
+ * if (!user.$hasPendingWrites) {
+ *   console.log('No pending local optimistic writes for this row')
  * }
  * if (user.$origin === 'local') {
- *   console.log('Created/modified locally')
+ *   console.log('Row has local attribution')
  * }
  * ```
  *
  * @example
  * ```typescript
  * // Using virtual properties in queries
- * const confirmedOrders = createLiveQueryCollection({
+ * const ordersWithoutLocalWrites = createLiveQueryCollection({
  *   query: (q) => q
  *     .from({ order: orders })
- *     .where(({ order }) => eq(order.$synced, true))
+ *     .where(({ order }) => eq(order.$hasPendingWrites, false))
  * })
  * ```
  */
@@ -58,24 +79,22 @@ export interface VirtualRowProps<
   TKey extends string | number = string | number,
 > {
   /**
-   * Whether this row reflects confirmed state from the backend.
+   * Whether this row currently has pending local optimistic writes.
    *
-   * - `true`: Row is confirmed by the backend (no pending optimistic mutations)
-   * - `false`: Row has pending optimistic mutations that haven't been confirmed
-   *
-   * For local-only collections (no sync), this is always `true`.
-   * For live query collections, this is passed through from the source collection.
+   * This describes the row's local optimistic state, not backend upload or
+   * acknowledgement. It is always `false` for local-only collections.
    */
-  readonly $synced: boolean
+  readonly $hasPendingWrites: boolean
 
   /**
-   * Origin of the last confirmed change to this row, from the current client's perspective.
-   *
-   * - `'local'`: The change originated from this client
-   * - `'remote'`: The change was received via sync
+   * Collection attribution for this row's current value. `'local'` covers
+   * optimistic rows and attributed source writes; `'remote'` covers source
+   * writes without local attribution. See {@link VirtualOrigin} for the
+   * key-and-timing rules, including truncate and overlapping mutations.
    *
    * For local-only collections, this is always `'local'`.
-   * For live query collections, this is passed through from the source collection.
+   * Whole-row live queries preserve source attribution. Projected row roots
+   * otherwise use the live-query Collection's attribution.
    */
   readonly $origin: VirtualOrigin
 
@@ -91,7 +110,8 @@ export interface VirtualRowProps<
    * The ID of the source collection this row originated from.
    *
    * In joins, this can help identify which collection each row came from.
-   * For live query collections, this is the ID of the upstream collection.
+   * Whole-row live queries preserve the upstream Collection's ID. Projected
+   * row roots otherwise use the live-query Collection's ID.
    */
   readonly $collectionId: string
 }
@@ -106,7 +126,7 @@ export interface VirtualRowProps<
  * ```typescript
  * type User = { id: string; name: string }
  * type UserWithVirtual = WithVirtualProps<User, string>
- * // { id: string; name: string; $synced: boolean; $origin: 'local' | 'remote'; $key: string; $collectionId: string }
+ * // { id: string; name: string; $hasPendingWrites: boolean; $origin: 'local' | 'remote'; $key: string; $collectionId: string }
  * ```
  */
 export type WithVirtualProps<
@@ -122,15 +142,17 @@ export type WithVirtualProps<
  *
  * @example
  * ```typescript
- * type UserWithVirtual = { id: string; name: string; $synced: boolean; $origin: 'local' | 'remote' }
+ * type UserWithVirtual = { id: string; name: string; $hasPendingWrites: boolean; $origin: 'local' | 'remote' }
  * type User = WithoutVirtualProps<UserWithVirtual>
  * // { id: string; name: string }
  * ```
  */
-export type WithoutVirtualProps<T> = Omit<T, keyof VirtualRowProps>
+export type WithoutVirtualProps<T> = T extends unknown
+  ? Omit<T, keyof VirtualRowProps>
+  : never
 
 /**
- * Checks if a value has virtual properties attached.
+ * Checks if a value has all virtual properties attached.
  *
  * @param value - The value to check
  * @returns true if the value has virtual properties
@@ -138,7 +160,7 @@ export type WithoutVirtualProps<T> = Omit<T, keyof VirtualRowProps>
  * @example
  * ```typescript
  * if (hasVirtualProps(row)) {
- *   console.log('Synced:', row.$synced)
+ *   console.log('Pending local writes:', row.$hasPendingWrites)
  * }
  * ```
  */
@@ -148,36 +170,10 @@ export function hasVirtualProps(
   return (
     typeof value === 'object' &&
     value !== null &&
-    VIRTUAL_PROP_NAMES.every((name) => name in value)
+    ['$hasPendingWrites', '$origin', '$key', '$collectionId'].every(
+      (name) => name in value,
+    )
   )
-}
-
-/**
- * Creates virtual properties for a row in a source collection.
- *
- * This is the internal function used by collections to add virtual properties
- * to rows when emitting change messages.
- *
- * @param key - The row's key
- * @param collectionId - The collection's ID
- * @param isSynced - Whether the row is synced (not optimistic)
- * @param origin - Whether the change was local or remote
- * @returns Virtual properties object to merge with the row
- *
- * @internal
- */
-export function createVirtualProps<TKey extends string | number>(
-  key: TKey,
-  collectionId: string,
-  isSynced: boolean,
-  origin: VirtualOrigin,
-): VirtualRowProps<TKey> {
-  return {
-    $synced: isSynced,
-    $origin: origin,
-    $key: key,
-    $collectionId: collectionId,
-  }
 }
 
 /**
@@ -192,7 +188,7 @@ export function createVirtualProps<TKey extends string | number>(
  * @param row - The row to enrich
  * @param key - The row's key
  * @param collectionId - The collection's ID
- * @param computeSynced - Function to compute $synced if missing
+ * @param computePendingWrites - Function to compute $hasPendingWrites if missing
  * @param computeOrigin - Function to compute $origin if missing
  * @returns The row with virtual properties (possibly the same object if already present)
  *
@@ -205,16 +201,18 @@ export function enrichRowWithVirtualProps<
   row: T,
   key: TKey,
   collectionId: string,
-  computeSynced: () => boolean,
+  computePendingWrites: () => boolean,
   computeOrigin: () => VirtualOrigin,
 ): WithVirtualProps<T, TKey> {
   // Use nullish coalescing to preserve existing virtual properties (pass-through)
   // This is the "add-if-missing" pattern described in the RFC
   const existingRow = row as Partial<VirtualRowProps<TKey>>
+  const hasPendingWrites =
+    existingRow.$hasPendingWrites ?? computePendingWrites()
 
   return {
     ...row,
-    $synced: existingRow.$synced ?? computeSynced(),
+    $hasPendingWrites: hasPendingWrites,
     $origin: existingRow.$origin ?? computeOrigin(),
     $key: existingRow.$key ?? key,
     $collectionId: existingRow.$collectionId ?? collectionId,
@@ -222,44 +220,11 @@ export function enrichRowWithVirtualProps<
 }
 
 /**
- * Computes aggregate virtual properties for a group of rows.
- *
- * For aggregates:
- * - `$synced`: true if ALL rows in the group are synced; false if ANY row is optimistic
- * - `$origin`: 'local' if ANY row in the group is local; otherwise 'remote'
- *
- * @param rows - The rows in the group
- * @param groupKey - The group key
- * @param collectionId - The collection ID
- * @returns Virtual properties for the aggregate row
- *
- * @internal
- */
-export function computeAggregateVirtualProps<TKey extends string | number>(
-  rows: Array<Partial<VirtualRowProps<string | number>>>,
-  groupKey: TKey,
-  collectionId: string,
-): VirtualRowProps<TKey> {
-  // $synced = true only if ALL rows are synced (false if ANY is optimistic)
-  const allSynced = rows.every((row) => row.$synced ?? true)
-
-  // $origin = 'local' if ANY row is local (consistent with "local influence" semantics)
-  const hasLocal = rows.some((row) => row.$origin === 'local')
-
-  return {
-    $synced: allSynced,
-    $origin: hasLocal ? 'local' : 'remote',
-    $key: groupKey,
-    $collectionId: collectionId,
-  }
-}
-
-/**
  * List of virtual property names for iteration and checking.
  * @internal
  */
 export const VIRTUAL_PROP_NAMES = [
-  '$synced',
+  '$hasPendingWrites',
   '$origin',
   '$key',
   '$collectionId',

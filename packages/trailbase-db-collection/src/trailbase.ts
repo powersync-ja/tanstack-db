@@ -1,6 +1,10 @@
 /* eslint-disable @typescript-eslint/no-unnecessary-condition */
 import { Store } from '@tanstack/store'
 import {
+  LoadSubsetOperationAbortedError,
+  withCollectionConfigFactory,
+} from '@tanstack/db'
+import {
   ExpectedDeleteTypeError,
   ExpectedInsertTypeError,
   ExpectedUpdateTypeError,
@@ -29,9 +33,9 @@ type OptionalConversions<
   OutputType extends ShapeOf<InputType>,
 > = {
   // Excludes all keys that require a conversation.
-  [K in keyof InputType as InputType[K] extends OutputType[K]
-    ? K
-    : never]?: Conversion<InputType[K], OutputType[K]>
+  [
+    K in keyof InputType as InputType[K] extends OutputType[K] ? K : never
+  ]?: Conversion<InputType[K], OutputType[K]>
 }
 
 type RequiredConversions<
@@ -39,9 +43,9 @@ type RequiredConversions<
   OutputType extends ShapeOf<InputType>,
 > = {
   // Excludes all keys that do not strictly require a conversation.
-  [K in keyof InputType as InputType[K] extends OutputType[K]
-    ? never
-    : K]: Conversion<InputType[K], OutputType[K]>
+  [
+    K in keyof InputType as InputType[K] extends OutputType[K] ? never : K
+  ]: Conversion<InputType[K], OutputType[K]>
 }
 
 type Conversions<
@@ -170,7 +174,9 @@ export function trailBaseCollectionOptions<
   let eventReader: ReadableStreamDefaultReader<Event> | undefined
   const cancelEventReader = () => {
     if (eventReader) {
-      eventReader.cancel()
+      // An already-errored stream rejects cancellation too. Cleanup still
+      // retires its reader; that rejection must not escape as detached work.
+      void eventReader.cancel().catch(() => undefined)
       eventReader.releaseLock()
       eventReader = undefined
     }
@@ -179,20 +185,79 @@ export function trailBaseCollectionOptions<
   type SyncParams = Parameters<SyncConfig<TItem, TKey>[`sync`]>[0]
   const sync = {
     sync: (params: SyncParams) => {
-      const { begin, write, commit, markReady } = params
+      const { begin, write, commit, markReady, fail, collection } = params
+      let cancelled = false
+      let periodicCleanupTask: ReturnType<typeof setInterval> | undefined
+      const cleanup = () => {
+        cancelled = true
+        settleListener()
+        cancelEventReader()
+        if (periodicCleanupTask !== undefined) {
+          clearInterval(periodicCleanupTask)
+          periodicCleanupTask = undefined
+        }
+      }
 
-      // NOTE: We cache cursors from prior fetches. TanStack/db expects that
-      // cursors can be derived from a key, which is not true for TB, since
-      // cursors are encrypted. This is leaky and therefore not ideal.
+      // TrailBase cursors are opaque. Cache a cursor by its last fetched key
+      // for callers that supply an established lastKey on a later request.
+      // CollectionSubscription does not derive lastKey from local snapshots,
+      // so its ordered requests use the offset fallback.
       const cursors = new Map<string | number, string>()
 
+      let listening = false
+      // Orders this run's change events against its list calls. Only loads
+      // in flight compare against it, so it is kept only while one runs.
+      let eventSequence = 0
+      const eventSequenceByKey = new Map<TKey, number>()
+      let loadsInFlight = 0
+      // Settles when the listener runs, cannot start (with the failure), or
+      // the session cleans up, so a waiting load never depends on the order
+      // of their continuations.
+      let settleListener!: (failure?: { error: unknown }) => void
+      const listenerSettled = new Promise<{ error: unknown } | undefined>(
+        (resolve) => {
+          settleListener = resolve
+        },
+      )
+
+      // Wait for the listener, but let the caller's abort end the wait even
+      // when the subscription never resolves.
+      async function waitForListener(signal: AbortSignal | undefined) {
+        if (!signal) return listenerSettled
+        let onAbort!: () => void
+        const aborted = new Promise<undefined>((resolve) => {
+          onAbort = () => resolve(undefined)
+          signal.addEventListener(`abort`, onAbort, { once: true })
+        })
+        try {
+          return await Promise.race([listenerSettled, aborted])
+        } finally {
+          // The request signal can outlive this wait; do not keep its listener.
+          signal.removeEventListener(`abort`, onAbort)
+        }
+      }
+
       // Load (more) data.
-      async function load(opts: LoadSubsetOptions) {
+      // A caller that aborts sees `AbortError`. Pages a commit accepted still
+      // apply, and the load waits until they are visible; cleanup is quiet.
+      // `everyRow` marks the eager load, which lists every row.
+      async function load(opts: LoadSubsetOptions, everyRow = false) {
+        if (cancelled) return
+        if (opts.signal?.aborted) throw new LoadSubsetOperationAbortedError()
+        if (!listening) {
+          const failure = await waitForListener(opts.signal)
+          if (cancelled) return
+          if (opts.signal?.aborted) throw new LoadSubsetOperationAbortedError()
+          if (failure) throw failure.error
+        }
+
         const lastKey = opts.cursor?.lastKey
         let cursor: string | undefined =
           lastKey !== undefined ? cursors.get(lastKey) : undefined
         let offset: number | undefined =
-          (opts.offset ?? 0) > 0 ? opts.offset : undefined
+          cursor === undefined && (opts.offset ?? 0) > 0
+            ? opts.offset
+            : undefined
 
         const order: Array<string> | undefined = buildOrder(opts)
         const filters: Array<FilterOrComposite> | undefined = buildFilters(
@@ -204,56 +269,111 @@ export function trailBaseCollectionOptions<
         if (remaining <= 0) {
           return
         }
+        const appliedPages: Array<Promise<void>> = []
+        const listed = new Set<TKey>()
 
-        while (true) {
-          const limit = Math.min(remaining, 256)
-          const response = await config.recordApi.list({
-            pagination: {
-              limit,
-              offset,
-              cursor,
-            },
-            order,
-            filters,
-          })
-
-          const length = response.records.length
-          if (length === 0) {
-            // Drained - read everything.
-            break
-          }
-
-          begin()
-
-          for (let i = 0; i < Math.min(length, remaining); ++i) {
-            write({
-              type: `insert`,
-              value: parse(response.records[i]!),
-            })
-          }
-
-          commit()
-
-          remaining -= length
-
-          // Drained or read enough.
-          if (length < limit || remaining <= 0) {
-            if (response.cursor) {
-              cursors.set(
-                getKey(parse(response.records.at(-1)!)),
-                response.cursor,
-              )
+        loadsInFlight++
+        try {
+          while (true) {
+            const limit = Math.min(remaining, 256)
+            let response
+            // A change event after this point is newer than the page.
+            const listedAfter = eventSequence
+            try {
+              response = await config.recordApi.list({
+                pagination: {
+                  limit,
+                  offset,
+                  cursor,
+                },
+                order,
+                filters,
+              })
+            } catch (error) {
+              if (cancelled) return
+              if (opts.signal?.aborted) break
+              throw error
             }
-            break
-          }
+            if (cancelled) return
+            // Check the signal before commit to discard a stale page.
+            if (opts.signal?.aborted) break
 
-          // Update params for next iteration.
-          if (offset !== undefined) {
-            offset += length
-          } else {
-            cursor = response.cursor
+            const length = response.records.length
+            if (length === 0) {
+              // Drained - read everything.
+              break
+            }
+
+            begin()
+
+            for (let i = 0; i < Math.min(length, remaining); ++i) {
+              const value = parse(response.records[i]!)
+              const key = getKey(value)
+              listed.add(key)
+              // The listener already applied a newer change for this row.
+              if ((eventSequenceByKey.get(key) ?? 0) > listedAfter) continue
+              // A page row is a full row. An update creates a missing row and
+              // replaces a held one, including one an accepted event queued.
+              write({ type: `update`, value })
+            }
+
+            // An accepted page always applies.
+            const applied = commit(opts.signal)
+            if (applied !== true) {
+              appliedPages.push(applied)
+            }
+            if (cancelled || opts.signal?.aborted) break
+
+            remaining -= length
+
+            // Drained or read enough.
+            if (length < limit || remaining <= 0) {
+              // Core subscriptions cannot send lastKey, so retaining their
+              // cursors only grows this cache. Direct callers can use the key
+              // from a completed page as their next opaque boundary.
+              if (
+                response.cursor &&
+                (opts.subscription === undefined || lastKey !== undefined)
+              ) {
+                cursors.set(
+                  getKey(parse(response.records.at(-1)!)),
+                  response.cursor,
+                )
+              }
+              break
+            }
+
+            // Update params for next iteration.
+            if (offset !== undefined) {
+              offset += length
+            } else {
+              cursor = response.cursor
+            }
           }
+          // A reload keeps the retired run's rows, and the pages update them.
+          // The eager load lists every row, so a held row that it did not
+          // list and that no change event touched is gone.
+          // Only the gone keys are collected, since a write during the walk
+          // would change the entries it reads.
+          const gone: Array<TKey> = []
+          if (everyRow)
+            for (const [key] of collection._state.acceptedSyncedEntries())
+              if (!listed.has(key) && !eventSequenceByKey.has(key))
+                gone.push(key)
+          if (gone.length > 0) {
+            begin()
+            for (const key of gone) write({ type: `delete`, key })
+            const applied = commit()
+            if (applied !== true) appliedPages.push(applied)
+          }
+        } finally {
+          if (--loadsInFlight === 0) eventSequenceByKey.clear()
         }
+
+        await Promise.all(appliedPages)
+        // An accepted page applies, but a caller that aborted still sees
+        // `AbortError`.
+        if (opts.signal?.aborted) throw new LoadSubsetOperationAbortedError()
       }
 
       // Afterwards subscribe.
@@ -262,8 +382,6 @@ export function trailBaseCollectionOptions<
           const { done, value: event } = await reader.read()
 
           if (done || !event) {
-            reader.releaseLock()
-            eventReader = undefined
             return
           }
 
@@ -271,7 +389,9 @@ export function trailBaseCollectionOptions<
           let value: TItem | undefined
           if (`Insert` in event) {
             value = parse(event.Insert as TRecord)
-            write({ type: `insert`, value })
+            // A page may already hold a newer value for this row, so an
+            // insert is written as a full-row update; it creates a missing row.
+            write({ type: `update`, value })
           } else if (`Delete` in event) {
             value = parse(event.Delete as TRecord)
             write({ type: `delete`, value })
@@ -281,9 +401,12 @@ export function trailBaseCollectionOptions<
           } else {
             console.error(`Error: ${event.Error}`)
           }
-          commit()
+          void commit()
 
           if (value) {
+            ++eventSequence
+            if (loadsInFlight > 0)
+              eventSequenceByKey.set(getKey(value), eventSequence)
             seenIds.setState((curr: Map<string, number>) => {
               const newIds = new Map(curr)
               newIds.set(String(getKey(value)), Date.now())
@@ -293,33 +416,78 @@ export function trailBaseCollectionOptions<
         }
       }
 
+      // The adapter does not resubscribe, so it stops when its stream ends;
+      // the first end reports why, and core ignores a later fail() in the same
+      // run. A later stream failure is only logged. These flags belong to this
+      // sync run: a reload runs `sync` again while the Collection still shows
+      // the previous run's status.
+      let streamEnded = false
+      function reportStreamEnd(error: unknown, closed = false) {
+        if (cancelled) return
+        if (streamEnded && !closed)
+          console.error(`TrailBase subscription failed`, error)
+        streamEnded = true
+        fail(error)
+      }
+
       async function start() {
-        const eventStream = await config.recordApi.subscribe(`*`)
-        const reader = (eventReader = eventStream.getReader())
-
-        // Start listening for subscriptions first. Otherwise, we'd risk a gap
-        // between the initial fetch and starting to listen.
-        listen(reader)
-
+        let reader: ReadableStreamDefaultReader<Event> | undefined
         try {
+          const eventStream = await config.recordApi.subscribe(`*`)
+          if (cancelled) {
+            await eventStream.cancel()
+            return
+          }
+          const subscribedReader = eventStream.getReader()
+          reader = eventReader = subscribedReader
+
+          // Start listening for subscriptions first. Otherwise, we'd risk a gap
+          // between the initial fetch and starting to listen.
+          void listen(subscribedReader)
+            .finally(() => {
+              // A closed stream can still have a final event being processed.
+              // Release only after the listener has finished draining it.
+              // A processing failure can leave the stream open; cancel it too.
+              // Preserve the original failure if the stream already errored.
+              // Error settlement must not wait for transport cleanup.
+              void subscribedReader.cancel().catch(() => undefined)
+              subscribedReader.releaseLock()
+              if (eventReader === subscribedReader) eventReader = undefined
+            })
+            .then(
+              () =>
+                reportStreamEnd(
+                  new Error(`TrailBase change stream closed`),
+                  true,
+                ),
+              (error: unknown) => reportStreamEnd(error),
+            )
+          listening = true
+          settleListener()
+
           // Eager mode: perform initial fetch to populate everything
           if (internalSyncMode === `eager`) {
             // Load everything on initial load.
-            await load({})
+            await load({}, true)
+            if (cancelled) return
             fullSyncCompleted = true
           }
-        } catch (e) {
+          // After this run's fail(), markReady() does nothing.
+          if (!cancelled) markReady()
+        } catch (error) {
+          // An abandoned startup must not cancel a replacement provider session's reader.
+          if (cancelled) return
+          settleListener({ error })
           cancelEventReader()
-          throw e
-        } finally {
-          // Mark ready both if everything went well or if there's an error to
-          // avoid blocking apps waiting for `.preload()` to finish.
-          markReady()
+          reportStreamEnd(error, true)
+          return
         }
 
         // Lastly, start a periodic cleanup task that will be removed when the
         // reader closes.
-        const periodicCleanupTask = setInterval(() => {
+        if (cancelled || !reader) return
+
+        periodicCleanupTask = setInterval(() => {
           seenIds.setState((curr) => {
             const now = Date.now()
             let anyExpired = false
@@ -337,17 +505,25 @@ export function trailBaseCollectionOptions<
           })
         }, 120 * 1000)
 
-        reader.closed.finally(() => clearInterval(periodicCleanupTask))
+        const clearCleanupTask = () => {
+          if (periodicCleanupTask !== undefined) {
+            clearInterval(periodicCleanupTask)
+            periodicCleanupTask = undefined
+          }
+        }
+        // listen() reports read errors. Observe this separate promise too.
+        void reader.closed.then(clearCleanupTask, clearCleanupTask)
       }
 
-      start()
+      void start()
 
       // Eager mode doesn't need subset loading
       if (internalSyncMode === `eager`) {
-        return
+        return { cleanup }
       }
 
       return {
+        cleanup,
         loadSubset: load,
         getSyncMetadata: () =>
           ({
@@ -363,13 +539,18 @@ export function trailBaseCollectionOptions<
       }) as const,
   }
 
-  return {
-    ...config,
+  const {
+    recordApi: _recordApi,
+    parse: _parse,
+    serialize: _serialize,
+    ...collectionConfig
+  } = config
+
+  const options = {
+    ...collectionConfig,
     sync,
     getKey,
-    onInsert: async (
-      params: InsertMutationFnParams<TItem, TKey>,
-    ): Promise<Array<number | string>> => {
+    onInsert: async (params: InsertMutationFnParams<TItem, TKey>) => {
       const ids = await config.recordApi.createBulk(
         params.transaction.mutations.map((tx) => {
           const { type, modified } = tx
@@ -384,8 +565,6 @@ export function trailBaseCollectionOptions<
       // we have to ensure that the new record was properly added to the local
       // DB by the subscription.
       await awaitIds(ids.map((id) => String(id)))
-
-      return ids
     },
     onUpdate: async (params: UpdateMutationFnParams<TItem, TKey>) => {
       const ids: Array<string> = await Promise.all(
@@ -428,6 +607,11 @@ export function trailBaseCollectionOptions<
       cancel: cancelEventReader,
     },
   }
+
+  return withCollectionConfigFactory(
+    options,
+    () => trailBaseCollectionOptions(config) as typeof options,
+  )
 }
 
 function buildOrder(opts: LoadSubsetOptions): undefined | Array<string> {

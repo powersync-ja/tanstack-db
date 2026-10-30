@@ -4,7 +4,10 @@ import { join } from 'node:path'
 import { afterAll, afterEach, beforeAll } from 'vitest'
 import { BTreeIndex, createCollection } from '@tanstack/db'
 import { persistedCollectionOptions } from '../src'
-import { generateSeedData } from '../../db-collection-e2e/src/fixtures/seed-data'
+import {
+  captureSeedData,
+  generateSeedData,
+} from '../../db-collection-e2e/src/fixtures/seed-data'
 import { runPersistedCollectionConformanceSuite } from '../../db-sqlite-persistence-core/tests/contracts/persisted-collection-conformance-contract'
 import { createExpoSQLiteTestDatabase } from '../tests/helpers/expo-sqlite-test-db'
 import type { Collection } from '@tanstack/db'
@@ -43,17 +46,20 @@ function createPersistedCollection<T extends PersistableRow>(
       return
     }
     seedTxSequence++
-    await persistence.adapter.applyCommittedTx(id, {
-      txId: `seed-${id}-${seedTxSequence}`,
-      term: 1,
-      seq: seedTxSequence,
-      rowVersion: seedTxSequence,
-      mutations: rows.map((row) => ({
-        type: `insert` as const,
-        key: row.id,
-        value: row,
-      })),
-    })
+    await persistence.adapter.applyCommittedTx(
+      { kind: `eager`, collectionId: id },
+      {
+        txId: `seed-${id}-${seedTxSequence}`,
+        term: 1,
+        seq: seedTxSequence,
+        rowVersion: seedTxSequence,
+        mutations: rows.map((row) => ({
+          type: `insert` as const,
+          key: row.id,
+          value: row,
+        })),
+      },
+    )
   }
 
   const collection = createCollection(
@@ -74,15 +80,13 @@ function createPersistedCollection<T extends PersistableRow>(
 }
 
 type PersistedTransactionHandle = {
-  isPersisted: {
-    promise: Promise<unknown>
-  }
+  when: (state: 'settled') => Promise<unknown>
 }
 
 async function waitForPersisted(
   transaction: PersistedTransactionHandle,
 ): Promise<void> {
-  await transaction.isPersisted.promise
+  await transaction.when(`settled`)
 }
 
 async function seedCollection<T extends PersistableRow>(
@@ -148,6 +152,11 @@ export function runMobilePersistedCollectionConformanceSuite(
       filename: dbPath,
     })
     const seedData = generateSeedData()
+    const fixture = captureSeedData(seedData, {
+      registration:
+        'packages/expo-db-sqlite-persistence/e2e/mobile-persisted-collection-conformance-suite.ts',
+      provider: 'Expo test database and supplied persistence factory',
+    })
 
     const eagerUsers = createPersistedCollection<User>(
       database,
@@ -201,6 +210,7 @@ export function runMobilePersistedCollectionConformanceSuite(
     await onDemandComments.seedPersisted(seedData.comments)
 
     config = {
+      fixture,
       collections: {
         eager: {
           users: eagerUsers.collection,
@@ -234,6 +244,11 @@ export function runMobilePersistedCollectionConformanceSuite(
           insertRowIntoCollections(
             [eagerPosts.collection, onDemandPosts.collection],
             post,
+          ),
+        deletePost: async (id) =>
+          deleteRowAcrossCollections(
+            [eagerPosts.collection, onDemandPosts.collection],
+            id,
           ),
       },
       setup: async () => {},

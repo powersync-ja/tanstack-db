@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest'
-import { createCollection } from '@tanstack/db'
+import { describe, expect, it, vi } from 'vitest'
+import { createCollection, createTransaction } from '@tanstack/db'
 import {
   addRxPlugin,
   createRxDatabase,
@@ -8,6 +8,7 @@ import {
 import { RxDBDevModePlugin } from 'rxdb/plugins/dev-mode'
 import { getRxStorageMemory } from 'rxdb/plugins/storage-memory'
 import { wrappedValidateAjvStorage } from 'rxdb/plugins/validate-ajv'
+import { Subject } from 'rxjs'
 import { stripVirtualProps } from '../../db/tests/utils'
 import { OPEN_RXDB_SUBSCRIPTIONS, rxdbCollectionOptions } from '../src/rxdb'
 import type { RxCollection } from 'rxdb/plugins/core'
@@ -21,6 +22,14 @@ type RxCollections = { test: RxCollection<TestDocType> }
 
 // Helper to advance timers and allow microtasks to flush
 const flushPromises = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+function createDeferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
+}
 
 describe(`RxDB Integration`, () => {
   addRxPlugin(RxDBDevModePlugin)
@@ -103,6 +112,349 @@ describe(`RxDB Integration`, () => {
   }
 
   describe(`sync`, () => {
+    it(`reports an initial storage query failure`, async () => {
+      const db = await getDatababase()
+      const rxCollection: RxCollection<TestDocType> = db.test
+      const initialError = new Error(`initial RxDB query failed`)
+      const query = vi
+        .spyOn(rxCollection.storageInstance, `query`)
+        .mockRejectedValueOnce(initialError)
+      const collection = createCollection(
+        rxdbCollectionOptions({
+          rxCollection,
+          startSync: true,
+          syncBatchSize: 10,
+        }),
+      )
+
+      try {
+        await expect(collection.preload()).rejects.toBe(initialError)
+        expect(collection.status).toBe(`error`)
+        expect(OPEN_RXDB_SUBSCRIPTIONS.get(rxCollection)?.size ?? 0).toBe(0)
+
+        await rxCollection.insert({ id: `after-failure`, name: `failed` })
+        await flushPromises()
+        expect(OPEN_RXDB_SUBSCRIPTIONS.get(rxCollection)?.size ?? 0).toBe(0)
+        expect(collection.has(`after-failure`)).toBe(false)
+      } finally {
+        query.mockRestore()
+        await collection.cleanup()
+        await db.remove()
+      }
+    })
+
+    // A reload runs `sync` again while the Collection still shows `error`.
+    // The new run's readiness, not that status, decides its outcome.
+    it.each([`ok`, `fail`] as const)(
+      `settles a reload after a failed first load: new run %s`,
+      async (outcome) => {
+        const db = await getDatababase(getTestData(1))
+        const rxCollection: RxCollection<TestDocType> = db.test
+        const query = vi
+          .spyOn(rxCollection.storageInstance, `query`)
+          .mockRejectedValueOnce(new Error(`first query failed`))
+        if (outcome === `fail`)
+          query.mockRejectedValueOnce(new Error(`reload query failed`))
+        const collection = createCollection(
+          rxdbCollectionOptions({
+            rxCollection,
+            startSync: true,
+            syncBatchSize: 10,
+          }),
+        )
+        try {
+          await collection.preload().catch(() => undefined)
+          expect(collection.status).toBe(`error`)
+          const settled = await Promise.race([
+            collection.reload().then(
+              () => `resolved`,
+              () => `rejected`,
+            ),
+            new Promise((resolve) => setTimeout(() => resolve(`pending`), 500)),
+          ])
+          expect(settled).toBe(outcome === `ok` ? `resolved` : `rejected`)
+          expect(collection.status).toBe(outcome === `ok` ? `ready` : `error`)
+          if (outcome === `ok`) expect(collection.size).toBe(1)
+          else
+            expect(collection.health.error?.message).toBe(`reload query failed`)
+        } finally {
+          query.mockRestore()
+          await collection.cleanup()
+          await db.remove()
+        }
+      },
+    )
+
+    // The change stream is how the Collection learns of later writes. When it
+    // errors it ends, so the sync adapter has stopped: before the first ready
+    // the first load fails, and after it the rows stay and the node's `error`
+    // holds the cause until a reload.
+    it.each([`before`, `after`] as const)(
+      `fails when the change stream errors %s the first ready`,
+      async (when) => {
+        const db = await getDatababase(getTestData(1))
+        const rxCollection: RxCollection<TestDocType> = db.test
+        const changes = new Subject<never>()
+        const streamError = new Error(`RxDB change stream failed`)
+        const stream = vi
+          .spyOn(rxCollection, `$`, `get`)
+          .mockReturnValue(changes.asObservable() as never)
+        const releaseQuery = createDeferred<void>()
+        const storageQuery = rxCollection.storageInstance.query.bind(
+          rxCollection.storageInstance,
+        )
+        const query = vi
+          .spyOn(rxCollection.storageInstance, `query`)
+          .mockImplementationOnce(async (preparedQuery) => {
+            await releaseQuery.promise
+            return storageQuery(preparedQuery)
+          })
+        const collection = createCollection(
+          rxdbCollectionOptions({
+            rxCollection,
+            startSync: true,
+            syncBatchSize: 10,
+          }),
+        )
+        try {
+          if (when === `before`) {
+            const preload = collection.preload()
+            changes.error(streamError)
+            releaseQuery.resolve()
+            await expect(preload).rejects.toBe(streamError)
+            expect(collection.status).toBe(`error`)
+          } else {
+            releaseQuery.resolve()
+            await collection.preload()
+            changes.error(streamError)
+            expect(collection.status).toBe(`ready`)
+            expect(collection.size).toBe(1)
+            expect(collection.health.error?.message).toBe(streamError.message)
+            expect(collection.health.failureReason).toBeNull()
+          }
+          expect(OPEN_RXDB_SUBSCRIPTIONS.get(rxCollection)?.size ?? 0).toBe(0)
+        } finally {
+          releaseQuery.resolve()
+          query.mockRestore()
+          stream.mockRestore()
+          await collection.cleanup()
+          await db.remove()
+        }
+      },
+    )
+
+    // Receiving witness for the reload law (owner: the source-health oracle;
+    // maintainer decision F19): a reload keeps the rows on screen until it
+    // completes and then ends with the source's current rows. The first run
+    // listens to a change stream that never emits, so it misses an update, a
+    // delete, and an insert in RxDB and the Collection holds stale rows, one
+    // of them a row RxDB deleted. The reload's run listens to RxDB's own
+    // stream, and its initial fetch is held: until the fetch lands the stale
+    // rows stay; after it the rows equal RxDB's documents, so the deleted
+    // row is gone. The documents span two fetch batches.
+    it(`a reload of a ready Collection keeps its rows and ends with the documents`, async () => {
+      const db = await getDatababase(getTestData(12))
+      const rxCollection: RxCollection<TestDocType> = db.test
+      const silent = new Subject<never>()
+      const stream = vi
+        .spyOn(rxCollection, `$`, `get`)
+        .mockReturnValueOnce(silent.asObservable() as never)
+      const collection = createCollection(
+        rxdbCollectionOptions({
+          rxCollection,
+          startSync: true,
+          syncBatchSize: 10,
+        }),
+      )
+      const rows = () =>
+        new Map(collection.toArray.map((row) => [row.id, row.name]))
+      const documents = async () =>
+        new Map(
+          (await rxCollection.find().exec()).map((doc) => [doc.id, doc.name]),
+        )
+      const releaseFetch = createDeferred<void>()
+      const storageQuery = rxCollection.storageInstance.query.bind(
+        rxCollection.storageInstance,
+      )
+      let query: { mockRestore: () => void } | undefined
+      try {
+        await collection.preload()
+        // Only the first run listens to the silent stream.
+        stream.mockRestore()
+        await (await rxCollection.findOne(`1`).exec())!.incrementalPatch({
+          name: `edited`,
+        })
+        await (await rxCollection.findOne(`2`).exec())!.remove()
+        await rxCollection.insert({ id: `new`, name: `new` })
+        await flushPromises()
+        const stale = rows()
+        expect(stale.has(`2`)).toBe(true)
+        expect(stale).not.toEqual(await documents())
+
+        query = vi
+          .spyOn(rxCollection.storageInstance, `query`)
+          .mockImplementationOnce(async (preparedQuery) => {
+            await releaseFetch.promise
+            return storageQuery(preparedQuery)
+          })
+        let settled = false
+        const reload = collection.reload().then(() => (settled = true))
+        await flushPromises()
+        expect(rows(), `the rows stay until the fetch lands`).toEqual(stale)
+        expect(settled).toBe(false)
+
+        releaseFetch.resolve()
+        await Promise.race([
+          reload,
+          new Promise((resolve) => setTimeout(resolve, 500)),
+        ])
+        expect(settled).toBe(true)
+        expect(collection.status).toBe(`ready`)
+        expect(rows()).toEqual(await documents())
+      } finally {
+        releaseFetch.resolve()
+        query?.mockRestore()
+        stream.mockRestore()
+        await collection.cleanup()
+        await db.remove()
+      }
+    })
+
+    it(`marks initial sync ready only after its rows are applied`, async () => {
+      const db = await getDatababase([{ id: `server`, name: `Server` }])
+      const rxCollection: RxCollection<TestDocType> = db.test
+      const releaseInitialQuery = createDeferred<void>()
+      const initialQueryStarted = createDeferred<void>()
+      const storageQuery = rxCollection.storageInstance.query.bind(
+        rxCollection.storageInstance,
+      )
+      const query = vi
+        .spyOn(rxCollection.storageInstance, `query`)
+        .mockImplementationOnce(async (preparedQuery) => {
+          const result = await storageQuery(preparedQuery)
+          initialQueryStarted.resolve()
+          await releaseInitialQuery.promise
+          return result
+        })
+      const collection = createCollection(
+        rxdbCollectionOptions({
+          rxCollection,
+          startSync: true,
+          syncBatchSize: 10,
+        }),
+      )
+      const persistence = createDeferred<void>()
+      const transaction = createTransaction({
+        mutationFn: () => persistence.promise,
+      })
+
+      try {
+        await initialQueryStarted.promise
+        transaction.mutate(() =>
+          collection.insert({ id: `local`, name: `Local` }),
+        )
+        const buffered = await rxCollection.insert({
+          id: `buffered`,
+          name: `Buffered`,
+        })
+        releaseInitialQuery.resolve()
+
+        const ready = collection.preload()
+        await flushPromises()
+
+        // The initial receipt is still parked. A later live change for the
+        // same row must not overtake the older buffered insert.
+        await buffered.getLatest().patch({ name: `Newest` })
+        await flushPromises()
+
+        expect(collection.status).toBe(`loading`)
+        expect(collection.get(`server`)).toBeUndefined()
+        expect(collection.get(`buffered`)).toBeUndefined()
+
+        persistence.resolve()
+        await transaction.when(`settled`)
+        await ready
+
+        expect(collection.get(`server`)).toEqual(
+          expect.objectContaining({ id: `server`, name: `Server` }),
+        )
+        expect(collection.get(`buffered`)).toEqual(
+          expect.objectContaining({ id: `buffered`, name: `Newest` }),
+        )
+        expect(collection.status).toBe(`ready`)
+      } finally {
+        releaseInitialQuery.resolve()
+        persistence.resolve()
+        await transaction.when(`settled`).catch(() => undefined)
+        query.mockRestore()
+        await collection.cleanup()
+        await db.remove()
+      }
+    })
+
+    it(`does not let later live traffic extend the startup readiness boundary`, async () => {
+      const db = await getDatababase()
+      const rxCollection: RxCollection<TestDocType> = db.test
+      const initialQueryStarted = createDeferred<void>()
+      const releaseInitialQuery = createDeferred<void>()
+      const bufferedApplied = createDeferred<void>()
+      const laterLiveApplied = createDeferred<void>()
+      const storageQuery = rxCollection.storageInstance.query.bind(
+        rxCollection.storageInstance,
+      )
+      const query = vi
+        .spyOn(rxCollection.storageInstance, `query`)
+        .mockImplementationOnce(async (preparedQuery) => {
+          const result = await storageQuery(preparedQuery)
+          initialQueryStarted.resolve()
+          await releaseInitialQuery.promise
+          return result
+        })
+      const options = rxdbCollectionOptions({ rxCollection })
+      const begin = vi.fn()
+      const write = vi.fn()
+      const commit = vi
+        .fn()
+        .mockReturnValueOnce(true)
+        .mockReturnValueOnce(bufferedApplied.promise)
+        .mockReturnValueOnce(laterLiveApplied.promise)
+      const markReady = vi.fn()
+      const fail = vi.fn()
+      const cleanup = options.sync.sync({
+        begin,
+        write,
+        commit,
+        markReady,
+        fail,
+        // A first load: the Collection holds no synced rows.
+        collection: {
+          status: `loading`,
+          _state: { acceptedSyncedEntries: () => new Map().entries() },
+        },
+      } as never)
+
+      try {
+        await initialQueryStarted.promise
+        await rxCollection.insert({ id: `buffered`, name: `Buffered` })
+        releaseInitialQuery.resolve()
+        await vi.waitFor(() => expect(commit).toHaveBeenCalledTimes(2))
+
+        await rxCollection.insert({ id: `later`, name: `Later` })
+        await vi.waitFor(() => expect(commit).toHaveBeenCalledTimes(3))
+        expect(markReady).not.toHaveBeenCalled()
+
+        bufferedApplied.resolve()
+        await vi.waitFor(() => expect(markReady).toHaveBeenCalledOnce())
+      } finally {
+        releaseInitialQuery.resolve()
+        bufferedApplied.resolve()
+        laterLiveApplied.resolve()
+        if (typeof cleanup === `function`) cleanup()
+        query.mockRestore()
+        await db.remove()
+      }
+    })
+
     it(`should initialize and fetch initial data`, async () => {
       const initialItems = getTestData(2)
 
@@ -185,7 +537,7 @@ describe(`RxDB Integration`, () => {
 
       // inserts
       const tx = collection.insert({ id: `3`, name: `inserted` })
-      await tx.isPersisted.promise
+      await tx.when(`settled`)
       let doc = await rxCollection.findOne(`3`).exec(true)
       expect(doc.name).toEqual(`inserted`)
 
@@ -295,32 +647,135 @@ describe(`RxDB Integration`, () => {
   })
 
   describe(`error handling`, () => {
-    it.skip(`should rollback the transaction on invalid data that does not match the RxCollection schema`, async () => {
+    function expectAdditionalPropertyError(error: unknown, id: string) {
+      expect(error).toBeInstanceOf(Error)
+      expect(error).toHaveProperty(
+        `message`,
+        expect.stringMatching(/schema validation error/),
+      )
+      expect(error).toMatchObject({
+        code: `COL20`,
+        rxdb: true,
+        parameters: {
+          document: id,
+          writeError: {
+            status: 422,
+            documentId: id,
+            validationErrors: expect.arrayContaining([
+              expect.objectContaining({
+                keyword: `additionalProperties`,
+                params: { additionalProperty: `foo` },
+              }),
+            ]),
+          },
+        },
+      })
+    }
+
+    it(`rejects an extra field at the provider and accepts its valid neighbor`, async () => {
+      const db = await getDatababase()
+      try {
+        const invalid = { id: `3`, name: `invalid`, foo: `bar` }
+        const rejected = await db.test.bulkUpsert([invalid])
+        expect(rejected.success).toEqual([])
+        expect(rejected.error).toHaveLength(1)
+        expect(rejected.error[0]).toMatchObject({
+          status: 422,
+          documentId: `3`,
+          validationErrors: expect.arrayContaining([
+            expect.objectContaining({
+              keyword: `additionalProperties`,
+              params: { additionalProperty: `foo` },
+            }),
+          ]),
+        })
+        expect(await db.test.find().exec()).toEqual([])
+
+        const accepted = await db.test.bulkUpsert([
+          { id: `3`, name: `invalid` },
+        ])
+        expect(accepted.error).toEqual([])
+        expect(accepted.success).toHaveLength(1)
+        const rows = await db.test.find().exec()
+        expect(rows.map((row) => ({ id: row.id, name: row.name }))).toEqual([
+          { id: `3`, name: `invalid` },
+        ])
+        expect(rows[0]!.toJSON()).not.toHaveProperty(`foo`)
+      } finally {
+        await db.remove()
+      }
+    })
+
+    it(`should rollback the transaction on invalid data that does not match the RxCollection schema`, async () => {
       const initialItems = getTestData(2)
-      const { collection, db } = await createTestState(initialItems)
+      const { collection, rxCollection, db } =
+        await createTestState(initialItems)
+      const outcomes: Array<Promise<unknown>> = []
+      const observe = (promise: Promise<unknown>) => {
+        const outcome = promise.then(
+          () => ({ status: `fulfilled` as const }),
+          (error: unknown) => ({ status: `rejected` as const, error }),
+        )
+        outcomes.push(outcome)
+        return outcome
+      }
+      const expectRows = async (expected: Array<TestDocType>) => {
+        expect(collection.toArray.map((row) => stripVirtualProps(row))).toEqual(
+          expected,
+        )
+        const stored = await rxCollection.find().exec()
+        expect(stored.map((row) => ({ id: row.id, name: row.name }))).toEqual(
+          expected,
+        )
+        for (const row of stored) {
+          expect(row.toJSON()).not.toHaveProperty(`foo`)
+        }
+      }
 
-      // INSERT
-      await expect(async () => {
-        const tx = collection.insert({
-          id: `3`,
-          name: `invalid`,
-          foo: `bar`,
+      try {
+        // Both old invalid inputs reach the actual provider through persistence.
+        const invalid = { id: `3`, name: `invalid`, foo: `bar` }
+        const insert = collection.insert(invalid)
+        const inserted = observe(insert.when(`settled`))
+        expect(collection.has(`3`)).toBe(true)
+        const insertOutcome = await inserted
+        expect(insertOutcome.status).toBe(`rejected`)
+        if (insertOutcome.status !== `rejected`) {
+          throw new Error(`Invalid insert unexpectedly persisted`)
+        }
+        expectAdditionalPropertyError(insertOutcome.error, `3`)
+        expect(collection.has(`3`)).toBe(false)
+        await expectRows(initialItems)
+
+        const update = collection.update(`2`, (draft) => {
+          Object.assign(draft, { name: `invalid`, foo: `bar` })
         })
-        await tx.isPersisted.promise
-      }).rejects.toThrow(/schema validation error/)
-      expect(collection.has(`3`)).toBe(false)
+        const updated = observe(update.when(`settled`))
+        expect(collection.get(`2`)?.name).toBe(`invalid`)
+        const updateOutcome = await updated
+        expect(updateOutcome.status).toBe(`rejected`)
+        if (updateOutcome.status !== `rejected`) {
+          throw new Error(`Invalid update unexpectedly persisted`)
+        }
+        expectAdditionalPropertyError(updateOutcome.error, `2`)
+        expect(stripVirtualProps(collection.get(`2`))?.name).toBe(`Item 2`)
+        await expectRows(initialItems)
 
-      // UPDATE
-      await expect(async () => {
-        const tx = collection.update(`2`, (d) => {
-          d.name = `invalid`
-          d.foo = `bar`
+        const next = collection.update(`2`, (draft) => {
+          draft.name = `Valid`
         })
-        await tx.isPersisted.promise
-      }).rejects.toThrow(/schema validation error/)
-      expect(stripVirtualProps(collection.get(`2`))?.name).toBe(`Item 2`)
-
-      await db.remove()
+        expect(await observe(next.when(`settled`))).toEqual({
+          status: `fulfilled`,
+        })
+        await expectRows([
+          { id: `1`, name: `Item 1` },
+          { id: `2`, name: `Valid` },
+        ])
+      } finally {
+        await Promise.all(outcomes)
+        await collection.cleanup()
+        await db.remove()
+      }
     })
   })
 })

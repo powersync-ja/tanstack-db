@@ -24,15 +24,16 @@ export const Route = createFileRoute(`/electric`)({
 
 function ElectricPage() {
   // Get data using live queries with Electric collections
-  const { data: todos } = useLiveQuery((q) =>
-    q
-      .from({ todo: electricTodoCollection })
-      .orderBy(({ todo }) => todo.created_at, `asc`),
-  )
+  const { data: todos } = useLiveQuery({
+    query: (q) =>
+      q
+        .from({ todo: electricTodoCollection })
+        .orderBy(({ todo }) => todo.created_at, `asc`),
+  })
 
-  const { data: configData } = useLiveQuery((q) =>
-    q.from({ config: electricConfigCollection }),
-  )
+  const { data: configData } = useLiveQuery({
+    query: (q) => q.from({ config: electricConfigCollection }),
+  })
 
   // Electric collections use txid to track sync
   const configMutationFn = async ({
@@ -64,7 +65,7 @@ function ElectricPage() {
 
     // Wait for all txids to sync back to the collection
     await Promise.all(
-      txids.map((txid) => electricConfigCollection.utils.awaitTxid(txid)),
+      txids.map((txid) => electricConfigCollection.utils.awaitTxId(txid)),
     )
   }
 

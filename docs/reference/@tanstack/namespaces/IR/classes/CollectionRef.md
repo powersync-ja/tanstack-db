@@ -3,9 +3,7 @@ id: CollectionRef
 title: CollectionRef
 ---
 
-# Class: CollectionRef
-
-Defined in: [packages/db/src/query/ir.ts:76](https://github.com/TanStack/db/blob/main/packages/db/src/query/ir.ts#L76)
+Defined in: [packages/db/src/query/ir.ts:91](https://github.com/TanStack/db/blob/main/packages/db/src/query/ir.ts#L91)
 
 ## Extends
 
@@ -16,18 +14,25 @@ Defined in: [packages/db/src/query/ir.ts:76](https://github.com/TanStack/db/blob
 ### Constructor
 
 ```ts
-new CollectionRef(collection, alias): CollectionRef;
+new CollectionRef(
+   collection, 
+   alias, 
+   bindingId?): CollectionRef;
 ```
 
-Defined in: [packages/db/src/query/ir.ts:78](https://github.com/TanStack/db/blob/main/packages/db/src/query/ir.ts#L78)
+Defined in: [packages/db/src/query/ir.ts:98](https://github.com/TanStack/db/blob/main/packages/db/src/query/ir.ts#L98)
 
 #### Parameters
 
 ##### collection
 
-[`CollectionImpl`](../../../../classes/CollectionImpl.md)
+[`CollectionImpl`](../../../../classes/CollectionImpl.md)\<`any`, `string` \| `number`, `any`, `any`, `any`\>
 
 ##### alias
+
+`string`
+
+##### bindingId?
 
 `string`
 
@@ -49,7 +54,7 @@ BaseExpression.constructor
 readonly __returnType: any;
 ```
 
-Defined in: [packages/db/src/query/ir.ts:73](https://github.com/TanStack/db/blob/main/packages/db/src/query/ir.ts#L73)
+Defined in: [packages/db/src/query/ir.ts:88](https://github.com/TanStack/db/blob/main/packages/db/src/query/ir.ts#L88)
 
 **`Internal`**
 
@@ -69,7 +74,7 @@ BaseExpression.__returnType
 alias: string;
 ```
 
-Defined in: [packages/db/src/query/ir.ts:80](https://github.com/TanStack/db/blob/main/packages/db/src/query/ir.ts#L80)
+Defined in: [packages/db/src/query/ir.ts:96](https://github.com/TanStack/db/blob/main/packages/db/src/query/ir.ts#L96)
 
 ***
 
@@ -79,7 +84,7 @@ Defined in: [packages/db/src/query/ir.ts:80](https://github.com/TanStack/db/blob
 collection: CollectionImpl;
 ```
 
-Defined in: [packages/db/src/query/ir.ts:79](https://github.com/TanStack/db/blob/main/packages/db/src/query/ir.ts#L79)
+Defined in: [packages/db/src/query/ir.ts:95](https://github.com/TanStack/db/blob/main/packages/db/src/query/ir.ts#L95)
 
 ***
 
@@ -89,10 +94,44 @@ Defined in: [packages/db/src/query/ir.ts:79](https://github.com/TanStack/db/blob
 type: "collectionRef";
 ```
 
-Defined in: [packages/db/src/query/ir.ts:77](https://github.com/TanStack/db/blob/main/packages/db/src/query/ir.ts#L77)
+Defined in: [packages/db/src/query/ir.ts:92](https://github.com/TanStack/db/blob/main/packages/db/src/query/ir.ts#L92)
 
 #### Overrides
 
 ```ts
 BaseExpression.type
 ```
+
+## Accessors
+
+### bindingId
+
+#### Get Signature
+
+```ts
+get bindingId(): string;
+```
+
+Defined in: [packages/db/src/query/ir.ts:114](https://github.com/TanStack/db/blob/main/packages/db/src/query/ir.ts#L114)
+
+##### Returns
+
+`string`
+
+***
+
+### sourceId
+
+#### Get Signature
+
+```ts
+get sourceId(): string;
+```
+
+Defined in: [packages/db/src/query/ir.ts:110](https://github.com/TanStack/db/blob/main/packages/db/src/query/ir.ts#L110)
+
+Opaque runtime identity; aliases are lexical names only.
+
+##### Returns
+
+`string`

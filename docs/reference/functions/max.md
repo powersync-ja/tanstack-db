@@ -3,26 +3,74 @@ id: max
 title: max
 ---
 
-# Function: max()
+## Call Signature
 
 ```ts
-function max<T>(arg): AggregateReturnType<T>;
+function max<T>(arg): Aggregate<T>;
 ```
 
-Defined in: [packages/db/src/query/builder/functions.ts:382](https://github.com/TanStack/db/blob/main/packages/db/src/query/builder/functions.ts#L382)
+Defined in: [packages/db/src/query/builder/functions.ts:694](https://github.com/TanStack/db/blob/main/packages/db/src/query/builder/functions.ts#L694)
 
-## Type Parameters
+### Type Parameters
 
-### T
+#### T
 
-`T` *extends* `ExpressionLike`
+`T` *extends* `OrderableAggregateValue`
 
-## Parameters
+### Parameters
 
-### arg
+#### arg
 
 `T`
 
-## Returns
+### Returns
 
-`AggregateReturnType`\<`T`\>
+[`Aggregate`](../@tanstack/namespaces/IR/classes/Aggregate.md)\<`T`\>
+
+## Call Signature
+
+```ts
+function max<T>(arg): Aggregate<T>;
+```
+
+Defined in: [packages/db/src/query/builder/functions.ts:695](https://github.com/TanStack/db/blob/main/packages/db/src/query/builder/functions.ts#L695)
+
+### Type Parameters
+
+#### T
+
+`T`
+
+### Parameters
+
+#### arg
+
+`OrderableAggregateWrapperArgument`\<`T`\>
+
+### Returns
+
+[`Aggregate`](../@tanstack/namespaces/IR/classes/Aggregate.md)\<`T`\>
+
+## Call Signature
+
+```ts
+function max<T>(arg): Aggregate<ExtractType<T>>;
+```
+
+Defined in: [packages/db/src/query/builder/functions.ts:696](https://github.com/TanStack/db/blob/main/packages/db/src/query/builder/functions.ts#L696)
+
+### Type Parameters
+
+#### T
+
+`T` *extends* `ExpressionLike`
+
+### Parameters
+
+#### arg
+
+`OrderableAggregateArgument`\<`T`\>
+
+### Returns
+
+[`Aggregate`](../@tanstack/namespaces/IR/classes/Aggregate.md)\<`ExtractType`\<`T`\>\>

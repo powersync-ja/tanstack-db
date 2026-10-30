@@ -3,9 +3,7 @@ id: ParseWhereOptions
 title: ParseWhereOptions
 ---
 
-# Interface: ParseWhereOptions\<T\>
-
-Defined in: [packages/db/src/query/expression-helpers.ts:53](https://github.com/TanStack/db/blob/main/packages/db/src/query/expression-helpers.ts#L53)
+Defined in: [packages/db/src/query/expression-helpers.ts:54](https://github.com/TanStack/db/blob/main/packages/db/src/query/expression-helpers.ts#L54)
 
 Options for customizing how WHERE expressions are parsed
 
@@ -23,7 +21,7 @@ Options for customizing how WHERE expressions are parsed
 handlers: object & object;
 ```
 
-Defined in: [packages/db/src/query/expression-helpers.ts:67](https://github.com/TanStack/db/blob/main/packages/db/src/query/expression-helpers.ts#L67)
+Defined in: [packages/db/src/query/expression-helpers.ts:68](https://github.com/TanStack/db/blob/main/packages/db/src/query/expression-helpers.ts#L68)
 
 Handler functions for different operators.
 Each handler receives the parsed field path(s) and value(s) and returns your custom format.
@@ -87,6 +85,22 @@ optional avg: (...args) => T;
 
 `T`
 
+##### caseWhen()?
+
+```ts
+optional caseWhen: (...args) => T;
+```
+
+###### Parameters
+
+###### args
+
+...`any`[]
+
+###### Returns
+
+`T`
+
 ##### coalesce()?
 
 ```ts
@@ -123,6 +137,22 @@ optional concat: (...args) => T;
 
 ```ts
 optional count: (...args) => T;
+```
+
+###### Parameters
+
+###### args
+
+...`any`[]
+
+###### Returns
+
+`T`
+
+##### divide()?
+
+```ts
+optional divide: (...args) => T;
 ```
 
 ###### Parameters
@@ -359,6 +389,22 @@ optional min: (...args) => T;
 
 `T`
 
+##### multiply()?
+
+```ts
+optional multiply: (...args) => T;
+```
+
+###### Parameters
+
+###### args
+
+...`any`[]
+
+###### Returns
+
+`T`
+
 ##### not()?
 
 ```ts
@@ -379,6 +425,22 @@ optional not: (...args) => T;
 
 ```ts
 optional or: (...args) => T;
+```
+
+###### Parameters
+
+###### args
+
+...`any`[]
+
+###### Returns
+
+`T`
+
+##### subtract()?
+
+```ts
+optional subtract: (...args) => T;
 ```
 
 ###### Parameters
@@ -431,7 +493,7 @@ optional upper: (...args) => T;
 optional onUnknownOperator: (operator, args) => T;
 ```
 
-Defined in: [packages/db/src/query/expression-helpers.ts:76](https://github.com/TanStack/db/blob/main/packages/db/src/query/expression-helpers.ts#L76)
+Defined in: [packages/db/src/query/expression-helpers.ts:77](https://github.com/TanStack/db/blob/main/packages/db/src/query/expression-helpers.ts#L77)
 
 Optional handler for when an unknown operator is encountered.
 If not provided, unknown operators throw an error.

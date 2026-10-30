@@ -1,13 +1,14 @@
 export type BrowserOPFSWorkerErrorCode =
-  | `INVALID_CONFIG`
-  | `PERSISTENCE_UNAVAILABLE`
-  | `INTERNAL`
+  `INVALID_CONFIG` | `PERSISTENCE_UNAVAILABLE` | `INTERNAL`
 
 export type BrowserOPFSWorkerInitRequest = {
   type: `init`
   requestId: string
   databaseName: string
   vfsName: string
+  wasmUrl: string
+  // The opener's build; see package-version.ts.
+  packageVersion: string
 }
 
 export type BrowserOPFSWorkerExecuteRequest = {
@@ -43,5 +44,4 @@ export type BrowserOPFSWorkerErrorResponse = {
 }
 
 export type BrowserOPFSWorkerResponse =
-  | BrowserOPFSWorkerSuccessResponse
-  | BrowserOPFSWorkerErrorResponse
+  BrowserOPFSWorkerSuccessResponse | BrowserOPFSWorkerErrorResponse

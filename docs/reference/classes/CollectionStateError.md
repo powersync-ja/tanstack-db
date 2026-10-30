@@ -3,9 +3,7 @@ id: CollectionStateError
 title: CollectionStateError
 ---
 
-# Class: CollectionStateError
-
-Defined in: [packages/db/src/errors.ts:103](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L103)
+Defined in: [packages/db/src/errors.ts:135](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L135)
 
 ## Extends
 
@@ -14,9 +12,14 @@ Defined in: [packages/db/src/errors.ts:103](https://github.com/TanStack/db/blob/
 ## Extended by
 
 - [`CollectionInErrorStateError`](CollectionInErrorStateError.md)
+- [`CollectionHasSubscribersError`](CollectionHasSubscribersError.md)
+- [`CollectionReloadCrashedError`](CollectionReloadCrashedError.md)
+- [`CollectionReloadDuringSyncEntryError`](CollectionReloadDuringSyncEntryError.md)
 - [`InvalidCollectionStatusTransitionError`](InvalidCollectionStatusTransitionError.md)
 - [`CollectionIsInErrorStateError`](CollectionIsInErrorStateError.md)
 - [`NegativeActiveSubscribersError`](NegativeActiveSubscribersError.md)
+- [`LiveQueryObserverDisposedError`](LiveQueryObserverDisposedError.md)
+- [`LiveQueryWindowControllerDisposedError`](LiveQueryWindowControllerDisposedError.md)
 
 ## Constructors
 
@@ -26,7 +29,7 @@ Defined in: [packages/db/src/errors.ts:103](https://github.com/TanStack/db/blob/
 new CollectionStateError(message): CollectionStateError;
 ```
 
-Defined in: [packages/db/src/errors.ts:104](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L104)
+Defined in: [packages/db/src/errors.ts:136](https://github.com/TanStack/db/blob/main/packages/db/src/errors.ts#L136)
 
 #### Parameters
 

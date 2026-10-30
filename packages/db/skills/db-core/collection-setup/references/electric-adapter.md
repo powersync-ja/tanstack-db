@@ -15,7 +15,7 @@ import { electricCollectionOptions } from '@tanstack/electric-db-collection'
 const collection = createCollection(
   electricCollectionOptions({
     shapeOptions: { url: '/api/todos' },
-    getKey: (item) => item.id,
+    getKey: (item: { id: string }) => item.id,
   }),
 )
 ```
@@ -30,20 +30,33 @@ const collection = createCollection(
 | `id`                  | (none)  | Unique collection identifier                        |
 | `schema`              | (none)  | StandardSchema validator                            |
 | `shapeOptions.params` | (none)  | Additional shape params (e.g. `{ table: 'todos' }`) |
-| `onInsert`            | (none)  | Persistence handler; should return `{ txid }`       |
-| `onUpdate`            | (none)  | Persistence handler; should return `{ txid }`       |
-| `onDelete`            | (none)  | Persistence handler; should return `{ txid }`       |
+| `syncMode`            | `eager` | `eager`, `on-demand`, or `progressive`              |
+| `onInsert`            | (none)  | Persistence handler; await sync before completing   |
+| `onUpdate`            | (none)  | Persistence handler; await sync before completing   |
+| `onDelete`            | (none)  | Persistence handler; await sync before completing   |
+
+## Sync Modes
+
+- `eager` loads the full shape before use.
+- `on-demand` loads only the subsets requested by live queries.
+- `progressive` loads the requested subset first, then completes the full sync
+  in the background.
+
+With SQLite persistence, progressive resume keeps hydrated rows visible while
+the full Electric stream resumes. On-demand subset snapshots use a bounded
+refresh wait, so a stalled native long-poll refresh does not block loading
+forever.
 
 ## Three Sync Strategies
 
-### 1. Txid Return (Recommended)
+### 1. Await Txid (Recommended)
 
-Handler returns `{ txid }`. Client waits for that txid in the Electric stream.
+The handler waits for the backend's txid in the Electric stream.
 
-```typescript
-onInsert: async ({ transaction }) => {
+```typescript nocheck
+onInsert: async ({ transaction, collection }) => {
   const response = await api.todos.create(transaction.mutations[0].modified)
-  return { txid: response.txid }
+  await collection.utils.awaitTxId(response.txid)
 },
 ```
 
@@ -127,6 +140,8 @@ When using Electric with a schema, data enters the collection via **two independ
 For types that need transformation (e.g., `timestamptz`), you need BOTH configured:
 
 ```typescript
+import { z } from 'zod'
+
 const todosCollection = createCollection(
   electricCollectionOptions({
     schema: z.object({
@@ -141,7 +156,7 @@ const todosCollection = createCollection(
         timestamptz: (value: string) => new Date(value), // sync path: parse incoming strings
       },
     },
-    getKey: (item) => item.id,
+    getKey: (item: { id: string }) => item.id,
   }),
 )
 ```
@@ -217,21 +232,21 @@ const todosCollection = createCollection(
         timestamptz: (value: string) => new Date(value), // sync path
       },
     },
-    onInsert: async ({ transaction }) => {
+    onInsert: async ({ transaction, collection }) => {
       const response = await api.todos.create(transaction.mutations[0].modified)
-      return { txid: response.txid }
+      await collection.utils.awaitTxId(response.txid)
     },
-    onUpdate: async ({ transaction }) => {
+    onUpdate: async ({ transaction, collection }) => {
       const { original, changes } = transaction.mutations[0]
       const response = await api.todos.update({
         where: { id: original.id },
         data: changes,
       })
-      return { txid: response.txid }
+      await collection.utils.awaitTxId(response.txid)
     },
-    onDelete: async ({ transaction }) => {
+    onDelete: async ({ transaction, collection }) => {
       const response = await api.todos.delete(transaction.mutations[0].key)
-      return { txid: response.txid }
+      await collection.utils.awaitTxId(response.txid)
     },
   }),
 )
