@@ -4,7 +4,11 @@ import { createCollection } from '@tanstack/db'
 import { z } from 'zod'
 import { powerSyncCollectionOptions } from '../src'
 import type { PowerSyncDatabase } from '@powersync/node'
-import type { PowerSyncCollectionUtils } from '../src'
+import type {
+  PowerSyncClient,
+  PowerSyncCollectionUtils,
+  StandalonePowerSyncCollectionUtils,
+} from '../src'
 
 const APP_SCHEMA = new Schema({
   documents: new Table({
@@ -88,6 +92,69 @@ describe(`PowerSync collection type tests`, () => {
         // @ts-expect-error transformed dates do not expose string methods
         return left.created_at!.localeCompare(right.created_at!)
       },
+    })
+  })
+
+  it(`types collection.utils as StandalonePowerSyncCollectionUtils for a client`, () => {
+    const options = powerSyncCollectionOptions({
+      client: {} as PowerSyncClient,
+      table: APP_SCHEMA.props.documents,
+      streams: [{ name: `documents` }],
+      onInsert: async ({ transaction, collection }) => {
+        expectTypeOf(transaction.mutations[0].modified.name).toEqualTypeOf<
+          string | null
+        >()
+        await collection.utils.confirmWrites()
+      },
+    })
+    const collection = createCollection(options)
+
+    const utils: StandalonePowerSyncCollectionUtils = collection.utils
+    expectTypeOf(utils.confirmWrites).toBeFunction()
+    // @ts-expect-error a standalone client has no local SQLite table to describe
+    collection.utils.getMeta()
+  })
+
+  it(`types a client collection against transformed schema output`, () => {
+    const schema = z.object({
+      id: z.string(),
+      name: z.string().nullable(),
+      author: z.string().nullable(),
+      created_at: z
+        .string()
+        .nullable()
+        .transform((value) => (value ? new Date(value) : null)),
+    })
+
+    powerSyncCollectionOptions({
+      client: {} as PowerSyncClient,
+      table: APP_SCHEMA.props.documents,
+      schema,
+      onDeserializationError: () => {},
+      syncMode: `on-demand`,
+      getSubscriptions: () => [{ name: `documents` }],
+      compare: (left, right) => {
+        expectTypeOf(left).toEqualTypeOf<z.infer<typeof schema>>()
+        return (
+          (left.created_at?.getTime() ?? 0) - (right.created_at?.getTime() ?? 0)
+        )
+      },
+    })
+  })
+
+  it(`rejects SQLite-only options for a client`, () => {
+    powerSyncCollectionOptions({
+      client: {} as PowerSyncClient,
+      table: APP_SCHEMA.props.documents,
+      // @ts-expect-error batching reads applies to a local SQLite database only
+      syncBatchSize: 10,
+    })
+
+    // @ts-expect-error getSubscriptions requires syncMode: 'on-demand'
+    powerSyncCollectionOptions({
+      client: {} as PowerSyncClient,
+      table: APP_SCHEMA.props.documents,
+      getSubscriptions: () => [],
     })
   })
 })

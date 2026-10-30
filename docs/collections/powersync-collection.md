@@ -531,6 +531,48 @@ interface PowerSyncCollectionConfig<TTable extends Table, TSchema> {
 }
 ```
 
+## Standalone Client (No Local Database)
+
+Instead of opening a full PowerSync database, you can also pass a `client` parameter instead of `database`.
+This uses a standalone client syncing rows directly to Tanstack DB collections, without a local SQLite database.
+
+```ts
+import { PowerSyncClient, powerSyncCollectionOptions } from '@tanstack/powersync-db-collection'
+
+const client = new PowerSyncClient({
+  endpoint: 'https://<instance id>.powersync.journeyapps.com',
+  getToken: () => fetchToken(),
+})
+
+const documents = createCollection(
+  powerSyncCollectionOptions({
+    client,
+    table: APP_SCHEMA.props.documents,
+    streams: [{ name: 'documents' }],
+    onInsert: async ({ transaction, collection }) => {
+      await api.insertDocuments(transaction.mutations.map((m) => m.modified))
+      // Keep the optimistic state until the write has synced back.
+      await collection.utils.confirmWrites()
+    },
+  }),
+)
+```
+
+The `table`, `schema`, `deserializationSchema` and `onDeserializationError` options work as with a database. A row
+that fails validation stops syncing the collection. Other options differ:
+
+| Option                                     | `database`                                     | `client`                                                       |
+| ------------------------------------------ | ---------------------------------------------- | -------------------------------------------------------------- |
+| `onInsert` / `onUpdate` / `onDelete`       | Built in: writes go to SQLite and upload queue | Your handlers write to your backend; there is no upload queue  |
+| `collection.utils`                         | `getMeta()`                                    | `confirmWrites()`                                              |
+| Eager sync                                 | `onLoad` hook                                  | `streams: StreamSubscription[]`                                |
+| On-demand sync (`syncMode: 'on-demand'`)   | `onLoadSubset` hook                            | `getSubscriptions(options)` returns the streams for the subset |
+| `serializer`, `syncBatchSize`              | Supported                                      | Not available                                                  |
+| `onError`                                  | Not available                                  | Connection, Sync Stream and sync errors                        |
+
+Before the collection is first ready, a connection or Sync Stream error fails its first load. After that, the client
+retries, the error shows in the collection's health, and it clears once a later connection completes a checkpoint.
+
 ## Advanced Transactions
 
 When you need more control over transaction handling, such as batching multiple operations or handling complex transaction scenarios, you can use PowerSync's transaction system directly with TanStack DB transactions.

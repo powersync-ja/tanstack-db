@@ -6,6 +6,8 @@ import { PowerSyncTransactor } from './PowerSyncTransactor'
 import { DEFAULT_BATCH_SIZE } from './definitions'
 import { asPowerSyncRecord, mapOperation } from './helpers'
 import { convertTableToSchema } from './schema'
+import { createRowDeserializer } from './deserialization'
+import { createStandaloneCollectionConfig } from './standalone'
 import { serializeForSQLite } from './serialization'
 import type {
   CleanupFn,
@@ -21,13 +23,16 @@ import type {
 } from './helpers'
 import type {
   BasePowerSyncCollectionConfig,
+  BaseStandalonePowerSyncCollectionConfig,
   ConfigWithArbitraryCollectionTypes,
   ConfigWithSQLiteInputType,
   ConfigWithSQLiteTypes,
   EnhancedPowerSyncCollectionConfig,
+  EnhancedStandalonePowerSyncCollectionConfig,
   InferPowerSyncOutputType,
   PowerSyncCollectionConfig,
   PowerSyncCollectionUtils,
+  StandalonePowerSyncCollectionConfig,
 } from './definitions'
 import type { PendingOperation } from './PendingOperationStore'
 import type { StandardSchemaV1 } from '@standard-schema/spec'
@@ -225,16 +230,103 @@ export function powerSyncCollectionOptions<
   schema: TSchema
 }
 
+// Overloads 4-6: the same three schema configurations, backed by a standalone client.
+
 /**
- * Implementation of powerSyncCollectionOptions that handles both schema and non-schema configurations.
+ * Creates a collection configuration backed by a standalone PowerSync client, with basic default validation.
+ * Input and Output types are the SQLite column types.
+ *
+ * The client syncs rows into memory without a local database. Writes are not queued: `onInsert`,
+ * `onUpdate` and `onDelete` write to the backend, and can await `collection.utils.confirmWrites()`.
+ *
+ * @example
+ * ```typescript
+ * const client = new PowerSyncClient({ endpoint, getToken })
+ *
+ * const collection = createCollection(
+ *   powerSyncCollectionOptions({
+ *     client,
+ *     table: APP_SCHEMA.props.documents,
+ *     streams: [{ name: "documents" }],
+ *     onInsert: async ({ transaction, collection }) => {
+ *       await api.insert(transaction.mutations.map((m) => m.modified))
+ *       await collection.utils.confirmWrites()
+ *     },
+ *   })
+ * )
+ * ```
+ */
+export function powerSyncCollectionOptions<TTable extends Table = Table>(
+  config: BaseStandalonePowerSyncCollectionConfig<TTable, never> &
+    ConfigWithSQLiteTypes,
+): EnhancedStandalonePowerSyncCollectionConfig<
+  OptionalExtractedTable<TTable>,
+  never
+>
+
+/**
+ * Creates a collection configuration backed by a standalone PowerSync client, with schema validation.
+ * The schema's input types are the SQLite types; it also validates synced rows.
+ */
+export function powerSyncCollectionOptions<
+  TTable extends Table,
+  TSchema extends StandardSchemaV1<
+    OptionalExtractedTable<TTable>,
+    AnyTableColumnType<TTable>
+  >,
+>(
+  config: BaseStandalonePowerSyncCollectionConfig<TTable, TSchema> &
+    Omit<ConfigWithSQLiteInputType<TTable, TSchema>, `serializer`>,
+): EnhancedStandalonePowerSyncCollectionConfig<
+  InferPowerSyncOutputType<TTable, TSchema>,
+  TSchema
+> & {
+  schema: TSchema
+}
+
+/**
+ * Creates a collection configuration backed by a standalone PowerSync client, with schema validation and
+ * arbitrary input types. The `deserializationSchema` converts synced SQLite-typed rows to the output type.
+ */
+export function powerSyncCollectionOptions<
+  TTable extends Table,
+  TSchema extends StandardSchemaV1<
+    AnyTableColumnType<TTable>,
+    AnyTableColumnType<TTable>
+  >,
+>(
+  config: BaseStandalonePowerSyncCollectionConfig<TTable, TSchema> &
+    Omit<ConfigWithArbitraryCollectionTypes<TTable, TSchema>, `serializer`>,
+): EnhancedStandalonePowerSyncCollectionConfig<
+  InferPowerSyncOutputType<TTable, TSchema>,
+  TSchema
+> & {
+  schema: TSchema
+}
+
+/**
+ * Implementation of powerSyncCollectionOptions that handles both sources and all schema configurations.
  */
 
 export function powerSyncCollectionOptions<
   TTable extends Table,
   TSchema extends StandardSchemaV1<any> = never,
 >(
-  config: PowerSyncCollectionConfig<TTable, TSchema>,
-): ReturnType<typeof createPowerSyncCollectionConfig<TTable, TSchema>> {
+  config:
+    | PowerSyncCollectionConfig<TTable, TSchema>
+    | StandalonePowerSyncCollectionConfig<TTable, TSchema>,
+):
+  | ReturnType<typeof createPowerSyncCollectionConfig<TTable, TSchema>>
+  | EnhancedStandalonePowerSyncCollectionConfig<
+      InferPowerSyncOutputType<TTable, TSchema>,
+      TSchema
+    > {
+  if (`client` in config) {
+    return withCollectionConfigFactory(
+      createStandaloneCollectionConfig(config),
+      () => createStandaloneCollectionConfig(config),
+    )
+  }
   const outputConfig = createPowerSyncCollectionConfig(config)
   return withCollectionConfigFactory(outputConfig, () =>
     createPowerSyncCollectionConfig(config),
@@ -270,32 +362,18 @@ function createPowerSyncCollectionConfig<
 
   const { viewName, trackMetadata: metadataIsTracked } = table
 
+  // We can do basic runtime validations for columns if not explicit schema has been provided
+  const schema = inputSchema ?? (convertTableToSchema(table) as TSchema)
+
   /**
    * Deserializes data from the incoming sync stream
    */
-  const deserializeSyncRow = (value: TableType): OutputType => {
-    const validationSchema = deserializationSchema || schema
-    const validation = validationSchema[`~standard`].validate(value)
-    if (`value` in validation) {
-      return validation.value
-    } else if (`issues` in validation) {
-      const issueMessage = `Failed to validate incoming data for ${viewName}. Issues: ${validation.issues.map((issue) => `${issue.path} - ${issue.message}`)}`
-      database.logger.log({ level: LogLevels.error, message: issueMessage })
-      onDeserializationError!(validation)
-      throw new Error(issueMessage)
-    } else {
-      const unknownErrorMessage = `Unknown deserialization error for ${viewName}`
-      database.logger.log({
-        level: LogLevels.error,
-        message: unknownErrorMessage,
-      })
-      onDeserializationError!({ issues: [{ message: unknownErrorMessage }] })
-      throw new Error(unknownErrorMessage)
-    }
-  }
-
-  // We can do basic runtime validations for columns if not explicit schema has been provided
-  const schema = inputSchema ?? (convertTableToSchema(table) as TSchema)
+  const deserializeSyncRow = createRowDeserializer<TableType, OutputType>(
+    viewName,
+    deserializationSchema || schema,
+    onDeserializationError,
+    (message) => database.logger.log({ level: LogLevels.error, message }),
+  )
   /**
    * The onInsert, onUpdate, and onDelete handlers should only return
    * after we have written the changes to TanStack DB.

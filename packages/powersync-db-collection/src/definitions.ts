@@ -1,4 +1,9 @@
 import type { CommonPowerSyncDatabase, Table } from '@powersync/common'
+import type {
+  ConfirmWritesOptions,
+  PowerSyncClient,
+  StreamSubscription,
+} from '@powersync/standalone-client'
 import type { StandardSchemaV1 } from '@standard-schema/spec'
 import type {
   BaseCollectionConfig,
@@ -202,7 +207,10 @@ export type OnDemandSyncHooks = {
   ) => CleanupFn | void | Promise<CleanupFn | void>
 }
 
-export type BasePowerSyncCollectionConfig<
+/**
+ * Collection options shared by collections backed by a PowerSync database and by a standalone client.
+ */
+export type SharedPowerSyncCollectionConfig<
   TTable extends Table = Table,
   TSchema extends StandardSchemaV1<any> = never,
 > = Omit<
@@ -215,6 +223,12 @@ export type BasePowerSyncCollectionConfig<
 > & {
   /** The PowerSync schema Table definition */
   table: TTable
+}
+
+export type BasePowerSyncCollectionConfig<
+  TTable extends Table = Table,
+  TSchema extends StandardSchemaV1<any> = never,
+> = SharedPowerSyncCollectionConfig<TTable, TSchema> & {
   /** The PowerSync database instance */
   database: CommonPowerSyncDatabase
   /**
@@ -320,6 +334,114 @@ export type EnhancedPowerSyncCollectionConfig<
  */
 export type PowerSyncCollectionUtils<TTable extends Table = Table> = {
   getMeta: () => PowerSyncCollectionMeta<TTable>
+}
+
+/**
+ * Maps a subset requested by a live query to the Sync Streams that contain its rows.
+ */
+export type GetSubscriptions = (
+  options: LoadSubsetOptions,
+) => ReadonlyArray<StreamSubscription>
+
+/**
+ * Sync Streams requested by a collection backed by a standalone client.
+ */
+export type StandaloneSyncStreams =
+  | {
+      syncMode?: 'eager'
+      /**
+       * Streams to request while the collection is syncing, with all query filtering performed locally. May be
+       * empty when rows for this table are synced through other collections or default streams.
+       */
+      streams?: ReadonlyArray<StreamSubscription>
+      getSubscriptions?: never
+    }
+  | {
+      syncMode: 'on-demand'
+      /** Streams to request for each subset loaded by a live query. */
+      getSubscriptions: GetSubscriptions
+      streams?: never
+    }
+
+/**
+ * Collection-level utilities for collections backed by a standalone client.
+ */
+export type StandalonePowerSyncCollectionUtils = {
+  /**
+   * Waits until writes the backend has committed are synced back and applied.
+   *
+   * This requests a checkpoint from the PowerSync service. As this happens _after_ the write has made it into the
+   * source database, PowerSync can determine when data including the write has synced back down.
+   *
+   * This waits for the checkpoint to be requested _and_ to have been downloaded, validated and applied locally.
+   * Awaiting this in an `onInsert`, `onUpdate` or `onDelete` callback ensures the optimistic state is replaced with
+   * confirmed data without flickering.
+   */
+  confirmWrites: (options?: ConfirmWritesOptions) => Promise<void>
+}
+
+type StandaloneCollectionHandlers<
+  TTable extends Table,
+  TSchema extends StandardSchemaV1<any>,
+> = Pick<
+  CollectionConfig<
+    InferPowerSyncOutputType<TTable, TSchema>,
+    string,
+    TSchema,
+    StandalonePowerSyncCollectionUtils
+  >,
+  `onInsert` | `onUpdate` | `onDelete`
+>
+
+/**
+ * Options for a collection backed by a standalone PowerSync client, which syncs rows into memory without a
+ * local database.
+ *
+ * There is no local upload queue: `onInsert`, `onUpdate` and `onDelete` write to the backend, and can await
+ * `collection.utils.confirmWrites()` to keep optimistic state until the write has synced back.
+ */
+export type BaseStandalonePowerSyncCollectionConfig<
+  TTable extends Table = Table,
+  TSchema extends StandardSchemaV1<any> = never,
+> = SharedPowerSyncCollectionConfig<TTable, TSchema> &
+  StandaloneCollectionHandlers<TTable, TSchema> & {
+    /** The standalone PowerSync client to sync rows from. */
+    client: PowerSyncClient
+    /**
+     * Called for connection and Sync Stream errors, and for errors that stop syncing this collection. Errors
+     * are also reported in the collection's health.
+     */
+    onError?: (error: Error) => void
+  } & StandaloneSyncStreams
+
+/**
+ * Configuration options for a collection backed by a standalone PowerSync client.
+ */
+export type StandalonePowerSyncCollectionConfig<
+  TTable extends Table = Table,
+  TSchema extends StandardSchemaV1<any> = never,
+> = BaseStandalonePowerSyncCollectionConfig<TTable, TSchema> &
+  (
+    | ConfigWithSQLiteTypes
+    | Omit<ConfigWithSQLiteInputType<TTable, TSchema>, `serializer`>
+    | Omit<ConfigWithArbitraryCollectionTypes<TTable, TSchema>, `serializer`>
+  )
+
+/**
+ * A CollectionConfig backed by a standalone PowerSync client.
+ */
+export type EnhancedStandalonePowerSyncCollectionConfig<
+  OutputType extends Record<string, unknown> = Record<string, unknown>,
+  TSchema extends StandardSchemaV1 = never,
+> = CollectionConfig<
+  OutputType,
+  string,
+  TSchema,
+  StandalonePowerSyncCollectionUtils
+> & {
+  id?: string
+  utils: StandalonePowerSyncCollectionUtils
+  schema?: TSchema
 }
 
 /**
