@@ -80,6 +80,12 @@ export type PowerSyncCollectionOptions<T extends { id: string }> =
            */
           syncMode?: 'eager'
           streams?: ReadonlyArray<StreamSubscription>
+          /**
+           * Whether to also request Sync Streams marked as `auto_subscribe: true` in the Sync Config.
+           *
+           * Defaults to false.
+           */
+          includeDefaultStreams?: boolean
           getSubscriptions?: never
         }
     )
@@ -128,7 +134,8 @@ export function powerSyncCollectionOptions<T extends { id: string }>(
       const controller = new AbortController()
       let first = true
       // An eager sync run shows no rows until its streams have synced: the
-      // client may still hold rows from an earlier run.
+      // client may still hold rows from an earlier run. A run without streams
+      // has nothing to wait for and shows the rows the client already holds.
       let synced = onDemand
       let active = true
       let lastApplied: SyncAppliedReceipt = true
@@ -168,10 +175,6 @@ export function powerSyncCollectionOptions<T extends { id: string }>(
       const onStreamError = (source: StreamLease, error: StreamError) => {
         if (!active) return
         if (collection.status !== 'ready') return stop(error)
-        // Stream errors are part of the initial checkpoint and reported for invalid
-        // parameters in rare cases. We get the same with every checkpoint, so don't
-        // report them twice.
-        if (streamErrors.has(source)) return
         streamErrors.set(source, error)
         reportError(error)
       }
@@ -259,6 +262,7 @@ export function powerSyncCollectionOptions<T extends { id: string }>(
       } else {
         const eager = client.acquireStreams(options.streams ?? [], {
           onError: (error) => onStreamError(eager, error),
+          includeDefaultStreams: options.includeDefaultStreams ?? false,
         })
         lease = eager
       }

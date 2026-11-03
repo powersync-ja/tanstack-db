@@ -5,6 +5,7 @@ import {
   StreamError,
   powerSyncCollectionOptions,
 } from '../src/index.js'
+import { createSubsetHandlers } from '../src/subsets.js'
 import { FakeService } from './fake-service'
 import type { StreamSubscription } from '../src/index.js'
 
@@ -110,6 +111,32 @@ it('shares one connection, requesting the union of streams', async () => {
     { name: 'a', after: '1' },
     { name: 'b', after: '2' },
   ])
+})
+
+it('can request default streams', async () => {
+  const { service, client } = setup()
+  const collection = createCollection(
+    powerSyncCollectionOptions<Task>({
+      client,
+      table: 'tasks',
+      streams: [],
+      includeDefaultStreams: true,
+      parse: (row) => row as Task,
+    }),
+  )
+  cleanups.push(() => collection.cleanup())
+  const ready = collection.preload()
+
+  await service.waitForRequest(1)
+  expect(service.lastRequest.streams).toEqual({
+    include_defaults: true,
+    subscriptions: [],
+  })
+  service.checkpoint(['a'])
+  service.put('a', 'tasks', '1', { title: 'task' })
+  service.complete()
+
+  await ready
 })
 
 it('reports rows from streams requested by other collections', async () => {
@@ -431,4 +458,28 @@ it('reports stream errors of loaded subsets until they are unloaded', async () =
 
   await live.cleanup()
   expect(collection.health.failureReason).toBeNull()
+})
+
+it('serializes loads of the same subset options, releasing one acquisition', async () => {
+  const { service, client } = setup()
+  const handlers = createSubsetHandlers(
+    client,
+    () => [{ name: 'board', parameters: { board: 'work' } }],
+    () => true,
+    { onError: () => {}, onRelease: () => {} },
+  )
+  cleanups.push(async () => handlers.cleanup())
+  const options = {}
+  const first = handlers.loadSubset!(options)
+  const second = handlers.loadSubset!(options)
+  await vi.waitFor(() =>
+    expect(service.lastRequest.streams.subscriptions).toHaveLength(1),
+  )
+  service.sync('a', 'tasks', {})
+  await Promise.all([first, second])
+
+  // Without leases or listeners, the client disconnects.
+  handlers.unloadSubset!(options)
+  await vi.waitFor(() => expect(client.status.state).toBe('idle'))
+  expect(service.aborted).toBe(true)
 })
