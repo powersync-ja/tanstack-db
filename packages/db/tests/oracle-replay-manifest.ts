@@ -778,6 +778,11 @@ const ownerGroups: ReadonlyArray<
     `powersync`,
   ],
   [
+    `powersync-slim-collection/tests/eager-live-source-conformance-oracle.property.test.ts`,
+    `adapter-conformance.eager-live-source`,
+    `powersync-slim`,
+  ],
+  [
     `electric-db-collection/tests/eager-live-source-conformance-oracle.property.test.ts`,
     `adapter-conformance.eager-live-source`,
     `electric`,
@@ -879,6 +884,7 @@ const replayTestNames = new Map([
     `trailbase`,
     `rxdb`,
     `powersync`,
+    `powersync-slim`,
     `electric`,
     `convex`,
   ].map(
